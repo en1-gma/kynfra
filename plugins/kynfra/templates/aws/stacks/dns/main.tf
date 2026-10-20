@@ -16,7 +16,7 @@ locals {
   retention_days = 365
 }
 
-# Zona pubblica condivisa dagli ambienti: ogni stack envs/<env>/spa vi scrive i propri record.
+# Zona pubblica condivisa dagli ambienti: ogni stack envs/<env>/spa o envs/<env>/elb vi scrive i propri record.
 resource "aws_route53_zone" "this" {
   name    = local.zone_name
   comment = "Zona pubblica di ${local.name} (kynfra)"

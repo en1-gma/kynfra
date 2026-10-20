@@ -35,12 +35,12 @@ variable "cost_center" {
 
 variable "domain_name" {
   type        = string
-  description = "Dominio della SPA del comando che ha generato questo stack: deve stare nella zona; se zone_name è vuoto diventa anche il nome della zona."
+  description = "Dominio (SPA o load balancer) del comando che ha generato questo stack: deve stare nella zona; se zone_name è vuoto diventa anche il nome della zona."
 }
 
 variable "zone_name" {
   type        = string
-  description = "Nome della hosted zone pubblica da creare, di solito il dominio radice (es. example.com); vuoto = domain_name. I domini delle SPA di tutti gli ambienti devono essere questo nome o suoi sottodomini."
+  description = "Nome della hosted zone pubblica da creare, di solito il dominio radice (es. example.com); vuoto = domain_name. I domini di SPA e load balancer di tutti gli ambienti devono essere questo nome o suoi sottodomini."
   default     = ""
 
   validation {

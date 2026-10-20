@@ -117,6 +117,95 @@
       "Deploy del frontend: carica la build nel bucket bucket_name con Cache-Control \"public, max-age=31536000, immutable\" sugli asset con hash e \"no-cache\" su index.html, poi invalida /index.html sulla distribuzione distribution_id; il ruolo di deploy ha bisogno solo di s3:PutObject/s3:DeleteObject/s3:ListBucket sul bucket e cloudfront:CreateInvalidation sulla distribuzione"
     ]
   },
+  "elb": {
+    "description": "Load balancer davanti ai workload: ALB (o NLB su richiesta) nelle subnet dello stack network, listener 443 con policy ELBSecurityPolicy-TLS13-1-2-2021-06 e certificato ACM regionale con validazione DNS, redirect 80 -> 443 (ALB), drop_invalid_header_fields e desync mitigation strictest, record Route53 alias, access log su un bucket dedicato con policy per il servizio ELB della regione, WAF regionale (obbligatorio in prod per l'ALB), deletion protection in prod, target group IP con health check, security group con 443/80 dal mondo o solo 443 dalla prefix list di CloudFront ed egress solo verso la VPC.",
+    "requires": [
+      "network"
+    ],
+    "inputs": {
+      "type": {
+        "type": "string",
+        "default": "alb",
+        "help": "alb (Application Load Balancer, HTTP/HTTPS) oppure nlb (Network Load Balancer, TLS terminato sul load balancer e inoltro TCP; niente WAF)"
+      },
+      "internal": {
+        "type": "bool",
+        "default": false,
+        "help": "true: load balancer interno nelle subnet private (client solo dalla VPC); false: pubblico nelle subnet pubbliche"
+      },
+      "allow_from": {
+        "type": "string",
+        "default": "internet",
+        "help": "Client di un load balancer pubblico: internet (443 e 80 dal mondo) oppure cloudfront (solo 443 dalla prefix list gestita com.amazonaws.global.cloudfront.origin-facing)"
+      },
+      "domain_name": {
+        "type": "string",
+        "required": true,
+        "example": {
+          "dev": "dev.api.example.com",
+          "prod": "api.example.com"
+        },
+        "help": "Dominio del load balancer in questo ambiente (es. api.example.com in prod, dev.api.example.com in dev)"
+      },
+      "hosted_zone": {
+        "type": "string",
+        "required": true,
+        "example": "create",
+        "help": "Zona Route53: create (zona in envs/shared/dns, la stessa del pattern spa) oppure existing:<zone_id>"
+      },
+      "zone_name": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "Con hosted_zone=create e zona non ancora generata: nome della zona, di solito il dominio radice (es. example.com); vuoto = domain_name del primo comando"
+      },
+      "target_port": {
+        "type": "number",
+        "default": 8080,
+        "help": "Porta dei target del gruppo di default (pod o task con target IP)"
+      },
+      "health_path": {
+        "type": "string",
+        "default": "/healthz",
+        "help": "Percorso HTTP dell'health check dei target"
+      },
+      "deletion_protection": {
+        "type": "bool",
+        "default": false,
+        "help": "Deletion protection del load balancer (sempre attiva in prod)"
+      },
+      "waf_enabled": {
+        "type": "bool",
+        "default": false,
+        "help": "WAF regionale con managed rule set e rate limit davanti all'ALB (sempre attivo in prod per l'ALB; con type=nlb deve essere false)"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "deletion_protection": true,
+        "waf_enabled": true
+      }
+    },
+    "stacks": [
+      "elb"
+    ],
+    "shared": false,
+    "single_env": true,
+    "shared_stacks": [
+      {
+        "stack": "dns",
+        "when": {
+          "hosted_zone": "create"
+        }
+      }
+    ],
+    "next_steps": [
+      "Prima lo stack network dello stesso ambiente (output vpc_id, public_subnet_ids, private_subnet_ids, chiave {{ project }}/<env>/network.tfstate) e, con hosted_zone=create, la zona: cd {{ infra_root }}/envs/shared/dns && {{ iac_cli }} init && {{ iac_cli }} plan -out=dns.tfplan && {{ iac_cli }} apply dns.tfplan, con i name_servers delegati dal registrar (o dalla zona padre), altrimenti la validazione ACM non termina",
+      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/elb && {{ iac_cli }} init && {{ iac_cli }} plan -out=elb.tfplan && {{ iac_cli }} apply elb.tfplan",
+      "I workload si registrano nel target group target_group_arn (target IP: TargetGroupBinding dell'AWS Load Balancer Controller su EKS o load_balancer del servizio ECS) e ammettono nel proprio security group la porta target_port dal security group security_group_id; l'ALB inoltra solo le richieste con Host = domain_name (le altre ricevono 404)",
+      "Con deletion protection attiva (prod) il destroy richiede prima deletion_protection = false e un apply"
+    ]
+  },
   "secrets": {
     "description": "Secrets Manager come secret vault: chiave KMS dedicata con rotazione attiva, segreti creati come contenitori senza valore (mappa nome => descrizione, ruoli lettori, Lambda di rotazione opzionale), resource policy per singolo ruolo con deny fuori dall'account e senza TLS, recovery window (30 giorni in prod), rotazione automatica dove c'è la Lambda, replica opzionale in una seconda regione.",
     "requires": [],

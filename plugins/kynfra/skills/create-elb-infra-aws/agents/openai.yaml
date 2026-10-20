@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra ELB (AWS)"
+  short_description: "Generate an AWS application or network load balancer with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-elb-infra-aws to generate the load balancer stack (ALB or NLB, HTTPS with TLS 1.3, ACM, Route53, access logs, WAF)."
+policy:
+  allow_implicit_invocation: false

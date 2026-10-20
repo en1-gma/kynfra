@@ -1,10 +1,10 @@
 output "zone_id" {
-  description = "ID della hosted zone pubblica (letto dagli stack envs/<env>/spa con hosted_zone = \"create\")."
+  description = "ID della hosted zone pubblica (letto dagli stack envs/<env>/spa ed envs/<env>/elb con hosted_zone = \"create\")."
   value       = aws_route53_zone.this.zone_id
 }
 
 output "zone_name" {
-  description = "Nome della zona: i domini delle SPA sono questo nome o suoi sottodomini."
+  description = "Nome della zona: i domini di SPA e load balancer sono questo nome o suoi sottodomini."
   value       = aws_route53_zone.this.name
 }
 
