@@ -173,6 +173,11 @@ def _check_value(name: str, value: str, kind: str = "string") -> str:
     return value
 
 
+def _text(value) -> str:
+    """Valore JSON di un input (default o env_defaults) come testo: i booleani diventano true/false."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
 def _account_id(cfg: dict, name: str) -> str:
     acc = (cfg.get("accounts") or {}).get(name)
     acc_id = str((acc or {}).get("id", "")) if isinstance(acc, dict) else ""
@@ -222,9 +227,9 @@ def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[
         if name in values:
             value = values[name]
         elif name in env_defaults:
-            value = str(env_defaults[name])
+            value = _text(env_defaults[name])
         elif "default" in spec and spec["default"] is not None:
-            value = str(spec["default"]).lower() if isinstance(spec["default"], bool) else str(spec["default"])
+            value = _text(spec["default"])
         elif spec.get("required", True):
             raise GenerateError(f"manca --var {name}=… ({spec.get('help', 'input richiesto')})")
         else:

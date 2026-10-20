@@ -170,6 +170,17 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual([f.format() for f in findings], [])
 
 
+class EnvDefaultsTypesTest(unittest.TestCase):
+    ENTRY = {"inputs": {"flag": {"type": "bool", "default": False}, "count": {"type": "number", "default": 2}},
+             "env_defaults": {"prod": {"flag": True, "count": 3}}}
+
+    def test_native_json_types_in_env_defaults(self):
+        prod = generate._inputs(self.ENTRY, {}, "prod", {}, "p")
+        self.assertEqual(prod, {"flag": "true", "count": "3"})
+        dev = generate._inputs(self.ENTRY, {}, "dev", {}, "p")
+        self.assertEqual(dev, {"flag": "false", "count": "2"})
+
+
 FAKE_PATTERNS = {
     "network": {"description": "rete", "requires": [], "inputs": {}, "stacks": ["network"], "shared": False},
     "elb": {"description": "lb", "requires": ["network"],
