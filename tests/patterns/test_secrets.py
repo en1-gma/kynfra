@@ -75,8 +75,10 @@ class SecretsPatternTest(unittest.TestCase):
         text = self.module("main.tf")
         key = block(text, 'resource "aws_kms_key" "secrets"')
         self.assertRegex(key, r"enable_key_rotation\s*=\s*true")
-        self.assertRegex(key, r'"kms:ViaService"\s*=\s*"secretsmanager\.\$\{data\.aws_region\.current\.region\}\.amazonaws\.com"')
-        self.assertRegex(key, r"Principal\s*=\s*\{ AWS = local\.account_root \}")
+        self.assertRegex(key, r"policy\s*=\s*local\.key_policies\[data\.aws_region\.current\.region\]")
+        text_policies = text.split("key_policies = {", 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(text_policies, r'"kms:ViaService"\s*=\s*"secretsmanager\.\$\{region\}\.amazonaws\.com"')
+        self.assertRegex(text_policies, r"Principal\s*=\s*\{ AWS = local\.account_root \}")
         secret = block(text, 'resource "aws_secretsmanager_secret" "this"')
         self.assertRegex(secret, r"kms_key_id\s*=\s*aws_kms_key\.secrets\.arn")
         self.assertRegex(secret, r'name\s*=\s*"\$\{var\.project\}/\$\{var\.environment\}/\$\{each\.key\}"')
@@ -101,9 +103,45 @@ class SecretsPatternTest(unittest.TestCase):
         self.assertEqual(tfvars(self.stack("dev", "terraform.tfvars"))["replica_region"], "")
         self.assertEqual(tfvars(self.stack("dev", "terraform.tfvars", self.other))["replica_region"], "eu-west-1")
 
+    def test_secrets_readers_guards(self):
+        # readers vuoti: statement Allow (e Principal) assenti, resta il solo deny; readers pieni: Principal = la lista
+        text = self.module("main.tf")
+        policy = block(text, 'resource "aws_secretsmanager_secret_policy" "this"')
+        self.assertRegex(policy, r"length\(each\.value\.readers\) == 0 \? \[\]\s*:\s*\[")
+        self.assertEqual(len(re.findall(r"each\.value\.readers", policy)), 3)  # guardia, Principal, precondition
+        self.assertEqual(len(re.findall(r'Effect\s*=\s*"Allow"', policy)), 1)
+        self.assertRegex(policy, r'"aws:PrincipalIsAWSService"\s*=\s*"false"')
+        self.assertRegex(policy, r'split\(":", r\)\[4\] == local\.account_id')
+        self.assertRegex(text, r"length\(local\.all_readers\) == 0 \? \[\]\s*:\s*\[")
+        self.assertRegex(text, r'Principal\s*=\s*\{ AWS = local\.all_readers \}')
+        # lo stack non legge lo stato di altri stack
+        self.assertNotIn("terraform_remote_state", self.stack("dev", "main.tf"))
+
+    def test_secrets_replica_key(self):
+        text = self.module("main.tf")
+        self.assertRegex(block(text, 'resource "aws_kms_key" "secrets"'), r"multi_region\s*=\s*true")
+        rep = block(text, 'resource "aws_kms_replica_key" "secrets"')
+        self.assertRegex(rep, r'count\s*=\s*var\.replica_region != "" \? 1 : 0')
+        self.assertRegex(rep, r"provider\s*=\s*aws\.replica")
+        self.assertRegex(rep, r"primary_key_arn\s*=\s*aws_kms_key\.secrets\.arn")
+        self.assertRegex(rep, r"var\.replica_region != data\.aws_region\.current\.region")
+        self.assertRegex(text, r"kms_key_id\s*=\s*aws_kms_replica_key\.secrets\[0\]\.arn")
+        self.assertRegex(self.module("versions.tf"), r"configuration_aliases\s*=\s*\[aws\.replica\]")
+        providers = self.stack("dev", "providers.tf")
+        alias = providers.split('alias               = "replica"', 1)[1]
+        self.assertRegex(alias, r'region\s*=\s*var\.replica_region != "" \? var\.replica_region : var\.region')
+        self.assertIn("allowed_account_ids = [var.account_id]", alias)
+        self.assertIn('ManagedBy   = "kynfra"', alias)
+        self.assertRegex(self.stack("dev", "main.tf"), r"aws\.replica\s*=\s*aws\.replica")
+
+    def test_secrets_stack_does_not_duplicate_validation(self):
+        stack = self.stack("dev", "variables.tf")
+        self.assertEqual(stack.count("validation {"), 2)  # account_id e replica_region != region
+        self.assertNotIn("can(regex", stack.split('variable "secrets"', 1)[1])
+
     def test_secrets_outputs(self):
         for text in (self.stack("dev", "outputs.tf"), self.module("outputs.tf")):
-            self.assertEqual(re.findall(r'^output "(\w+)"', text, re.M), ["secret_arns", "kms_key_arn"])
+            self.assertEqual(re.findall(r'^output "(\w+)"', text, re.M), ["secret_arns", "secret_names", "kms_key_arn"])
 
 
 if __name__ == "__main__":

@@ -143,10 +143,11 @@
     ],
     "shared": false,
     "next_steps": [
-      "Modifica la mappa secrets in {{ infra_root }}/envs/<env>/secrets/terraform.tfvars (nome, descrizione, ARN dei ruoli lettori, Lambda di rotazione opzionale): è un segnaposto con il solo segreto app-db e nessun lettore",
-      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/secrets && {{ iac_cli }} init && {{ iac_cli }} plan -out=secrets.tfplan && {{ iac_cli }} apply secrets.tfplan",
+      "Applica per primo lo stack secrets: modifica la mappa secrets in {{ infra_root }}/envs/<env>/secrets/terraform.tfvars (nome e descrizione; readers e Lambda di rotazione sono facoltativi), poi il DevOps, con le credenziali dell'account {{ account_id }}: cd {{ infra_root }}/envs/<env>/secrets && {{ iac_cli }} init && {{ iac_cli }} plan -out=secrets.tfplan && {{ iac_cli }} apply secrets.tfplan",
       "I segreti nascono senza valore: il DevOps lo inserisce fuori da Terraform, es. aws secretsmanager put-secret-value --secret-id {{ project }}/<env>/<nome> --secret-string <valore> (mai nei file né da un agente)",
-      "Le app leggono il segreto a runtime con il proprio ruolo IAM, che deve essere in readers; l'ARN arriva dall'output secret_arns (chiave {{ project }}/<env>/secrets.tfstate)"
+      "Gli stack dei workload leggono gli output secret_arns, secret_names e kms_key_arn con terraform_remote_state (chiave {{ project }}/<env>/secrets.tfstate) e danno al proprio ruolo una policy identity: secretsmanager:GetSecretValue sull'ARN del segreto e kms:Decrypt sulla chiave con kms:ViaService = secretsmanager.<regione>.amazonaws.com",
+      "readers è facoltativo: aggiungilo più tardi con gli ARN di ruoli già esistenti se vuoi una concessione anche nella resource policy; lo stack secrets non legge mai lo stato degli altri stack",
+      "Con rotation_lambda_arn la Lambda (di un altro stack) richiede un ruolo con Describe/Get/PutSecretValue e UpdateSecretVersionStage sul segreto, kms:Decrypt e kms:GenerateDataKey sulla chiave, e un aws_lambda_permission per secretsmanager.amazonaws.com"
     ]
   }
 }

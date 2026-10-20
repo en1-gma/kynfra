@@ -1,6 +1,11 @@
 module "secrets" {
   source = "../../../modules/secrets"
 
+  providers = {
+    aws         = aws
+    aws.replica = aws.replica
+  }
+
   project              = var.project
   environment          = var.environment
   secrets              = var.secrets

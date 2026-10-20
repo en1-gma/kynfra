@@ -63,6 +63,13 @@ def with_requires(provider: str, pattern: str, seen=None) -> list:
 # combinazioni di input in più per pattern: ognuna diventa un test con gli stessi controlli
 VARIANTS = {
     "spa": [{"hosted_zone": "existing:Z0123456789ABCDEFGHIJ", "api_origin": "backend"}],
+    # replica in un'altra regione e segreti con lettori e Lambda di rotazione (la chiave "_tfvars" sostituisce testo
+    # nei terraform.tfvars generati: struttura che il generatore non sa passare)
+    "secrets": [{"replica_region": "eu-west-1", "_tfvars": [
+        ('    description = "Credenziali del database dell\'applicazione"\n    readers     = []\n    # rotation_lambda_arn',
+         '    description         = "Credenziali del database dell\'applicazione"\n'
+         '    readers             = ["arn:aws:iam::123456789012:role/acme-dev-app"]\n    rotation_lambda_arn'),
+    ]}],
 }
 
 
@@ -105,10 +112,18 @@ class PatternsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix=f"kynfra-{pattern}-") as d:
             proj = Path(d)
             cfg = make_project(proj)
+            extra = dict(extra or {})
+            edits = extra.pop("_tfvars", [])
             for p in with_requires(provider, pattern):
                 for res in generate_pattern(proj, cfg, provider, p, extra if p == pattern else None):
                     self.assertTrue(res["created"], p)
                     self.assertEqual(res["missing_requires"], [], p)
+            for path in proj.glob(f"**/envs/*/{pattern}/terraform.tfvars"):
+                text = path.read_text(encoding="utf-8")
+                for old, new in edits:
+                    self.assertIn(old, text)
+                    text = text.replace(old, new)
+                path.write_text(text, encoding="utf-8")
             findings = arch_check.run(proj, cfg)
             self.assertEqual([f.format() for f in findings], [], f"pattern {pattern}: arch_check --strict")
             iac = "tofu" if cfg["iac"] == "opentofu" else "terraform"

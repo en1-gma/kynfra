@@ -7,7 +7,8 @@ cost_center          = "{{ cost_center }}"
 recovery_window_days = {{ recovery_window_days }}
 replica_region       = "{{ replica_region }}"
 
-# Esempio: un segreto segnaposto senza lettori. Modifica la mappa (nome => descrizione, ruoli lettori, Lambda di rotazione opzionale).
+# Esempio: un segreto segnaposto. I workload leggono con una policy identity sul proprio ruolo (output secret_arns e kms_key_arn);
+# readers è un'aggiunta facoltativa alla resource policy, con ARN di ruoli già esistenti.
 secrets = {
   app-db = {
     description = "Credenziali del database dell'applicazione"

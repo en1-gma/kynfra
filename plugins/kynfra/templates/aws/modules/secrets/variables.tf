@@ -14,7 +14,7 @@ variable "secrets" {
     readers             = list(string)
     rotation_lambda_arn = optional(string)
   }))
-  description = "Segreti da creare (solo i contenitori, mai i valori): nome => descrizione, ARN dei ruoli IAM dell'account che possono leggerlo (readers) e, per la rotazione automatica, ARN della Lambda di rotazione."
+  description = "Segreti da creare (solo i contenitori, mai i valori): nome => descrizione, ARN di ruoli IAM dell'account a cui concedere in più la lettura nella resource policy (readers, facoltativo: i workload leggono anche con una policy identity sul proprio ruolo) e, per la rotazione automatica, ARN della Lambda di rotazione."
 
   validation {
     condition     = alltrue([for name, s in var.secrets : can(regex("^[a-z0-9][a-z0-9-]*$", name))])
@@ -49,7 +49,7 @@ variable "recovery_window_days" {
 
 variable "replica_region" {
   type        = string
-  description = "Regione di replica dei segreti (vuoto = nessuna replica); in quella regione si usa la chiave gestita aws/secretsmanager."
+  description = "Regione di replica dei segreti (vuoto = nessuna replica); diversa dalla regione dello stack; i segreti si replicano con una replica della chiave KMS multi-regione."
   default     = ""
 
   validation {
