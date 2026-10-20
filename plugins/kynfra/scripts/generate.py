@@ -9,6 +9,7 @@ Uso: python3 -B generate.py --pattern P [--provider aws] [--env dev,prod] [--var
   `envs/shared/<stack>/` se il pattern è `shared`); `templates/<provider>/<dir>/` -> `<infra_root>/<dir>/` una sola
   volta (es. `bootstrap`). `shared_stacks` = [{stack, when}]: stack condivisi copiati una sola volta in
   `envs/shared/<stack>/`, solo se ogni input di `when` ha il valore indicato (es. la zona DNS se `hosted_zone=create`).
+  `single_env: true`: un solo ambiente per comando (input come il dominio che cambiano da ambiente ad ambiente).
 - I template usano solo segnaposto `{{ nome }}`, senza logica: un segnaposto sconosciuto è un errore.
 - Ogni file generato ha in testa `# Generato da kynfra <versione> — pattern <p>` (nessuna intestazione nei JSON).
 - Deterministico: nessuna data, iterazione ordinata, un solo a capo in fondo.
@@ -88,7 +89,7 @@ def load_pattern(provider: str, pattern: str) -> dict:
         raise GenerateError(f"pattern '{pattern}' sconosciuto per {provider} (disponibili: {', '.join(names)})")
     raw = data[pattern]
     entry = {"description": "", "requires": [], "inputs": {}, "env_defaults": {}, "stacks": [], "shared": False,
-             "shared_stacks": [], "dir": None, "next_steps": [], **raw}
+             "shared_stacks": [], "single_env": False, "dir": None, "next_steps": [], **raw}
     for name, spec in entry["inputs"].items():
         if spec.get("type", "string") not in INPUT_TYPES:
             raise GenerateError(f"input '{name}' del pattern '{pattern}': tipo non supportato")
@@ -276,6 +277,9 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
             out.append((rel, _render_file(src, rel, ctx, pattern, version)))
 
     plain = _merge(base, _inputs(entry, values, None, base, pattern))
+    if "account" in values and not (entry.get("dir") or entry.get("shared") or _triggered_shared(entry, plain)):
+        raise GenerateError(f"--var account vale solo per gli stack condivisi: con questi input il pattern '{pattern}' "
+                            "non ne genera (l'account degli stack per ambiente viene da environments in config)")
     add(tpl / "modules" / pattern, f"modules/{pattern}", plain)
     if entry.get("dir"):
         account = _default_account(cfg, envs, values)
@@ -292,10 +296,7 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
             for stack in stacks:
                 ctx = _merge(env_ctx, {"stack": stack, "state_key": f"{base['project']}/{env}/{stack}.tfstate"})
                 add(tpl / "stacks" / stack, f"envs/{env}/{stack}", ctx)
-    for spec in entry.get("shared_stacks") or []:
-        if any(plain.get(k) != _text(v) for k, v in sorted((spec.get("when") or {}).items())):
-            continue
-        stack = spec["stack"]
+    for stack in _triggered_shared(entry, plain):
         account = _default_account(cfg, envs, values)
         key = f"{base['project']}/shared/{stack}.tfstate"
         ctx = _merge(base, _inputs(entry, values, None, base, pattern), _account_context(cfg, base, account),
@@ -308,6 +309,12 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
         if why:
             raise GenerateError(f"il template scriverebbe un file protetto ({rel}): {why}")
     return out
+
+
+def _triggered_shared(entry: dict, inputs: Dict[str, str]) -> List[str]:
+    """Stack di `shared_stacks` il cui `when` combacia con gli input (valori senza ambiente)."""
+    return [spec["stack"] for spec in entry.get("shared_stacks") or []
+            if all(inputs.get(k) == _text(v) for k, v in sorted((spec.get("when") or {}).items()))]
 
 
 def _present(proj: Path, cfg: dict, provider: str, name: str, envs: List[str]) -> bool:
@@ -359,6 +366,9 @@ def generate(proj: Path, cfg: dict, provider: str, pattern: str, envs: List[str]
     values = dict(values)
     shared = entry.get("dir") or entry.get("shared") or entry.get("shared_stacks")
     allowed = set(entry["inputs"]) | ({"account"} if shared else set())
+    if entry.get("single_env") and len(envs) != 1:
+        raise GenerateError(f"il pattern '{pattern}' si genera un ambiente per comando (--env <ambiente>): input come "
+                            "il dominio cambiano da ambiente ad ambiente")
     unknown = sorted(set(values) - allowed)
     if unknown:
         raise GenerateError(f"variabili sconosciute per il pattern '{pattern}': {', '.join(unknown)} "

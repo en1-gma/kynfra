@@ -35,5 +35,16 @@ variable "cost_center" {
 
 variable "domain_name" {
   type        = string
-  description = "Nome della hosted zone pubblica da creare (es. example.com): i domini delle SPA degli ambienti stanno in questa zona."
+  description = "Dominio della SPA del comando che ha generato questo stack: deve stare nella zona; se zone_name è vuoto diventa anche il nome della zona."
+}
+
+variable "zone_name" {
+  type        = string
+  description = "Nome della hosted zone pubblica da creare, di solito il dominio radice (es. example.com); vuoto = domain_name. I domini delle SPA di tutti gli ambienti devono essere questo nome o suoi sottodomini."
+  default     = ""
+
+  validation {
+    condition     = var.zone_name == "" || var.domain_name == var.zone_name || endswith(var.domain_name, ".${var.zone_name}")
+    error_message = "domain_name deve essere zone_name o un suo sottodominio."
+  }
 }

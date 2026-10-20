@@ -40,7 +40,7 @@ locals {
   waf_log_group     = "aws-waf-logs-${local.name}"
   waf_log_group_arn = "arn:${local.partition}:logs:${local.edge}:${local.account_id}:log-group:${local.waf_log_group}"
   account_root      = "arn:${local.partition}:iam::${local.account_id}:root"
-  cdn_log_prefix    = "AWSLogs/${local.account_id}/CloudFront"
+  cdn_log_prefix    = "cloudfront" # prefisso esplicito della destinazione v2: sostituisce AWSLogs/<account>/CloudFront
   s3_log_prefix     = "s3-access/site/"
 }
 
@@ -139,6 +139,17 @@ resource "aws_s3_bucket_policy" "site" {
         Condition = {
           StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.this.arn }
         }
+      },
+      {
+        # con ListBucket un oggetto mancante restituisce 404 invece di 403
+        Sid       = "CloudFrontList"
+        Effect    = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.site.arn
+        Condition = {
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.this.arn }
+        }
       }
     ]
   })
@@ -233,7 +244,7 @@ resource "aws_s3_bucket_policy" "logs" {
         Sid       = "CloudFrontLogDeliveryAclCheck"
         Effect    = "Allow"
         Principal = { Service = "delivery.logs.amazonaws.com" }
-        Action    = "s3:GetBucketAcl"
+        Action    = ["s3:GetBucketAcl", "s3:ListBucket"]
         Resource  = aws_s3_bucket.logs.arn
         Condition = {
           StringEquals = { "aws:SourceAccount" = local.account_id }
@@ -544,7 +555,7 @@ resource "aws_cloudwatch_log_delivery_destination" "cdn" {
   output_format = "w3c"
 
   delivery_destination_configuration {
-    destination_resource_arn = aws_s3_bucket.logs.arn
+    destination_resource_arn = "${aws_s3_bucket.logs.arn}/${local.cdn_log_prefix}"
   }
 }
 

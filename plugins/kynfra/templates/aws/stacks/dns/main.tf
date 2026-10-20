@@ -7,24 +7,25 @@ data "aws_region" "query_logs" {
 
 locals {
   name           = "${var.project}-${var.environment}"
+  zone_name      = var.zone_name != "" ? var.zone_name : var.domain_name
   account_id     = data.aws_caller_identity.current.account_id
   partition      = data.aws_partition.current.partition
   logs_region    = data.aws_region.query_logs.region
-  query_log_name = "/aws/route53/${var.domain_name}"
+  query_log_name = "/aws/route53/${local.zone_name}"
   query_log_arn  = "arn:${local.partition}:logs:${local.logs_region}:${local.account_id}:log-group:${local.query_log_name}"
   retention_days = 365
 }
 
 # Zona pubblica condivisa dagli ambienti: ogni stack envs/<env>/spa vi scrive i propri record.
 resource "aws_route53_zone" "this" {
-  name    = var.domain_name
+  name    = local.zone_name
   comment = "Zona pubblica di ${local.name} (kynfra)"
 }
 
 resource "aws_kms_key" "query_logs" {
   provider = aws.us_east_1
 
-  description             = "Cifratura dei log delle query DNS di ${var.domain_name}"
+  description             = "Cifratura dei log delle query DNS di ${local.zone_name}"
   enable_key_rotation     = true
   deletion_window_in_days = 30
 

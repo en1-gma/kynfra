@@ -272,7 +272,8 @@ class SharedStacksTest(FakeTemplatesBase):
         for stack in ("site", "dns"):
             (self.tpl / "aws/stacks" / stack).mkdir(parents=True)
             (self.tpl / "aws/stacks" / stack / "terraform.tfvars").write_text(
-                'environment = "{{ environment }}"\nkey = "{{ state_key }}"\nzone = "{{ zone }}"\n')
+                'environment = "{{ environment }}"\nkey = "{{ state_key }}"\nzone = "{{ zone }}"\n'
+                'account_id = "{{ account_id }}"\n')
 
     def test_shared_stack_generated_once_when_condition_matches(self):
         res = generate.generate(self.d, self.cfg, "aws", "site", ["dev", "prod"], {"zone": "create"})
@@ -290,6 +291,42 @@ class SharedStacksTest(FakeTemplatesBase):
     def test_shared_stack_accepts_account_var(self):
         res = generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "create", "account": "main"})
         self.assertIn("infra/envs/shared/dns/terraform.tfvars", res["created"])
+
+    def test_account_var_rejected_without_triggered_shared_stack(self):
+        with self.assertRaises(generate.GenerateError) as cm:
+            generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "existing:Z1", "account": "main"})
+        self.assertIn("account", str(cm.exception))
+        with self.assertRaises(generate.GenerateError):
+            generate.generate(self.d, self.cfg, "aws", "elb", ["dev"], {"domain": "a.com", "account": "main"})
+
+    def test_second_run_skips_existing_shared_stack(self):
+        generate.generate(self.d, self.cfg, "aws", "site", ["prod"], {"zone": "create"})
+        res = generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "create"})
+        self.assertEqual(res["created"], ["infra/envs/dev/site/terraform.tfvars"])
+        self.assertEqual(res["skipped"], ["infra/envs/shared/dns/terraform.tfvars"])
+
+    def test_multi_account_needs_account_var(self):
+        raw = dict(REFERENCE_CONFIG, accounts={"main": {"id": "123456789012"}, "prod": {"id": "210987654321"}},
+                   environments={"dev": {"account": "main"}, "prod": {"account": "prod"}})
+        cfg = make_project(self.d, raw)
+        with self.assertRaises(generate.GenerateError) as cm:
+            generate.generate(self.d, cfg, "aws", "site", ["dev", "prod"], {"zone": "create"})
+        self.assertIn("--var account=", str(cm.exception))
+        res = generate.generate(self.d, cfg, "aws", "site", ["dev", "prod"], {"zone": "create", "account": "prod"})
+        self.assertIn('account_id = "210987654321"', (self.d / "infra/envs/shared/dns/terraform.tfvars").read_text())
+        self.assertIn("infra/envs/shared/dns/terraform.tfvars", res["created"])
+
+    def test_single_env_pattern_refuses_multiple_envs(self):
+        data = json.loads((self.tpl / "aws/patterns.json").read_text())
+        data["site"]["single_env"] = True
+        (self.tpl / "aws/patterns.json").write_text(json.dumps(data))
+        with self.assertRaises(generate.GenerateError) as cm:
+            generate.generate(self.d, self.cfg, "aws", "site", ["dev", "prod"], {"zone": "create"})
+        self.assertIn("un ambiente", str(cm.exception))
+        with self.assertRaises(generate.GenerateError):
+            generate.generate(self.d, self.cfg, "aws", "site", [], {"zone": "create"})
+        res = generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "create"})
+        self.assertIn("infra/envs/dev/site/terraform.tfvars", res["created"])
 
     def test_shared_stack_bad_spec_rejected(self):
         data = json.loads((self.tpl / "aws/patterns.json").read_text())

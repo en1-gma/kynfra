@@ -1,6 +1,12 @@
 variable "project" {
   type        = string
   description = "Nome del progetto (kebab-case): prefisso dei nomi delle risorse."
+
+  validation {
+    # il nome più lungo è <project>-<env>-cdn-logs-<account (12 cifre)>, limite dei bucket S3: 63 caratteri
+    condition     = length("${var.project}-${var.environment}-cdn-logs-000000000000") <= 63
+    error_message = "project e environment sono troppo lunghi: <project>-<env>-cdn-logs-<account> supera i 63 caratteri dei nomi dei bucket S3 (al massimo 40 caratteri per project + environment)."
+  }
 }
 
 variable "environment" {

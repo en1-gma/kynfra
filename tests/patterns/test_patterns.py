@@ -4,6 +4,8 @@ finding, avvisi compresi. Se terraform/tofu, tflint o checkov sono risolvibili (
 strumenti esterni; con KYNFRA_REQUIRE_TOOLS=1 (CI) sono obbligatori. KYNFRA_PATTERNS="p1 p2" limita i pattern.
 KYNFRA_TOOLS_PROJECT=<dir> usa i binari verificati sul registro di <dir>/.kynfra (e i suoi plugin di TFLint) invece
 di quelli del progetto temporaneo, es. gli strumenti installati con tools.py nel repository del kit.
+I pattern `single_env` si generano un ambiente per comando; `example` può essere un dizionario {ambiente: valore}.
+VARIANTS aggiunge combinazioni di input da verificare allo stesso modo (es. spa con zona esistente e /api/*).
 """
 import json
 import os
@@ -58,15 +60,30 @@ def with_requires(provider: str, pattern: str, seen=None) -> list:
     return seen
 
 
-def sample_values(provider: str, pattern: str) -> dict:
-    """Valori degli input richiesti senza default: il campo `example` di patterns.json."""
+# combinazioni di input in più per pattern: ognuna diventa un test con gli stessi controlli
+VARIANTS = {
+    "spa": [{"hosted_zone": "existing:Z0123456789ABCDEFGHIJ", "api_origin": "backend"}],
+}
+
+
+def sample_values(provider: str, pattern: str, env: str = "") -> dict:
+    """Valori degli input richiesti senza default: il campo `example` di patterns.json (per ambiente se è un
+    dizionario)."""
     out = {}
     for name, spec in generate.load_pattern(provider, pattern)["inputs"].items():
         if spec.get("required", True) and spec.get("default") is None:
             if "example" not in spec:
                 raise AssertionError(f"input '{name}' del pattern '{pattern}' senza example in patterns.json")
-            out[name] = str(spec["example"])
+            ex = spec["example"]
+            out[name] = str(ex[env] if isinstance(ex, dict) else ex)
     return out
+
+
+def generate_pattern(proj: Path, cfg: dict, provider: str, pattern: str, extra: dict = None) -> list:
+    """Genera il pattern per ENVS (un comando per ambiente se single_env); ritorna i risultati di generate."""
+    groups = [[e] for e in ENVS] if generate.load_pattern(provider, pattern).get("single_env") else [ENVS]
+    return [generate.generate(proj, cfg, provider, pattern, envs,
+                              {**sample_values(provider, pattern, envs[0]), **(extra or {})}) for envs in groups]
 
 
 def make_project(base: Path) -> dict:
@@ -84,14 +101,14 @@ def make_project(base: Path) -> dict:
 class PatternsTest(unittest.TestCase):
     maxDiff = None
 
-    def check_pattern(self, provider: str, pattern: str):
+    def check_pattern(self, provider: str, pattern: str, extra: dict = None):
         with tempfile.TemporaryDirectory(prefix=f"kynfra-{pattern}-") as d:
             proj = Path(d)
             cfg = make_project(proj)
             for p in with_requires(provider, pattern):
-                res = generate.generate(proj, cfg, provider, p, ENVS, sample_values(provider, p))
-                self.assertTrue(res["created"], p)
-                self.assertEqual(res["missing_requires"], [], p)
+                for res in generate_pattern(proj, cfg, provider, p, extra if p == pattern else None):
+                    self.assertTrue(res["created"], p)
+                    self.assertEqual(res["missing_requires"], [], p)
             findings = arch_check.run(proj, cfg)
             self.assertEqual([f.format() for f in findings], [], f"pattern {pattern}: arch_check --strict")
             iac = "tofu" if cfg["iac"] == "opentofu" else "terraform"
@@ -110,6 +127,10 @@ def _add_tests():
             def test(self, provider=provider, name=name):
                 self.check_pattern(provider, name)
             setattr(PatternsTest, f"test_pattern_{provider}_{name.replace('-', '_')}", test)
+            for i, extra in enumerate(VARIANTS.get(name, []), 1):
+                def variant(self, provider=provider, name=name, extra=extra):
+                    self.check_pattern(provider, name, extra)
+                setattr(PatternsTest, f"test_pattern_{provider}_{name.replace('-', '_')}_variant_{i}", variant)
 
 
 _add_tests()

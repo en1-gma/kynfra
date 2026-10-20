@@ -29,9 +29,15 @@ class SpaPatternTest(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory(prefix="kynfra-spa-")
         cls.proj = Path(cls._tmp.name)
         cfg = tp.make_project(cls.proj)
-        res = generate.generate(cls.proj, cfg, "aws", "spa", ["dev", "staging", "prod"],
-                                {"domain_name": "app.example.com", "hosted_zone": "create"})
-        assert res["created"]
+        cls.cfg = cfg
+        # un comando per ambiente, ognuno col proprio dominio nella zona example.com
+        cls.results = {}
+        for env, domain in (("prod", "app.example.com"), ("dev", "dev.app.example.com"),
+                            ("staging", "staging.app.example.com")):
+            cls.results[env] = generate.generate(cls.proj, cfg, "aws", "spa", [env],
+                                                 {"domain_name": domain, "hosted_zone": "create",
+                                                  "zone_name": "example.com"})
+            assert cls.results[env]["created"]
         cls.other = Path(cls._tmp.name) / "existing"
         cls.other.mkdir()
         cfg2 = tp.make_project(cls.other)
@@ -127,13 +133,37 @@ class SpaPatternTest(unittest.TestCase):
         self.assertTrue((self.proj / "infra/envs/shared/dns/main.tf").is_file())
         self.assertFalse((self.other / "infra/envs/shared").exists())
         shared = tfvars((self.proj / "infra/envs/shared/dns/terraform.tfvars").read_text(encoding="utf-8"))
-        self.assertEqual((shared["environment"], shared["domain_name"]), ("shared", "app.example.com"))
+        self.assertEqual((shared["environment"], shared["domain_name"], shared["zone_name"]),
+                         ("shared", "app.example.com", "example.com"))
+        # gli ambienti generati dopo il primo trovano la zona e non la riscrivono
+        self.assertIn("infra/envs/shared/dns/terraform.tfvars", self.results["dev"]["skipped"])
+        self.assertEqual(tfvars(self.stack("dev", "terraform.tfvars"))["domain_name"], "dev.app.example.com")
+        dns = (self.proj / "infra/envs/shared/dns" / "main.tf").read_text(encoding="utf-8")
+        self.assertRegex(dns, r'zone_name\s*=\s*var\.zone_name != "" \? var\.zone_name : var\.domain_name')
+        self.assertRegex(dns, r"name\s*=\s*local\.zone_name")
+        self.assertIn('output "zone_name"', (self.proj / "infra/envs/shared/dns/outputs.tf").read_text())
         backend = (self.proj / "infra/envs/shared/dns/backend.tf").read_text(encoding="utf-8")
         self.assertIn('key          = "acme/shared/dns.tfstate"', backend)
         main = self.stack("dev", "main.tf")
         self.assertIn('key    = "${var.project}/shared/dns.tfstate"', main)
         self.assertEqual(tfvars(self.stack("dev", "terraform.tfvars", self.other))["hosted_zone"],
                          "existing:Z0123456789ABC")
+
+    def test_spa_one_env_per_command(self):
+        with self.assertRaises(generate.GenerateError) as cm:
+            generate.generate(self.proj, self.cfg, "aws", "spa", ["dev", "prod"],
+                              {"domain_name": "app.example.com", "hosted_zone": "create"}, force=True)
+        self.assertIn("un ambiente per comando", str(cm.exception))
+
+    def test_spa_domain_checked_against_zone(self):
+        main = self.stack("prod", "main.tf")
+        zone = block(main, 'data "aws_route53_zone" "this"')
+        self.assertRegex(zone, r"zone_id\s*=\s*local\.zone_id")
+        self.assertIn("!self.private_zone", zone)
+        self.assertIn('endswith(var.domain_name, ".${trimsuffix(self.name, ".")}")', zone)
+        self.assertRegex(main, r"zone_id\s*=\s*data\.aws_route53_zone\.this\.zone_id")
+        self.assertRegex((self.proj / "infra/envs/shared/dns/variables.tf").read_text(),
+                         r'endswith\(var\.domain_name, "\.\$\{var\.zone_name\}"\)')
 
     def test_spa_waf_prod_only(self):
         self.assertEqual(tfvars(self.stack("prod", "terraform.tfvars"))["waf_enabled"], "true")
@@ -163,6 +193,13 @@ class SpaPatternTest(unittest.TestCase):
         self.assertRegex(block(text, 'resource "aws_cloudfront_cache_policy" "site"'), r"default_ttl\s*=\s*0")
         self.assertRegex(block(text, 'resource "aws_cloudwatch_log_delivery_source" "cdn"'),
                          r"resource_arn\s*=\s*aws_cloudfront_distribution\.this\.arn")
+        policy = block(text, 'resource "aws_s3_bucket_policy" "site"')
+        self.assertIn('Action    = "s3:ListBucket"', policy)
+        self.assertRegex(text, r'cdn_log_prefix\s*=\s*"cloudfront"')
+        self.assertIn('destination_resource_arn = "${aws_s3_bucket.logs.arn}/${local.cdn_log_prefix}"', text)
+        self.assertIn('Resource  = "${aws_s3_bucket.logs.arn}/${local.cdn_log_prefix}/*"', text)
+        self.assertRegex(self.module("variables.tf"),
+                         r'length\("\$\{var\.project\}-\$\{var\.environment\}-cdn-logs-000000000000"\) <= 63')
         for bucket in ("site", "logs"):
             self.assertRegex(block(text, f'resource "aws_s3_bucket_ownership_controls" "{bucket}"'),
                              r'object_ownership\s*=\s*"BucketOwnerEnforced"')
