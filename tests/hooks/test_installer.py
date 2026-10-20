@@ -209,6 +209,42 @@ class InstallerTest(InstallerCase):
         subprocess.run(["bash", "-n", str(PLUGIN / "templates/setup.sh")], check=True)
         json.loads((PLUGIN / "templates/codex-hooks.json").read_text())
 
+    def test_invalid_json_settings_abort_before_any_write(self):
+        for rel in (".claude/settings.json", ".codex/hooks.json"):
+            with self.subTest(rel=rel):
+                d = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, d, True)
+                (d / rel).parent.mkdir(parents=True)
+                (d / rel).write_text('{ // commento\n "permissions": {} }\n')
+                res = subprocess.run(["bash", str(PLUGIN / "install.sh"), "--target", str(d), "--no-plugin"],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn(rel, res.stderr)
+                self.assertEqual(sorted(p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file()), [rel])
+
+    def test_help_lists_every_flag(self):
+        res = subprocess.run(["bash", str(PLUGIN / "install.sh"), "--help"], check=True, capture_output=True, text=True)
+        for flag in ("--target", "--iac", "--providers", "--infra-root", "--project", "--envs", "--region",
+                     "--account-id", "--agents", "--ci", "--scope", "--no-plugin", "--force", "--uninstall"):
+            self.assertIn(flag, res.stdout)
+
+    def test_invalid_values_rejected(self):
+        bad = [("--project", "My_Proj"), ("--project", "-x"), ("--account-id", "123"), ("--account-id", "12345678901a"),
+               ("--region", "Europe"), ("--region", "eu-south-x"), ("--scope", "global"),
+               ("--envs", "dev,Prod"), ("--envs", "dev,a_b"), ("--infra-root", "a|b"),
+               ("--infra-root", "a&b"), ("--infra-root", "a\\b")]
+        for flag, val in bad:
+            with self.subTest(flag=flag, val=val):
+                d = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, d, True)
+                res = subprocess.run(["bash", str(PLUGIN / "install.sh"), "--target", str(d), "--no-plugin", flag, val],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse((d / ".kynfra").exists())
+                self.assertFalse((d / "tools").exists())
+        self.run_install("--project", "ok-1", "--account-id", "123456789012", "--region", "us-east-1",
+                         "--scope", "user", "--envs", "dev,prod-eu")
+
 
 if __name__ == "__main__":
     unittest.main()

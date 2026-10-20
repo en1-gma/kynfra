@@ -33,7 +33,7 @@ info() { printf '\033[36m•\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,6 +64,18 @@ case "$AGENTS" in claude|codex|both) ;; *) die "--agents: claude, codex o both" 
 case "${IAC:-terraform}" in terraform|opentofu) ;; *) die "--iac: terraform o opentofu" ;; esac
 case "$CI" in github|none) ;; *) die "--ci: github o none" ;; esac
 [ "$PROVIDERS" = aws ] || die "--providers: nella v1 solo aws"
+# ------------------------------------------------------------------ validazione (prima di qualsiasi scrittura)
+[ -z "$PROJECT" ] || printf '%s\n' "$PROJECT" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$' || die "--project: kebab-case (a-z, 0-9, trattini), ricevuto '$PROJECT'"
+[ -z "$ACCOUNT_ID" ] || printf '%s\n' "$ACCOUNT_ID" | grep -Eq '^[0-9]{12}$' || die "--account-id: 12 cifre, ricevuto '$ACCOUNT_ID'"
+printf '%s\n' "$REGION" | grep -Eq '^[a-z]{2}(-[a-z]+)+-[0-9]$' || die "--region: formato tipo eu-south-1, ricevuto '$REGION'"
+case "$SCOPE" in local|project|user) ;; *) die "--scope: local, project o user" ;; esac
+printf '%s\n' "$ENVS" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*(,[a-z0-9]+(-[a-z0-9]+)*)*$' || die "--envs: nomi kebab-case separati da virgola, ricevuto '$ENVS'"
+case "$INFRA_ROOT" in *'|'*|*'&'*|*'\'*) die "--infra-root: caratteri | & \\ non ammessi" ;; esac
+for f in "$TARGET/.claude/settings.json" "$TARGET/.codex/hooks.json"; do
+  [ -f "$f" ] || continue
+  python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f" >/dev/null 2>&1 \
+    || die "$f non è JSON valido (commenti o virgole finali?): correggilo e rilancia; non ho scritto nulla"
+done
 want_claude() { [ "$AGENTS" = claude ] || [ "$AGENTS" = both ]; }
 want_codex()  { [ "$AGENTS" = codex ]  || [ "$AGENTS" = both ]; }
 
