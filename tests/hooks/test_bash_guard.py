@@ -617,5 +617,57 @@ class FixRound2Tests(GuardCase):
                             "git restore native/spa/app.yaml", "git checkout HEAD~1 -- missingdir"])
 
 
+    def test_c1_namerefs_hash_and_more_exec_env(self):
+        put(self.proj, "envs/dev/spa/main.tf", "")
+        self.assert_denied([
+            "declare -n X=GIT_SSH_COMMAND; X='terraform apply'; git fetch", "typeset -n X=PATH; X=/tmp/evil; ls",
+            "local -n X=TF_CLI_ARGS", "declare -n X; X=y", "declare -gn X=LD_PRELOAD",
+            "hash -p /tmp/evil/git git; git status", "hash -p /tmp/x terraform",
+            ": ${GIT_SSH_COMMAND:='terraform apply'}; git fetch", ": ${PATH:=/tmp/evil}",
+            ": ${LD_PRELOAD=/tmp/x.so}", "echo ${TF_CLI_ARGS:=-auto-approve}",
+            "GIT_PROXY_COMMAND='terraform apply' git fetch", "LESSOPEN='|/tmp/x.sh %s' less a.txt",
+            "LESSCLOSE='/tmp/x.sh %s %s' less a.txt", "RSYNC_RSH='terraform apply' rsync a b:c",
+            "JAVA_TOOL_OPTIONS=-javaagent:/tmp/x.jar java -version", "_JAVA_OPTIONS=-Dx=y java -version",
+            "HOME=/tmp/evil git status", "export HOME=/tmp/x", "XDG_CONFIG_HOME=/tmp/evil git status",
+            "GIT_CONFIG_GLOBAL=/tmp/x git log", "GIT_TRACE=main.tf git status",
+            "GIT_TRACE_PACKET=envs/dev/spa/main.tf git fetch",
+        ])
+        self.assert_allowed(["GIT_PAGER=cat git log", "GIT_EDITOR=true git commit --amend --no-edit",
+                             "PATH=$PATH:/opt/bin ls", "ENV=prod ls", "GIT_TRACE=1 git status",
+                             "GIT_TRACE=/tmp/trace.log git status", "export -n FOO", "declare -x FOO=1",
+                             "echo ${FOO:=bar}", f"python3 -B {KIT}/arch_check.py ."])
+
+    def test_c2_kit_exemption_only_for_bare_python(self):
+        kit_code = "import subprocess\nsubprocess.run(['terraform', 'validate'])\nopen('main.tf', 'w')\n"
+        for name in bash_guard.KIT_SCRIPTS:
+            put(self.proj, f"{KIT}/{name}.py", kit_code)
+        self.assert_denied([
+            f"/tmp/evil/python3 -B {KIT}/arch_check.py .", f"./python3 -B {KIT}/arch_check.py .",
+            f"hash -p /tmp/evil/python3 python3; python3 -B {KIT}/arch_check.py .",
+            f"python3 -B {KIT}/arch_check.py . ; hash -p /tmp/evil/python3 python3",
+            f"declare -n P=PATH; python3 -B {KIT}/arch_check.py .",
+            f"PATH=/tmp/evil python3 -B {KIT}/arch_check.py .",
+        ])
+        self.assert_allowed([f"python3 -B {KIT}/arch_check.py .", f"python3.12 -B {KIT}/arch_check.py .",
+                             f"python -B {KIT}/tools.py status"])
+
+    def test_c3_stdin_from_file_via_rw_groups_and_exec(self):
+        put(self.proj, "evil.sh", "terraform apply\n")
+        put(self.proj, "ok.sh", "echo ok\n")
+        put(self.proj, "list.txt", "a\nb\n")
+        self.assert_denied([
+            "bash <> evil.sh", "bash 0<> evil.sh", "{ bash; } < evil.sh", "(bash) < evil.sh",
+            "exec < evil.sh; bash", "exec 3< evil.sh; bash <&3", "bash <&3", "{ python3; } < $F",
+            "exec < $F; sh", "{ bash; } <<'E'\nterraform apply\nE", "(sh) <<< 'terraform apply'",
+        ])
+        self.assert_allowed(["bash < ok.sh", "{ bash; } < ok.sh", "while read l; do echo $l; done < list.txt",
+                             "cat < list.txt", "bash -c true <&0"])
+
+    def test_c4_make_dynamic_makefile(self):
+        put(self.proj, "Makefile", "fmt:\n\tterraform fmt\n")
+        self.assert_denied(["make -f <(echo 'x:; terraform apply') x", "make --file=<(cat /tmp/m) x",
+                            "make -f $MF x", "make --file $(mktemp) x", "make -f<(cat /tmp/m) x"])
+        self.assert_allowed(["make fmt", "make -f Makefile fmt"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -62,18 +62,27 @@ ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)\+?=(.*)$", re.S)
 # dopo `$PATH`.
 EXEC_ENV = {
     **dict.fromkeys(("GIT_SSH_COMMAND", "GIT_SSH", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "PAGER",
-                     "MANPAGER", "EDITOR", "VISUAL", "GIT_ASKPASS", "SSH_ASKPASS"), "cmd"),
+                     "MANPAGER", "EDITOR", "VISUAL", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND",
+                     "RSYNC_RSH"), "cmd"),
     **dict.fromkeys(("GIT_EXTERNAL_DIFF", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG",
                      "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_DIR",
                      "BASH_ENV", "PROMPT_COMMAND", "PS0", "PS1", "PS4", "SHELLOPTS", "BASHOPTS", "ZDOTDIR",
                      "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
                      "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "NODE_OPTIONS", "NODE_PATH",
                      "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE", "PERL5OPT", "PERL5LIB",
-                     "PERLLIB", "RUBYOPT", "RUBYLIB", "MAKEFILES", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"), "deny"),
+                     "PERLLIB", "RUBYOPT", "RUBYLIB", "MAKEFILES", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS",
+                     "LESSOPEN", "LESSCLOSE", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "HOME", "XDG_CONFIG_HOME"),
+                  "deny"),
     "ENV": "file",
     "PATH": "path",
 }
 EXEC_ENV_RE = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_\d+")
+# GIT_TRACE*: un valore che non è 0/1/2-9/true/false è il file in cui git scrive la traccia
+GIT_TRACE_RE = re.compile(r"GIT_TRACE\w*")
+# `${NOME:=valore}` / `${NOME=valore}`: assegnazione dentro un'espansione
+PARAM_ASSIGN_RE = re.compile(r"([A-Za-z_]\w*):?=")
+# interprete python per nome, senza percorso: solo così vale l'esenzione degli script del kit
+BARE_PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?")
 MAKE_SHELL_RE = re.compile(r"^\s*(?:(?:override|export)\s+)*(SHELL|MAKESHELL|\.SHELLFLAGS)\s*(?::::?=|[:+?!]?=)\s*(.*)$")
 SAFE_SHELL_RE = re.compile(r"(?:(?:/usr|/usr/local|/opt/homebrew)?/bin/)?(?:env\s+)?(?:bash|sh|zsh|dash|ksh)")
 SAFE_SHELLFLAG_RE = re.compile(r"-[a-zA-Z]+|pipefail|errexit|nounset|xtrace|posix")
@@ -318,6 +327,11 @@ class Analyzer:
         self.writes: Set[str] = set()
         self.executed: Set[str] = set()
         self.installs = 0
+        # PATH, `hash`, nameref o variabili di EXEC_ENV toccati nel comando: niente esenzione del kit
+        self.env_tampered = False
+        # stdin dato a un gruppo (`{ …; } < f`, `( … ) < f`) o alla shell (`exec < f`): vale per tutto lo script
+        self.group_stdin: List[Arg] = []
+        self.group_bodies: List[str] = []  # heredoc/herestring dati a un gruppo
         self.protect = cfg.get("rules", {}).get("protected-files", "block") != "off"
         self.vars: Dict[str, Optional[str]] = {
             "HOME": str(Path.home()), "PWD": str(cwd), "CLAUDE_PROJECT_DIR": str(self.proj),
@@ -362,6 +376,11 @@ class Analyzer:
                 if not quoted and re.search(r"[*?\[]|\{[^}]*,", val):
                     globby = True
             elif kind in ("var", "pvar"):
+                pa = PARAM_ASSIGN_RE.match(val) if kind == "pvar" else None
+                if pa and self.sensitive_name(pa.group(1)):
+                    self.env_tampered = True
+                    self.deny(f"`${{{pa.group(1)}:=…}}`: assegna una variabile che fa eseguire codice o cambia "
+                              "le opzioni dei comandi (PATH, EXEC_ENV, TF_CLI_ARGS*)")
                 m = re.match(r"([A-Za-z_]\w*)", val)
                 name = m.group(1) if m and not val.startswith("#") else None
                 value = self.vars.get(name) if name else None
@@ -432,15 +451,37 @@ class Analyzer:
                 self.deny("comando non analizzabile: non verificabile")
             return
         cwds = list(cwds)
+        self.scan_tamper(text)
         for sub in lx.subs:
             self.script(sub, cwds, depth + 1)
         pipelines: Dict[int, List[Cmd]] = {}
         for cmd in cmds:
             pipelines.setdefault(cmd.pipeline, []).append(cmd)
-        for cmd in cmds:
-            self.command(cmd, cwds, depth)
+        outer, outer_bodies = self.group_stdin, self.group_bodies
+        files, bodies = self.shared_stdin(cmds)
+        self.group_stdin, self.group_bodies = outer + files, outer_bodies + bodies
+        try:
+            for cmd in cmds:
+                self.command(cmd, cwds, depth)
+        finally:
+            self.group_stdin, self.group_bodies = outer, outer_bodies
         for pl in pipelines.values():
             self.pipeline_checks(pl)
+
+    def shared_stdin(self, cmds: List[Cmd]) -> Tuple[List[Arg], List[str]]:
+        """File dati come stdin a un gruppo (`{ …; } < f`, `( … ) < f`, `done < f`) o alla shell stessa
+        (`exec < f`, `exec 3< f`): non si sa a quali comandi arrivano, quindi valgono per tutto lo script."""
+        out: List[Arg] = []
+        bodies: List[str] = []
+        for cmd in cmds:
+            head = [w.parts[0][1] if len(w.parts) == 1 and w.parts[0][0] == "lit" else None for w in cmd.words]
+            if head and head not in (["}"], ["done"], ["fi"], ["esac"], ["exec"]):
+                continue
+            for op, w in cmd.redirs:
+                if op in ("<", "<>"):
+                    out += self.expand(w)
+            bodies += [self.expand_join(w) for w in cmd.stdin]
+        return out, bodies
 
     def pipeline_checks(self, pl: List[Cmd]) -> None:
         for k, c in enumerate(pl):
@@ -459,8 +500,15 @@ class Analyzer:
             args += self.expand(w)
         ctx = Ctx(cwds, depth, piped=cmd.pos > 0, cmd=cmd)
         for op, w in cmd.redirs:
-            if op == "<":
+            if op in ("<", "<>"):
                 ctx.stdin_files += self.expand(w)
+                if op == "<":
+                    continue
+            if op == "<&":
+                for a in self.expand(w):
+                    if not re.fullmatch(r"0|-|0-", a.text):
+                        # stdin duplicato da un altro descrittore: è uno dei file aperti con `exec N< f`, se ci sono
+                        ctx.stdin_files += self.group_stdin or [Arg(f"&{a.text}", dyn=True)]
                 continue
             if op not in (">", ">>", ">|", "&>", "&>>", "<>", ">&"):
                 continue
@@ -474,6 +522,8 @@ class Analyzer:
                 self.target(a, cwds)
         cmd.writes = ctx.write_redir
         ctx.stdin = [self.expand_join(w) for w in cmd.stdin]
+        if not ctx.stdin and not ctx.stdin_files and not ctx.piped:
+            ctx.stdin_files, ctx.stdin = list(self.group_stdin), list(self.group_bodies)
         self.run(args, ctx)
 
     def check_assigns(self, assigns: List[Tuple[str, str]], ctx: Ctx) -> None:
@@ -491,8 +541,14 @@ class Analyzer:
     def exec_env(self, name: str, value: Optional[str], ctx: Ctx) -> None:
         """Variabile che fa eseguire codice (EXEC_ENV); `value` None = valore non determinabile (`read`, …)."""
         kind = EXEC_ENV.get(name) or ("deny" if EXEC_ENV_RE.fullmatch(name) else None)
+        if kind is None and GIT_TRACE_RE.fullmatch(name):
+            if value is not None and value.lower() not in ("", "0", "1", "true", "false") \
+                    and not re.fullmatch(r"[2-9]", value):
+                self.target(Arg(value, "$" in value), ctx.cwds)
+            return
         if kind is None:
             return
+        self.env_tampered = True
         if value is not None:
             if kind == "cmd":
                 self.script(value, ctx.cwds, ctx.depth + 1)
@@ -503,6 +559,19 @@ class Analyzer:
                 return
         what = "valore non determinabile" if value is None else "fa eseguire codice o caricare file non verificati"
         self.deny(f"variabile {name}: {what} (git, shell, interpreti, loader o make)")
+
+    @staticmethod
+    def sensitive_name(name: str) -> bool:
+        """Variabile che cambia i programmi eseguiti o le loro opzioni (EXEC_ENV, PATH, TF_CLI_ARGS*)."""
+        return name in EXEC_ENV or bool(EXEC_ENV_RE.fullmatch(name)) or name.upper().startswith("TF_CLI_ARGS")
+
+    def scan_tamper(self, text: str) -> None:
+        """Prima dell'analisi: il testo cambia PATH, `hash`, nameref o variabili di EXEC_ENV in un punto
+        qualsiasi (anche dopo o in una funzione) → gli script del kit non sono più esenti."""
+        names = [a or b for a, b in re.findall(r"(?<![\w$])([A-Za-z_]\w*)\+?=|\$\{([A-Za-z_]\w*):?=", text)]
+        if any(self.sensitive_name(n) for n in names) or re.search(
+                r"(?<![\w-])hash\b|(?<![\w-])(?:declare|typeset|local)\s+(?:[-+]\w+\s+)*-\w*n", text):
+            self.env_tampered = True
 
     @staticmethod
     def exec_env_set(ctx: Ctx) -> bool:
@@ -537,6 +606,10 @@ class Analyzer:
         elif name in ("mapfile", "readarray"):
             names += [a.text for a in _opt_split(args[1:], {"-d", "-n", "-O", "-s", "-u", "-C", "-c"})][:1]
         elif name in ("export", "declare", "typeset", "local", "readonly"):
+            if name in ("declare", "typeset", "local") and any(re.fullmatch(r"-\w*n\w*", x) for x in t[1:]):
+                self.env_tampered = True
+                self.deny(f"`{name} -n`: nameref, assegna variabili con un altro nome (PATH, EXEC_ENV, "
+                          "TF_CLI_ARGS*) e non è verificabile")
             for x in t[1:]:
                 if x.startswith(("-", "+")) or "=" in x:
                     continue
@@ -841,6 +914,11 @@ class Analyzer:
     # ------------------------------------------------------------ smistamento
 
     def dispatch(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        if name == "hash":
+            if any(re.fullmatch(r"-\w*p\w*", a.text) or a.dyn for a in args[1:]):
+                self.env_tampered = True
+                self.deny("`hash -p`: cambia il programma eseguito per un nome di comando, non verificabile")
+            return RO
         if name in ("read", "printf", "mapfile", "readarray", "export", "declare", "typeset", "local", "readonly"):
             self.builtin_names(name, args, ctx)
         if name in ("cd", "pushd"):
@@ -1437,7 +1515,8 @@ class Analyzer:
         if script.dyn:
             self.deny(f"script python non determinabile ({script.text}): non verificabile")
             return RW
-        if all(re.fullmatch(r"-[BIuEsSOq]+", o) for o in opts) and not self.exec_env_set(ctx):
+        if all(re.fullmatch(r"-[BIuEsSOq]+", o) for o in opts) and not self.exec_env_set(ctx) \
+                and not self.env_tampered and not args[0].dyn and BARE_PYTHON_RE.fullmatch(args[0].text):
             paths = self.resolve_all(script.text, ctx.cwds)
             kit = [p for p in paths if str(p) in self.kit_scripts]
             other = [p for p in paths if str(p) not in self.kit_scripts and p.is_file()]
@@ -1833,11 +1912,18 @@ class Analyzer:
                 i += 1
                 continue
             if x in ("-f", "--file", "--makefile") and nxt is not None:
+                if args[i + 1].dyn:
+                    self.deny(f"`make {x} {nxt}`: Makefile non determinabile (variabile, sostituzione o `<(…)`)")
+                    return RW
                 mfile, i = nxt, i + 2
                 continue
             if x in ("-C", "--directory") and nxt is not None:
                 mdir, i = nxt, i + 2
                 continue
+            if x.startswith(("--file=", "--makefile=", "-f")) and (args[i].dyn or x in ("--file=", "--makefile=")):
+                # `--file=$MF`, `--file=<(…)` (la `<(…)` è una parola a sé e il valore resta vuoto)
+                self.deny(f"`make {x}`: Makefile non determinabile (variabile, sostituzione o `<(…)`)")
+                return RW
             if x.startswith(("--file=", "--makefile=")):
                 mfile = x.split("=", 1)[1]
             elif x.startswith("--directory="):
