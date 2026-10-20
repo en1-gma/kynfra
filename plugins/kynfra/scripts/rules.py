@@ -311,6 +311,19 @@ def check_layout(rel: str, cfg: dict) -> List[Finding]:
 
 # Regole dei provider (Task 6+): provider in cfg["providers"] → funzioni (irel, blocks, text, cfg) -> List[Finding].
 PROVIDER_RULES: Dict[str, List[Callable]] = {}
+# Regole d'insieme dei provider: funzioni (files, cfg) -> List[Finding], con files = [(irel, blocchi)] di una cartella
+# Terraform (modules/<p>/, envs/<env>/<stack>/, bootstrap/) o, con `fn.scope == "project"`, dell'intero progetto.
+PROVIDER_PROJECT_RULES: Dict[str, List[Callable]] = {}
+# modulo che registra le regole del provider in PROVIDER_RULES/PROVIDER_PROJECT_RULES quando viene importato
+PROVIDER_MODULES: Dict[str, str] = {"aws": "rules_aws"}
+
+
+def _load_providers(cfg: dict) -> None:
+    import importlib
+    for prov in cfg.get("providers") or []:
+        mod = PROVIDER_MODULES.get(prov)
+        if mod and prov not in PROVIDER_RULES:
+            importlib.import_module(mod)
 
 
 def _rule_name(fn: Callable) -> str:
@@ -351,6 +364,7 @@ def check_content(rel: str, text: str, cfg: dict) -> List[Finding]:
                                     "possono verificare ciò che non leggono"))
         blocks = hcl.parse(text, filename)
         fns = list(rules_common.COMMON_RULES)
+        _load_providers(cfg)
         for prov in cfg.get("providers") or []:
             fns.extend(PROVIDER_RULES.get(prov, []))
     for fn in fns:
@@ -592,14 +606,50 @@ def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = Fa
     return out
 
 
+def _provider_project_findings(parsed, cfg: dict) -> List[Finding]:
+    """Regole d'insieme dei provider in config, per cartella Terraform (o sull'intero progetto se `scope` è
+    "project"). I percorsi dei finding tornano relativi al progetto."""
+    import rules_common
+
+    _load_providers(cfg)
+    fns: List[Callable] = []
+    for prov in cfg.get("providers") or []:
+        fns.extend(PROVIDER_PROJECT_RULES.get(prov, []))
+    if not fns:
+        return []
+    files = [(irel, blocks) for _, irel, _, blocks in parsed if not rules_common._native(irel)]
+    dirs: Dict[str, List[Tuple[str, list]]] = {}
+    for irel, blocks in files:
+        if irel.split("/")[0] in ("modules", "envs", "bootstrap"):
+            dirs.setdefault(posixpath.dirname(irel), []).append((irel, blocks))
+    root = cfg.get("infra_root", ".")
+    prefix = "" if root in ("", ".") else root + "/"
+    out: List[Finding] = []
+    for fn in fns:
+        groups = [("", files)] if getattr(fn, "scope", "dir") == "project" else sorted(dirs.items())
+        for d, group in groups:
+            try:
+                found = fn(group, cfg)
+            except Exception as e:  # fail closed, come in check_content
+                found = [Finding(getattr(fn, "rule", _rule_name(fn)), "block", (d + "/") if d else ".", 0,
+                                 f"errore interno della regola ({type(e).__name__}): segnala il problema e "
+                                 "verifica i file a mano")]
+            for f in found:
+                f.path = prefix + f.path if f.path != "." else (root or ".")
+            out.extend(found)
+    return out
+
+
 def check_project(proj: Path, cfg: dict, stop_gate: bool = False) -> List[Finding]:
     """Controlli sull'intero progetto: check_content su ogni file IaC, regole d'insieme per stack e bootstrap,
-    literal-reuse (con la soglia bloccante solo se `stop_gate`). Percorsi relativi al progetto."""
+    regole d'insieme dei provider (es. rules_aws.AWS_PROJECT_RULES), literal-reuse (con la soglia bloccante solo se
+    `stop_gate`). Percorsi relativi al progetto."""
     parsed = _parse_project(proj, cfg)
     per_file: List[Finding] = []
     for rel, _, text, _ in parsed:
         per_file.extend(check_content(rel, text, cfg))
     extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
+    extra.extend(_provider_project_findings(parsed, cfg))
     reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate)
     out = per_file + _post_process(extra, cfg)
     for f in _post_process(reuse, cfg):
