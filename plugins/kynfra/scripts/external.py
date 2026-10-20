@@ -115,6 +115,8 @@ def run_external(steps: List[Step], strict: bool, proj: Path,
             if step.name.startswith("validate") and step.cwd in failed_init:
                 continue
             env = dict(os.environ, TF_IN_AUTOMATION="1", TF_INPUT="0")
+            if tool == "tflint":
+                env["TFLINT_PLUGIN_DIR"] = str(proj / ".kynfra/tflint.d/plugins")
             if step.name.startswith(("init", "validate")):
                 if step.cwd not in data_dirs:
                     data_dirs[step.cwd] = tempfile.mkdtemp(dir=tmp)

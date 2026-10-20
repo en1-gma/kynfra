@@ -30,7 +30,8 @@
     "checksums_url": "https://github.com/terraform-linters/tflint-ruleset-aws/releases/download/v{version}/checksums.txt",
     "signature": "gpg-non-verificata",
     "archive": "zip",
-    "binary": "tflint-ruleset-aws"
+    "binary": "tflint-ruleset-aws",
+    "dest_rel": ".kynfra/tflint.d/plugins/github.com/terraform-linters/tflint-ruleset-aws/{version}/tflint-ruleset-aws"
   },
   "trivy": {
     "kind": "binary",

@@ -7,7 +7,9 @@ Regole (spec 7.3.1):
 - sorgenti solo https e solo host ufficiali in ALLOWED_HOSTS (anche dopo i redirect);
 - verifica: SHA256 dell'archivio scaricato contro il file SHA256SUMS ufficiale scaricato via HTTPS dallo stesso host.
   Le FIRME GPG NON sono verificate nella v1: la fiducia poggia su HTTPS + host ufficiale + checksum;
-- Checkov (kind "pypi"): virtualenv in .kynfra/venv e `pip install checkov==<versione>` da PyPI;
+- Checkov (kind "pypi"): virtualenv in .kynfra/venv; pip isolato (ambiente pulito, solo l'indice https://pypi.org/simple/,
+  solo wheel): prima `pip download checkov==<versione> --no-deps` per calcolare lo SHA256 della wheel, poi installazione
+  da quel file. Le wheel delle dipendenze NON sono fissate una per una nella v1 (arrivano dallo stesso indice);
 - installazione solo sotto .kynfra/bin e .kynfra/venv, mai globale, mai come root (niente sudo);
 - .kynfra/tools.lock.json lo scrive solo questo script (chiavi ordinate, indent 2).
 Solo libreria standard.
@@ -40,12 +42,15 @@ LOCK_REL = ".kynfra/tools.lock.json"
 BIN_REL = ".kynfra/bin"
 VENV_REL = ".kynfra/venv"
 ALLOWED_HOSTS = frozenset({
-    "releases.hashicorp.com", "github.com", "objects.githubusercontent.com", "pypi.org", "files.pythonhosted.org",
+    "releases.hashicorp.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+    "pypi.org", "files.pythonhosted.org",
 })
 ALIASES = {"tofu": "opentofu", "tflint-ruleset-aws": "tflint_ruleset_aws"}
 TRIVY_OS = {"darwin": "macOS", "linux": "Linux"}
 TRIVY_ARCH = {"amd64": "64bit", "arm64": "ARM64"}
 MAX_DOWNLOAD = 600 * 1024 * 1024
+PIP_INDEX = "https://pypi.org/simple/"
+PIP_OPTS = ["--isolated", "--index-url", PIP_INDEX, "--only-binary=:all:", "--no-input", "--disable-pip-version-check"]
 NO_VERSION_CHECK = {"tflint_ruleset_aws"}  # plugin di TFLint: non è eseguibile da solo
 
 
@@ -144,12 +149,20 @@ def lock_path(proj: Path) -> Path:
     return proj / LOCK_REL
 
 
-def read_lock(proj: Path) -> dict:
-    try:
-        data = _read_json(lock_path(proj))
-    except (OSError, ValueError):
+def read_lock(proj: Path, strict: bool = False) -> dict:
+    """Registro; se manca → vuoto. Con strict=True un registro illeggibile o malformato è un errore (non si
+    sovrascrive)."""
+    path = lock_path(proj)
+    if not path.exists():
         return {"tools": {}}
-    if not isinstance(data, dict) or not isinstance(data.get("tools"), dict):
+    try:
+        data = _read_json(path)
+        ok = isinstance(data, dict) and isinstance(data.get("tools"), dict)
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        if strict:
+            raise ToolError(f"{path} è illeggibile o malformato: non lo sovrascrivo, correggilo o ripristinalo da git")
         return {"tools": {}}
     return data
 
@@ -186,6 +199,8 @@ def sha256_file(path: Path) -> str:
 # ------------------------------------------------------------------ piano
 
 def _binary_path(proj: Path, e: dict) -> Path:
+    if e.get("dest_rel"):
+        return proj / e["dest_rel"].format(version=e["version"])
     sub = f"{VENV_REL}/bin" if e["kind"] == "pypi" else BIN_REL
     return proj / sub / e["binary"]
 
@@ -237,23 +252,31 @@ def _safe_names(names: List[str]) -> None:
             raise ToolError(f"archivio rifiutato: voce non sicura '{n}'")
 
 
+def _norm(name: str) -> str:
+    return posixpath.normpath(name)
+
+
 def _extract_binary(data: bytes, archive: str, binary: str) -> bytes:
     try:
         if archive == "zip":
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 _safe_names(z.namelist())
-                for info in z.infolist():
-                    if not info.is_dir() and posixpath.basename(info.filename) == binary:
-                        return z.read(info)
+                hits = [i for i in z.infolist() if not i.is_dir() and _norm(i.filename) == binary]
+                if len(hits) > 1:
+                    raise ToolError(f"archivio rifiutato: più voci '{binary}'")
+                if hits:
+                    return z.read(hits[0])
         elif archive == "tar.gz":
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
                 members = t.getmembers()
                 _safe_names([m.name for m in members])
-                for m in members:
-                    if m.isfile() and posixpath.basename(m.name) == binary:
-                        f = t.extractfile(m)
-                        if f is not None:
-                            return f.read()
+                hits = [m for m in members if m.isfile() and _norm(m.name) == binary]
+                if len(hits) > 1:
+                    raise ToolError(f"archivio rifiutato: più voci '{binary}'")
+                if hits:
+                    f = t.extractfile(hits[0])
+                    if f is not None:
+                        return f.read()
         else:
             raise ToolError(f"formato archivio non gestito: {archive}")
     except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as e:
@@ -265,19 +288,38 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _install_pypi(proj: Path, e: dict, run: Callable) -> Optional[str]:
+def _pip_env() -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PIP_")}
+    env["PIP_CONFIG_FILE"] = os.devnull
+    return env
+
+
+def _install_pypi(proj: Path, e: dict, run: Callable) -> str:
+    """Virtualenv + pip isolato dal solo indice PyPI ufficiale; ritorna lo SHA256 della wheel di checkov."""
     venv = proj / VENV_REL
     py = venv / "bin" / "python"
+    env = _pip_env()
     if not py.is_file():
-        r = run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True)
+        r = run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise ToolError(f"creazione del virtualenv fallita: {(r.stderr or r.stdout).strip()[-500:]}")
     spec = f"{e['binary']}=={e['version']}"
-    r = run([str(py), "-m", "pip", "install", "--disable-pip-version-check", spec], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ToolError(f"pip install {spec} fallito: {(r.stderr or r.stdout).strip()[-500:]}")
-    m = re.search(r"sha256[:=]([0-9a-f]{64})", (r.stdout or "") + (r.stderr or ""))
-    return m.group(1) if m else None
+    with tempfile.TemporaryDirectory(prefix="kynfra-pip-") as tmp:
+        r = run([str(py), "-m", "pip", "download", spec, "--no-deps", "-d", tmp, *PIP_OPTS],
+                capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise ToolError(f"pip download {spec} fallito: {(r.stderr or r.stdout).strip()[-500:]}")
+        wheels = sorted(Path(tmp).glob("*.whl"))
+        if len(wheels) != 1:
+            raise ToolError(f"pip download {spec}: attesa una sola wheel, trovate {len(wheels)}")
+        sha = sha256_file(wheels[0])
+        r = run([str(py), "-m", "pip", "install", str(wheels[0]), *PIP_OPTS],
+                capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise ToolError(f"pip install {spec} fallito: {(r.stderr or r.stdout).strip()[-500:]}")
+    if not (venv / "bin" / e["binary"]).is_file():
+        raise ToolError(f"pip ha terminato ma {venv / 'bin' / e['binary']} non esiste: installazione annullata")
+    return sha
 
 
 def install(proj: Path, tool: str, approved_by: str, fetch: Callable[[str], bytes] = urllib_fetch,
@@ -289,13 +331,14 @@ def install(proj: Path, tool: str, approved_by: str, fetch: Callable[[str], byte
         raise ToolError("non eseguire come root né con sudo: gli strumenti si installano nel progetto")
     e = _entry(tool)
     name = canonical(tool)
+    lock = read_lock(proj, strict=True)
     if os_ is None or arch is None:
         os_, arch = detect_platform()
     plan = plan_install(proj, name, os_, arch)
     dest = Path(plan["dest"])
     if e["kind"] == "pypi":
         sha = _install_pypi(proj, e, run)
-        bin_sha = sha256_file(dest) if dest.is_file() else None
+        bin_sha = sha256_file(dest)
         entry = {"version": e["version"], "source": "pypi", "sha256": sha, "binary_sha256": bin_sha}
     else:
         check_url(plan["url"])
@@ -315,7 +358,6 @@ def install(proj: Path, tool: str, approved_by: str, fetch: Callable[[str], byte
         entry = {"version": e["version"], "source": plan["url"], "sha256": actual,
                  "binary_sha256": hashlib.sha256(content).hexdigest()}
     entry.update(installed_at=_now(), approved_by=approved_by.strip())
-    lock = read_lock(proj)
     lock["tools"][name] = entry
     write_lock(proj, lock)
     return dict(entry, tool=name, path=str(dest))
@@ -331,7 +373,27 @@ def _tool_of_binary(binary: str) -> Optional[str]:
 
 
 def _candidates(proj: Path, name: str) -> List[Path]:
-    return [proj / BIN_REL / name, proj / VENV_REL / "bin" / name]
+    out = [proj / BIN_REL / name, proj / VENV_REL / "bin" / name]
+    tool = _tool_of_binary(name)
+    if tool and catalog()[tool].get("dest_rel"):
+        out.insert(0, _binary_path(proj, catalog()[tool]))
+    return out
+
+
+def version_in(version: str, text: str) -> bool:
+    """La versione compare nel testo come numero intero (1.10.5 non coincide con 1.10.50 né con 21.10.5)."""
+    return re.search(r"(?<![\d.])" + re.escape(version) + r"(?![\d]|\.\d)", text) is not None
+
+
+def _trusted(proj: Path, path: str, tool: str) -> bool:
+    """Un binario sotto .kynfra si esegue solo se il suo SHA256 coincide con il registro; fuori da .kynfra (PATH) sì."""
+    p = Path(path)
+    try:
+        p.resolve().relative_to((proj / ".kynfra").resolve())
+    except ValueError:
+        return True
+    want = read_lock(proj)["tools"].get(tool, {}).get("binary_sha256")
+    return bool(want) and p.is_file() and sha256_file(p) == want
 
 
 def resolve_binary(proj: Path, name: str) -> Optional[str]:
@@ -372,14 +434,18 @@ def verify_lock(proj: Path) -> List[str]:
             problems.append(f"{name}: nel registro ma il binario manca ({path})")
             continue
         want = rec.get("binary_sha256")
-        if want and sha256_file(path) != want:
-            problems.append(f"{name}: lo SHA256 del binario non coincide con il registro")
+        if not want:
+            problems.append(f"{name}: il registro non ha lo SHA256 del binario, non lo eseguo")
+            continue
+        if sha256_file(path) != want:
+            problems.append(f"{name}: lo SHA256 del binario non coincide con il registro, non lo eseguo")
+            continue
         if name in NO_VERSION_CHECK:
             continue
         out = installed_version(str(path), name)
         if out is None:
             problems.append(f"{name}: impossibile leggere la versione di {path}")
-        elif rec.get("version") and rec["version"] not in out:
+        elif rec.get("version") and not version_in(rec["version"], out):
             problems.append(f"{name}: versione installata diversa dal registro (registro {rec['version']})")
     return problems
 
@@ -396,9 +462,9 @@ def status(proj: Path, cfg: dict) -> List[dict]:
     for name, e in sorted(cat.items()):
         path = resolve_binary(proj, e["binary"])
         found = None
-        if path and name not in NO_VERSION_CHECK:
+        if path and name not in NO_VERSION_CHECK and _trusted(proj, path, name):
             out = installed_version(path, name)
-            found = e["version"] if out and e["version"] in out else (out.splitlines()[0] if out else None)
+            found = e["version"] if out and version_in(e["version"], out) else (out.splitlines()[0] if out else None)
         elif path:
             found = lock.get(name, {}).get("version")
         in_lock = name in lock
@@ -453,6 +519,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     except ToolError as e:
         print(f"errore: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"errore di sistema: {e}", file=sys.stderr)
         return 1
 
 

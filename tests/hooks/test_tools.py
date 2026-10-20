@@ -9,6 +9,9 @@ import tarfile
 import tempfile
 import unittest
 import unittest.mock
+import warnings
+import email.message
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -201,8 +204,16 @@ class ToolsTest(unittest.TestCase):
         f = bindir / "tflint"
         f.write_text("#!/bin/sh\n")
         f.chmod(0o755)
-        self.assertEqual(tools.resolve_binary(self.proj, "tflint"), str(f))
-        self.assertIsNone(tools.resolve_binary(self.proj, "nonesiste-xyz"))
+        pathdir = self.proj / "pathbin"
+        pathdir.mkdir()
+        g = pathdir / "tflint"
+        g.write_text("#!/bin/sh\n")
+        g.chmod(0o755)
+        with unittest.mock.patch.dict(os.environ, {"PATH": str(pathdir)}):
+            self.assertEqual(tools.resolve_binary(self.proj, "tflint"), str(f))
+            self.assertIsNone(tools.resolve_binary(self.proj, "nonesiste-xyz"))
+            f.unlink()
+            self.assertEqual(tools.resolve_binary(self.proj, "tflint"), str(g))
 
     def test_resolve_skips_tampered_binary(self):
         self.do_install("tflint")
@@ -220,7 +231,10 @@ class ToolsTest(unittest.TestCase):
         f.chmod(0o755)
         probs = tools.verify_lock(self.proj)
         self.assertTrue(any("SHA256" in p for p in probs), probs)
-        self.assertTrue(any("versione" in p for p in probs), probs)
+        lock = self.lock()  # hash allineato al file nuovo: resta solo la versione diversa
+        lock["tools"]["tflint"]["binary_sha256"] = tools.sha256_file(f)
+        (self.proj / ".kynfra/tools.lock.json").write_text(json.dumps(lock))
+        self.assertTrue(any("versione" in p for p in tools.verify_lock(self.proj)))
 
     def test_verify_lock_missing_binary(self):
         self.do_install("tflint")
@@ -229,6 +243,8 @@ class ToolsTest(unittest.TestCase):
 
     def test_status(self):
         self.do_install("tflint")
+        if tools.shutil.which("trivy"):
+            self.skipTest("trivy nel PATH")
         rows = {r["tool"]: r for r in tools.status(self.proj, {"iac": "opentofu", "scanner": "trivy"})}
         self.assertTrue(rows["tflint"]["ok"] and rows["tflint"]["in_lock"] and rows["tflint"]["required"])
         self.assertTrue(rows["opentofu"]["required"])
@@ -236,31 +252,140 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(rows["trivy"]["required"])
         self.assertFalse(rows["checkov"]["required"])
         self.assertFalse(rows["trivy"]["ok"])
-        self.assertIsNone(rows["trivy"]["path"] if not tools.shutil.which("trivy") else None)
+        self.assertFalse(rows["trivy"]["in_lock"])
 
-    def test_checkov_pypi(self):
-        calls = []
-
+    def fake_pip(self, calls, make_checkov=True, fail=None):
         def run(cmd, **kw):
-            calls.append(cmd)
+            calls.append((cmd, kw))
             if "venv" in cmd:
                 py = Path(cmd[-1]) / "bin" / "python"
                 py.parent.mkdir(parents=True)
                 py.write_text("")
-            else:
+            elif "download" in cmd:
+                (Path(cmd[cmd.index("-d") + 1]) / "checkov-1-py3-none-any.whl").write_bytes(b"wheel-bytes")
+            elif "install" in cmd and make_checkov:
                 b = Path(cmd[0]).parent / "checkov"
                 b.write_text("#!/bin/sh\necho 3\n")
                 b.chmod(0o755)
-            return unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            rc = 1 if fail and fail in cmd else 0
+            return unittest.mock.Mock(returncode=rc, stdout="", stderr="boom")
+        return run
 
-        rec = tools.install(self.proj, "checkov", "Mario", fetch=lambda u: b"", run=run)
+    def test_checkov_pypi(self):
+        calls = []
+        with unittest.mock.patch.dict(os.environ, {"PIP_INDEX_URL": "https://evil.example/", "PIP_EXTRA_INDEX_URL": "x"}):
+            rec = tools.install(self.proj, "checkov", "Mario", fetch=lambda u: b"", run=self.fake_pip(calls))
         v = tools.catalog()["checkov"]["version"]
-        self.assertTrue(any(f"checkov=={v}" in c for c in calls))
+        dl = [c for c in calls if "download" in c[0]][0]
+        ins = [c for c in calls if "install" in c[0]][0]
+        self.assertIn(f"checkov=={v}", dl[0])
+        for flag in ("--no-deps", "--isolated", "--only-binary=:all:", "--no-input"):
+            self.assertIn(flag, dl[0])
+        for cmd, kw in (dl, ins):
+            self.assertEqual(cmd[cmd.index("--index-url") + 1], "https://pypi.org/simple/")
+            self.assertEqual(kw["env"]["PIP_CONFIG_FILE"], os.devnull)
+            self.assertFalse([k for k in kw["env"] if k.startswith("PIP_") and k != "PIP_CONFIG_FILE"])
+        self.assertTrue(ins[0][ins[0].index("install") + 1].endswith(".whl"))
         e = self.lock()["tools"]["checkov"]
         self.assertEqual(e["source"], "pypi")
-        self.assertIsNone(e["sha256"])
+        self.assertEqual(e["sha256"], hashlib.sha256(b"wheel-bytes").hexdigest())
+        self.assertTrue(e["binary_sha256"])
         self.assertEqual(e["approved_by"], "Mario")
         self.assertEqual(rec["path"], str(self.proj / ".kynfra/venv/bin/checkov"))
+
+    def test_checkov_binary_missing_after_pip(self):
+        with self.assertRaises(tools.ToolError):
+            tools.install(self.proj, "checkov", "M", fetch=lambda u: b"", run=self.fake_pip([], make_checkov=False))
+        self.assertFalse((self.proj / ".kynfra/tools.lock.json").exists())
+
+    def test_checkov_pip_failure(self):
+        with self.assertRaises(tools.ToolError):
+            tools.install(self.proj, "checkov", "M", fetch=lambda u: b"", run=self.fake_pip([], fail="download"))
+        self.assertFalse((self.proj / ".kynfra/tools.lock.json").exists())
+
+    def test_ruleset_installed_in_plugin_dir(self):
+        self.do_install("tflint_ruleset_aws")
+        v = tools.catalog()["tflint_ruleset_aws"]["version"]
+        p = self.proj / f".kynfra/tflint.d/plugins/github.com/terraform-linters/tflint-ruleset-aws/{v}/tflint-ruleset-aws"
+        self.assertTrue(p.is_file())
+        self.assertFalse((self.proj / ".kynfra/bin/tflint-ruleset-aws").exists())
+        self.assertEqual(tools.verify_lock(self.proj), [])
+        self.assertEqual(tools.resolve_binary(self.proj, "tflint-ruleset-aws"), str(p))
+
+    def test_tflint_gets_plugin_dir_env(self):
+        import external
+        self.assertEqual(external.tools.catalog()["tflint"]["binary"], "tflint")
+        bindir = self.proj / ".kynfra/bin"
+        bindir.mkdir(parents=True)
+        f = bindir / "tflint"
+        f.write_text("#!/bin/sh\necho $TFLINT_PLUGIN_DIR > \"$0.out\"\n")
+        f.chmod(0o755)
+        step = external.Step("tflint", ["tflint"], self.proj, True)
+        external.run_external([step], False, self.proj)
+        self.assertEqual((bindir / "tflint.out").read_text().strip(), str(self.proj / ".kynfra/tflint.d/plugins"))
+
+    def test_verify_lock_never_executes_mismatched_binary(self):
+        self.do_install("tflint")
+        marker = self.proj / "marker"
+        f = self.proj / ".kynfra/bin/tflint"
+        f.write_text(f"#!/bin/sh\ntouch {marker}\necho 'fake 0.0.1'\n")
+        f.chmod(0o755)
+        tools.verify_lock(self.proj)
+        tools.status(self.proj, {})
+        self.assertFalse(marker.exists())
+
+    def test_never_executes_binary_without_lock_hash(self):
+        self.do_install("tflint")
+        lock = self.lock()
+        del lock["tools"]["tflint"]["binary_sha256"]
+        (self.proj / ".kynfra/tools.lock.json").write_text(json.dumps(lock))
+        marker = self.proj / "marker"
+        f = self.proj / ".kynfra/bin/tflint"
+        f.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        f.chmod(0o755)
+        self.assertTrue(tools.verify_lock(self.proj))
+        tools.status(self.proj, {})
+        self.assertFalse(marker.exists())
+
+    def test_redirect_to_allowed_host_accepted(self):
+        h = tools._AllowlistRedirect()
+        req = urllib.request.Request("https://github.com/a")
+        r = h.redirect_request(req, None, 302, "x", email.message.Message(),
+                               "https://release-assets.githubusercontent.com/b")
+        self.assertEqual(r.full_url, "https://release-assets.githubusercontent.com/b")
+
+    def test_malformed_lock_not_overwritten(self):
+        (self.proj / ".kynfra").mkdir()
+        lp = self.proj / ".kynfra/tools.lock.json"
+        lp.write_text("{rotto")
+        with self.assertRaises(tools.ToolError):
+            self.do_install("tflint")
+        self.assertEqual(lp.read_text(), "{rotto")
+        self.assertFalse((self.proj / ".kynfra/bin/tflint").exists())
+
+    def test_version_boundary(self):
+        self.assertTrue(tools.version_in("1.10.5", "Terraform v1.10.5\non linux"))
+        self.assertFalse(tools.version_in("1.10.5", "Terraform v1.10.50"))
+        self.assertFalse(tools.version_in("1.10.5", "v21.10.5"))
+        self.assertFalse(tools.version_in("1.10.5", "1.10.5.1"))
+
+    def test_archive_exact_toplevel_name_and_duplicates(self):
+        with self.assertRaises(tools.ToolError):
+            self.do_install("tflint", Env("tflint", archive=make_zip({"sub/tflint": b"x"})))
+        buf = io.BytesIO()
+        with warnings.catch_warnings(), zipfile.ZipFile(buf, "w") as z:
+            warnings.simplefilter("ignore")
+            z.writestr("tflint", b"a")
+            z.writestr("tflint", b"b")
+        with self.assertRaises(tools.ToolError):
+            self.do_install("tflint", Env("tflint", archive=buf.getvalue()))
+
+    def test_cli_oserror_message(self):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.proj)}), \
+                unittest.mock.patch("tools.install", side_effect=OSError("disco pieno")), \
+                unittest.mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(tools.main(["install", "tflint", "--approved-by", "x"]), 1)
+        self.assertIn("disco pieno", err.getvalue())
 
     def test_cli_install_requires_single_tool(self):
         with unittest.mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.proj)}), \
