@@ -3,8 +3,8 @@ variable "project" {
   description = "Nome del progetto (kebab-case): prefisso dei nomi delle risorse."
 
   validation {
-    condition     = can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", var.project))
-    error_message = "project deve essere kebab-case (minuscole, cifre e trattini)."
+    condition     = can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", var.project)) && length(var.project) <= 42
+    error_message = "project deve essere kebab-case (minuscole, cifre e trattini) e al massimo di 42 caratteri: il nome del bucket <project>-tfstate-<account_id> non supera 63."
   }
 }
 

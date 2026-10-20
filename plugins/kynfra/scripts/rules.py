@@ -415,18 +415,36 @@ def baseline_path() -> Path:
     return Path(__file__).resolve().parent.parent / "templates" / "scanner-baseline.json"
 
 
-def scanner_skips(cfg: dict, env: Optional[str]) -> List[str]:
-    """ID dello scanner configurato esclusi dalla baseline del kit per l'ambiente (env=None: solo le voci "*")."""
+def scanner_baseline(cfg: dict) -> List[dict]:
+    """Voci della baseline del kit per lo scanner configurato: {id, envs ("*" o lista), paths (glob relativi a
+    infra_root, default ["**"]), reason}. Le voci senza id si ignorano."""
     try:
         data = json.loads(baseline_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    ids: List[str] = []
-    for entry in data.get(cfg.get("scanner") or "checkov") or []:
-        envs = entry.get("envs")
+    out: List[dict] = []
+    for entry in (data.get(cfg.get("scanner") or "checkov") or []) if isinstance(data, dict) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+            continue
+        paths = entry.get("paths") or ["**"]
+        out.append({"id": entry["id"], "envs": entry.get("envs", "*"),
+                    "paths": [p for p in paths if isinstance(p, str)], "reason": str(entry.get("reason") or "")})
+    return out
+
+
+def baseline_allows(baseline: List[dict], check_id: str, irel: str) -> bool:
+    """Il controllo fallito `check_id` sul file `irel` (relativo a infra_root) è escluso da una voce della baseline:
+    stesso id, file che combacia con uno dei glob `paths`, ambiente dello stack (envs/<env>/…) tra gli `envs` della
+    voce. Fuori dagli stack (modules/, bootstrap/) l'ambiente non è noto: valgono solo le voci con envs "*"."""
+    key = stack_of(irel)
+    env = key[0] if key else None
+    for e in baseline:
+        if e["id"] != check_id or not any(_glob_match(irel, p) for p in e["paths"]):
+            continue
+        envs = e["envs"]
         if envs == "*" or (env is not None and isinstance(envs, list) and env in envs):
-            ids.append(entry["id"])
-    return ids
+            return True
+    return False
 
 
 def _post_process(findings: List[Finding], cfg: dict, report_config: bool = True) -> List[Finding]:

@@ -112,7 +112,7 @@ Nessun valore di segreto nei file, nelle variabili, nei `tfvars` o nello stato. 
 
 Nessuna soppressione inline. Un'eccezione è una voce in `.kynfra/config.json`: `exceptions: [{rule, path, resource, reason, expires}]`, con motivo e scadenza obbligatori; la scrive solo l'utente (file protetto). Scaduta `expires`, la regola torna a bloccare. Se una regola ti ostacola, correggi la causa; se serve davvero un'eccezione, chiedila all'utente indicando regola, percorso, risorsa e motivo.
 
-Per lo scanner (Checkov o Trivy) il kit ha una baseline di controlli esclusi, motivati e legati a un ambiente, in `tools/kynfra/` (protetta).
+Per lo scanner (Checkov o Trivy) il kit ha una baseline di controlli esclusi, motivati e limitati per ambiente e percorso (es. solo `bootstrap/**`), in `tools/kynfra/` (protetta): vale solo per quei file, il resto dei controlli falliti blocca.
 
 ## 6. Dove Terraform non copre (sez. 5.4 della spec)
 

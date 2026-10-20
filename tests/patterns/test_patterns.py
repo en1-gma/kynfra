@@ -2,7 +2,8 @@
 di riferimento (ambienti dev e prod, più i pattern richiesti) e deve passare arch_check in modalità strict con zero
 finding, avvisi compresi. Se terraform/tofu, tflint o checkov sono risolvibili (tools.resolve_binary) esegue anche gli
 strumenti esterni; con KYNFRA_REQUIRE_TOOLS=1 (CI) sono obbligatori. KYNFRA_PATTERNS="p1 p2" limita i pattern.
-Gli strumenti installati con tools.py nel repository del kit (.kynfra/, o KYNFRA_TOOLS_DIR) si riusano.
+KYNFRA_TOOLS_PROJECT=<dir> usa i binari verificati sul registro di <dir>/.kynfra (e i suoi plugin di TFLint) invece
+di quelli del progetto temporaneo, es. gli strumenti installati con tools.py nel repository del kit.
 """
 import json
 import os
@@ -37,7 +38,6 @@ REFERENCE_CONFIG = {
     "rules": {},
     "exceptions": [],
 }
-TOOL_LINKS = ("bin", "venv", "tflint.d", "tools.lock.json")
 
 
 def patterns(provider: str):
@@ -72,10 +72,6 @@ def sample_values(provider: str, pattern: str) -> dict:
 def make_project(base: Path) -> dict:
     (base / ".kynfra").mkdir(parents=True)
     (base / ".kynfra/config.json").write_text(json.dumps(REFERENCE_CONFIG), encoding="utf-8")
-    tools_home = Path(os.environ.get("KYNFRA_TOOLS_DIR") or ROOT / ".kynfra")
-    for name in TOOL_LINKS:
-        if (tools_home / name).exists():
-            os.symlink(tools_home / name, base / ".kynfra" / name)
     cfg = rules.load_config(base)
     infra = base / cfg["infra_root"]
     infra.mkdir(parents=True, exist_ok=True)
@@ -100,9 +96,11 @@ class PatternsTest(unittest.TestCase):
             self.assertEqual([f.format() for f in findings], [], f"pattern {pattern}: arch_check --strict")
             iac = "tofu" if cfg["iac"] == "opentofu" else "terraform"
             required = os.environ.get("KYNFRA_REQUIRE_TOOLS") == "1"
-            if not required and not any(tools.resolve_binary(proj, n) for n in (iac, "tflint", "checkov")):
+            tools_proj = Path(os.environ["KYNFRA_TOOLS_PROJECT"]) if os.environ.get("KYNFRA_TOOLS_PROJECT") else proj
+            if not required and not any(tools.resolve_binary(tools_proj, n) for n in (iac, "tflint", "checkov")):
                 return
-            errors, _ = external.run_external(external.external_steps(proj, cfg), required, proj, cfg)
+            errors, _ = external.run_external(external.external_steps(proj, cfg), required, proj, cfg,
+                                              tools_proj=tools_proj)
             self.assertEqual(errors, [], f"pattern {pattern}: strumenti esterni")
 
 

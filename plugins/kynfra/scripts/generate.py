@@ -51,6 +51,8 @@ VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 ACCOUNT_RE = re.compile(r"\d{12}")
 REGION_RE = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-\d")
 UNSAFE = ('"', "\\", "${", "%{", "{{", "}}")
+# chiavi del contesto fuori da quelle di base e di versione: gli input dei pattern non possono usarle
+CONTEXT_KEYS = ("account", "account_id", "state_bucket", "environment", "stack", "state_key", "envs")
 
 
 class GenerateError(Exception):
@@ -128,14 +130,32 @@ def _header(rel: str, pattern: str, version: str) -> str:
 
 
 def _render_file(src: Path, rel: str, ctx: Dict[str, str], pattern: str, version: str) -> str:
-    body = render(src.read_text(encoding="utf-8"), ctx).rstrip("\n") + "\n"
+    try:
+        text = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise GenerateError(f"template non UTF-8: {src}")
+    body = render(text, ctx).rstrip("\n") + "\n"
     return _header(rel, pattern, version) + body
 
 
 def _template_files(src_dir: Path) -> List[Path]:
+    """File dei template in ordine stabile, esclusi i file e le cartelle nascosti (.DS_Store, .terraform, …)."""
     if not src_dir.is_dir():
         return []
-    return sorted((p for p in src_dir.rglob("*") if p.is_file()), key=lambda p: p.relative_to(src_dir).as_posix())
+    files = (p for p in src_dir.rglob("*")
+             if p.is_file() and not any(part.startswith(".") for part in p.relative_to(src_dir).parts))
+    return sorted(files, key=lambda p: p.relative_to(src_dir).as_posix())
+
+
+def _merge(*parts: Dict[str, str]) -> Dict[str, str]:
+    """Unione dei pezzi di contesto; una chiave presente in due pezzi è un errore (nessuna sovrascrittura muta)."""
+    out: Dict[str, str] = {}
+    for part in parts:
+        clash = sorted(set(out) & set(part))
+        if clash:
+            raise GenerateError(f"chiavi di contesto in conflitto: {', '.join(clash)}")
+        out.update(part)
+    return out
 
 
 # ---------------------------------------------------------------- valori
@@ -197,7 +217,7 @@ def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[
     out: Dict[str, str] = {}
     env_defaults = (entry.get("env_defaults") or {}).get(env or "", {})
     for name, spec in sorted(entry["inputs"].items()):
-        if name in base:
+        if name in base or name in CONTEXT_KEYS:
             raise GenerateError(f"input '{name}' del pattern '{pattern}' ha un nome riservato")
         if name in values:
             value = values[name]
@@ -208,7 +228,7 @@ def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[
         elif spec.get("required", True):
             raise GenerateError(f"manca --var {name}=… ({spec.get('help', 'input richiesto')})")
         else:
-            value = ""
+            continue  # facoltativo senza default: fuori dal contesto (un template che lo usa è un errore)
         out[name] = _check_value(name, value, spec.get("type", "string"))
     return out
 
@@ -243,11 +263,11 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
             rel = f"{prefix}{dest_rel}/{src.relative_to(src_dir).as_posix()}"
             out.append((rel, _render_file(src, rel, ctx, pattern, version)))
 
-    plain = dict(base, **_inputs(entry, values, None, base, pattern))
+    plain = _merge(base, _inputs(entry, values, None, base, pattern))
     add(tpl / "modules" / pattern, f"modules/{pattern}", plain)
     if entry.get("dir"):
         account = _default_account(cfg, envs, values)
-        add(tpl / entry["dir"], entry["dir"], dict(plain, **_account_context(cfg, base, account)))
+        add(tpl / entry["dir"], entry["dir"], _merge(plain, _account_context(cfg, base, account)))
     stacks = list(entry.get("stacks") or [])
     if stacks:
         targets = ["shared"] if entry.get("shared") else list(envs)
@@ -255,10 +275,10 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
             raise GenerateError(f"il pattern '{pattern}' ha stack per ambiente: indica --env <ambiente>[,<ambiente>]")
         for env in targets:
             account = _default_account(cfg, envs, values) if env == "shared" else _env_account(cfg, env)
-            env_ctx = dict(base, **_inputs(entry, values, env, base, pattern),
-                           **_account_context(cfg, base, account), environment=env)
+            env_ctx = _merge(base, _inputs(entry, values, env, base, pattern), _account_context(cfg, base, account),
+                             {"environment": env})
             for stack in stacks:
-                ctx = dict(env_ctx, stack=stack, state_key=f"{base['project']}/{env}/{stack}.tfstate")
+                ctx = _merge(env_ctx, {"stack": stack, "state_key": f"{base['project']}/{env}/{stack}.tfstate"})
                 add(tpl / "stacks" / stack, f"envs/{env}/{stack}", ctx)
     if not out:
         raise GenerateError(f"il pattern '{pattern}' non ha template in {tpl}")
@@ -343,9 +363,9 @@ def generate(proj: Path, cfg: dict, provider: str, pattern: str, envs: List[str]
         os.replace(tmp, dest)
         created.append(rel)
     missing = [r for r in entry["requires"] if not _present(proj, cfg, provider, r, envs)]
-    summary = dict(_base_context(cfg, pattern, provider), envs=",".join(envs))
+    summary = _merge(_base_context(cfg, pattern, provider), {"envs": ",".join(envs)})
     try:
-        summary.update(_account_context(cfg, summary, _default_account(cfg, envs, values)))
+        summary = _merge(summary, _account_context(cfg, summary, _default_account(cfg, envs, values)))
     except GenerateError:
         pass
     next_steps = [render(s, summary) for s in entry.get("next_steps") or []]

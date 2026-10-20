@@ -1,5 +1,24 @@
 {
-  "_comment": "Baseline dello scanner del kit: le voci si aggiungono con i task dei pattern, ciascuna con il suo motivo (reason) e gli ambienti in cui vale (envs: lista oppure \"*\").",
-  "checkov": [],
+  "_comment": "Baseline dello scanner del kit: le voci si aggiungono con i task dei pattern. Ogni voce: id del controllo, envs (lista di ambienti o \"*\"; fuori da envs/<env>/ l'ambiente non è noto e valgono solo le voci \"*\"), paths (glob relativi a infra_root, default [\"**\"]) e reason. Si applica ai controlli falliti dell'output JSON dello scanner: solo id + percorso + ambiente che combaciano.",
+  "checkov": [
+    {
+      "id": "CKV_AWS_18",
+      "envs": "*",
+      "paths": ["bootstrap/**"],
+      "reason": "Bucket dello stato Terraform: il log di accesso S3 richiederebbe un secondo bucket da creare prima dello stato stesso, che a sua volta richiederebbe i log. Per tracciare le letture e le scritture dello stato si attivano i data event S3 di CloudTrail a livello di account."
+    },
+    {
+      "id": "CKV_AWS_144",
+      "envs": "*",
+      "paths": ["bootstrap/**"],
+      "reason": "Bucket dello stato Terraform: protetto da versioning, prevent_destroy e scadenza delle sole versioni non correnti; la replica in un'altra regione richiede un secondo bucket, un ruolo IAM e una chiave KMS nella regione di destinazione ed è una scelta del DevOps, non un default del kit."
+    },
+    {
+      "id": "CKV2_AWS_62",
+      "envs": "*",
+      "paths": ["bootstrap/**"],
+      "reason": "Bucket dello stato Terraform: scritto solo da Terraform con lock nativo; le notifiche di eventi non hanno un destinatario e non aggiungono protezione."
+    }
+  ],
   "trivy": []
 }

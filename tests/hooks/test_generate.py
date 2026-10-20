@@ -181,8 +181,8 @@ FAKE_PATTERNS = {
 }
 
 
-class FakeTemplatesTest(unittest.TestCase):
-    """Pattern con modulo e stack, su template finti (i pattern veri arrivano con i task successivi)."""
+class FakeTemplatesBase(unittest.TestCase):
+    """Template finti in una cartella temporanea (i pattern veri arrivano con i task successivi)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -208,6 +208,10 @@ class FakeTemplatesTest(unittest.TestCase):
     def tearDown(self):
         self.patch.stop()
         self._tmp.cleanup()
+
+
+class FakeTemplatesTest(FakeTemplatesBase):
+    """Pattern con modulo e stack."""
 
     def test_missing_requires_reported(self):
         res = generate.generate(self.d, self.cfg, "aws", "elb", ["dev", "prod"], {"domain": "example.com"})
@@ -246,6 +250,64 @@ class FakeTemplatesTest(unittest.TestCase):
 
 def clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PROJECT_DIR", "KYNFRA_PROJECT_DIR")}
+
+
+class TemplateFilesTest(FakeTemplatesBase):
+    def write_pattern(self, name, entry, files):
+        data = json.loads((self.tpl / "aws/patterns.json").read_text())
+        data[name] = {"requires": [], "inputs": {}, "stacks": [], "shared": False, **entry}
+        (self.tpl / "aws/patterns.json").write_text(json.dumps(data))
+        for rel, content in files.items():
+            p = self.tpl / "aws/modules" / name / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                p.write_bytes(content)
+            else:
+                p.write_text(content)
+
+    def test_headers_by_extension(self):
+        self.write_pattern("doc", {}, {"README.md": "# Doc {{ project }}\n", "policy.json": '{"a": 1}\n',
+                                       "main.tf": "# x\n"})
+        generate.generate(self.d, self.cfg, "aws", "doc", [], {})
+        mod = self.d / "infra/modules/doc"
+        version = generate.kit_version()
+        self.assertEqual((mod / "policy.json").read_text(), '{"a": 1}\n')
+        self.assertEqual((mod / "README.md").read_text(),
+                         f"<!-- Generato da kynfra {version} — pattern doc -->\n# Doc acme\n")
+        self.assertTrue((mod / "main.tf").read_text().startswith(f"# Generato da kynfra {version} — pattern doc\n"))
+
+    def test_dotfiles_skipped(self):
+        self.write_pattern("dots", {}, {"main.tf": "# x\n", ".DS_Store": b"\x00\xff", ".terraform/x.tf": "# y\n"})
+        res = generate.generate(self.d, self.cfg, "aws", "dots", [], {})
+        self.assertEqual(res["created"], ["infra/modules/dots/main.tf"])
+
+    def test_non_utf8_template_fails(self):
+        self.write_pattern("bin", {}, {"main.tf": b"\xff\xfe\x00"})
+        with self.assertRaises(generate.GenerateError):
+            generate.generate(self.d, self.cfg, "aws", "bin", [], {})
+
+    def test_reserved_input_names(self):
+        for name in ("environment", "state_key", "project", "aws_provider_constraint"):
+            self.write_pattern("bad", {"inputs": {name: {"type": "string", "required": False, "default": "x"}}},
+                               {"main.tf": "# x\n"})
+            with self.assertRaises(generate.GenerateError, msg=name):
+                generate.generate(self.d, self.cfg, "aws", "bad", [], {})
+
+    def test_merge_detects_collision(self):
+        with self.assertRaises(generate.GenerateError):
+            generate._merge({"a": "1"}, {"b": "2"}, {"a": "3"})
+
+    def test_optional_input_without_default_is_omitted(self):
+        self.write_pattern("opt", {"inputs": {"waf_arn": {"type": "string", "required": False}}},
+                           {"main.tf": "# x\n"})
+        generate.generate(self.d, self.cfg, "aws", "opt", [], {})
+        self.write_pattern("opt2", {"inputs": {"waf_arn": {"type": "string", "required": False}}},
+                           {"main.tf": 'arn = "{{ waf_arn }}"\n'})
+        with self.assertRaises(generate.GenerateError) as cm:
+            generate.generate(self.d, self.cfg, "aws", "opt2", [], {})
+        self.assertIn("waf_arn", str(cm.exception))
+        generate.generate(self.d, self.cfg, "aws", "opt2", [], {"waf_arn": "arn:aws:wafv2:x"})
+        self.assertIn('arn = "arn:aws:wafv2:x"', (self.d / "infra/modules/opt2/main.tf").read_text())
 
 
 class CliTest(unittest.TestCase):

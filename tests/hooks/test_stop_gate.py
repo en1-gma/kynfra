@@ -238,7 +238,8 @@ class ExternalStepsTest(Base):
         self.assertIn(str((self.proj / ".tflint.hcl").resolve()), by["tflint"].argv)
         self.assertEqual(by["checkov"].argv[0], "checkov")
         argv = by["checkov"].argv
-        self.assertEqual(argv[argv.index("--skip-check") + 1], "CKV_AWS_1,CKV_AWS_2")
+        self.assertNotIn("--skip-check", argv)  # la baseline si applica sull'output JSON
+        self.assertEqual(argv[argv.index("-o") + 1], "json")
 
     def test_opentofu_and_trivy(self):
         self.config(iac="opentofu", scanner="trivy")
@@ -351,6 +352,93 @@ class ExternalStepsTest(Base):
             with unittest.mock.patch("subprocess.run", side_effect=OSError("nope")):
                 errors, _ = external.run_external([step], False, self.proj)
             self.assertIn("impossibile eseguire", errors[0])
+
+
+CHECKOV_JSON = """#!{py}
+import json, sys
+print(json.dumps({{"check_type": "terraform", "results": {{"failed_checks": [
+    {{"check_id": "CKV_AWS_18", "check_name": "access log", "file_path": "/bootstrap/main.tf",
+     "file_line_range": [54, 60], "resource": "aws_s3_bucket.state"}},
+    {{"check_id": "CKV_AWS_18", "check_name": "access log", "file_path": "/envs/dev/spa/main.tf",
+     "file_line_range": [3, 9], "resource": "aws_s3_bucket.site"}},
+    {{"check_id": "CKV_AWS_7", "check_name": "rotation", "file_path": "/envs/prod/spa/main.tf",
+     "file_line_range": [12, 20], "resource": "aws_kms_key.k"}}]}}, "summary": {{"failed": 3}}}}))
+sys.exit(1)
+"""
+
+
+class CheckovBaselineTest(Base):
+    def setUp(self):
+        super().setUp()
+        base = self.tmp / "baseline.json"
+        base.write_text(json.dumps({"checkov": [
+            {"id": "CKV_AWS_18", "envs": "*", "paths": ["bootstrap/**"], "reason": "r"},
+            {"id": "CKV_AWS_7", "envs": ["dev"], "reason": "r"}]}))
+        orig = rules.baseline_path
+        rules.baseline_path = lambda: base
+        self.addCleanup(setattr, rules, "baseline_path", orig)
+
+    def run_checkov(self, script):
+        self.config()
+        self.bin.mkdir()
+        (self.bin / "checkov").write_text(script.format(py=sys.executable))
+        (self.bin / "checkov").chmod(0o755)
+        write(self.proj, stack())
+        cfg = rules.load_config(self.proj)
+        steps = [s for s in external.external_steps(self.proj, cfg) if s.name == "checkov"]
+        with unittest.mock.patch.dict(os.environ, self.env()):
+            return external.run_external(steps, True, self.proj)
+
+    def test_baseline_scoped_by_path_and_env(self):
+        errors, _ = self.run_checkov(CHECKOV_JSON)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2 controlli falliti", errors[0])
+        self.assertIn("CKV_AWS_18 aws_s3_bucket.site envs/dev/spa/main.tf:3", errors[0])
+        self.assertIn("CKV_AWS_7 aws_kms_key.k envs/prod/spa/main.tf:12", errors[0])
+        self.assertNotIn("bootstrap/main.tf", errors[0])
+
+    def test_all_failures_in_baseline_pass(self):
+        script = CHECKOV_JSON.replace('"/envs/dev/spa/main.tf"', '"/bootstrap/main.tf"').replace(
+            '"/envs/prod/spa/main.tf"', '"/envs/dev/spa/main.tf"')
+        self.assertEqual(self.run_checkov(script)[0], [])
+
+    def test_list_output_and_non_json(self):
+        root = Path("/r")
+        b = [{"id": "X", "envs": "*", "paths": ["**"], "reason": "r"}]
+        out = json.dumps([{"results": {"failed_checks": [{"check_id": "X", "file_path": "/a.tf"}]}},
+                          {"results": {"failed_checks": [{"check_id": "Y", "file_path": "/b.tf",
+                                                          "file_line_range": [2, 3], "resource": "r.y"}]}}])
+        errs = external.checkov_errors(out, 1, root, b)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("Y r.y b.tf:2", errs[0])
+        self.assertEqual(external.checkov_errors("", 0, root, b), [])
+        self.assertIn("exit 2", external.checkov_errors("Traceback", 2, root, b)[0])
+        self.assertIn("senza controlli", external.checkov_errors("{}", 1, root, b)[0])
+
+
+class ToolsProjectTest(Base):
+    def test_tools_resolved_from_tools_project(self):
+        self.config()
+        kit = self.tmp / "kit"
+        make_bin(kit / ".kynfra" / "bin", ("terraform", "tflint"))
+        lock = {"tools": {t: {"binary_sha256": external.tools.sha256_file(kit / ".kynfra/bin" / t)}
+                          for t in ("terraform", "tflint")}}
+        write(kit, {".kynfra/tools.lock.json": json.dumps(lock)})
+        write(self.proj, stack())
+        cfg = rules.load_config(self.proj)
+        steps = [s for s in external.external_steps(self.proj, cfg) if s.argv[0] in ("terraform", "tflint")]
+        self.bin.mkdir()
+        log_env = self.env()
+        with unittest.mock.patch.dict(os.environ, log_env):
+            errors, warnings = external.run_external(steps, True, self.proj, cfg)
+            self.assertTrue(any("non installato" in e for e in errors))  # nel progetto non ci sono
+            with unittest.mock.patch("subprocess.run", wraps=subprocess.run) as run:
+                errors, warnings = external.run_external(steps, True, self.proj, cfg, tools_proj=kit)
+        self.assertEqual((errors, warnings), ([], []))
+        exes = {c.args[0][0] for c in run.call_args_list}
+        self.assertEqual(exes, {str(kit / ".kynfra/bin/terraform"), str(kit / ".kynfra/bin/tflint")})
+        tflint_env = [c.kwargs["env"] for c in run.call_args_list if c.args[0][0].endswith("tflint")][0]
+        self.assertEqual(tflint_env["TFLINT_PLUGIN_DIR"], str(kit / ".kynfra/tflint.d/plugins"))
 
 
 class LiteralReuseStatsTest(Base):

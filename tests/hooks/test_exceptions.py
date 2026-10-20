@@ -103,7 +103,8 @@ class BaselineTest(unittest.TestCase):
         p.write_text(json.dumps({
             "_comment": "x",
             "checkov": [{"id": "CKV_A", "envs": ["dev", "staging"], "reason": "r"},
-                        {"id": "CKV_B", "envs": "*", "reason": "r"}],
+                        {"id": "CKV_B", "envs": "*", "reason": "r"},
+                        {"id": "CKV_C", "envs": "*", "paths": ["bootstrap/**"], "reason": "r"}],
             "trivy": [{"id": "AVD-1", "envs": "*", "reason": "r"}]}))
         rules.baseline_path = lambda: p
 
@@ -112,20 +113,34 @@ class BaselineTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_baseline_env_filter(self):
-        cfg = rules.normalize_config({})
-        self.assertEqual(rules.scanner_skips(cfg, "dev"), ["CKV_A", "CKV_B"])
-        self.assertEqual(rules.scanner_skips(cfg, "prod"), ["CKV_B"])
-        self.assertEqual(rules.scanner_skips(cfg, None), ["CKV_B"])
+        b = rules.scanner_baseline(rules.normalize_config({}))
+        self.assertEqual([e["id"] for e in b], ["CKV_A", "CKV_B", "CKV_C"])
+        self.assertEqual(b[0]["paths"], ["**"])  # default
+        self.assertTrue(rules.baseline_allows(b, "CKV_A", "envs/dev/spa/main.tf"))
+        self.assertFalse(rules.baseline_allows(b, "CKV_A", "envs/prod/spa/main.tf"))
+        self.assertFalse(rules.baseline_allows(b, "CKV_A", "modules/spa/main.tf"))  # ambiente non noto
+        self.assertTrue(rules.baseline_allows(b, "CKV_B", "modules/spa/main.tf"))
+        self.assertFalse(rules.baseline_allows(b, "CKV_Z", "modules/spa/main.tf"))
+
+    def test_baseline_paths_scope(self):
+        b = rules.scanner_baseline(rules.normalize_config({}))
+        self.assertTrue(rules.baseline_allows(b, "CKV_C", "bootstrap/main.tf"))
+        self.assertFalse(rules.baseline_allows(b, "CKV_C", "modules/spa/main.tf"))
+        self.assertFalse(rules.baseline_allows(b, "CKV_C", "envs/dev/spa/main.tf"))
 
     def test_baseline_scanner_choice(self):
-        cfg = rules.normalize_config({"scanner": "trivy"})
-        self.assertEqual(rules.scanner_skips(cfg, "prod"), ["AVD-1"])
+        b = rules.scanner_baseline(rules.normalize_config({"scanner": "trivy"}))
+        self.assertEqual([e["id"] for e in b], ["AVD-1"])
 
     def test_kit_baseline_file_valid(self):
         rules.baseline_path = self._orig
-        cfg = rules.normalize_config({})
-        self.assertEqual(rules.scanner_skips(cfg, "dev"), [])
-
+        import json
+        data = json.loads(rules.baseline_path().read_text())
+        for scanner in ("checkov", "trivy"):
+            for e in data[scanner]:
+                self.assertTrue(e["id"] and e["reason"].strip(), e)
+                self.assertTrue(e["envs"] == "*" or isinstance(e["envs"], list), e)
+                self.assertTrue(e["paths"] and all(isinstance(p, str) for p in e["paths"]), e)
 
 if __name__ == "__main__":
     unittest.main()

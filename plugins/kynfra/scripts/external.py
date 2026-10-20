@@ -5,12 +5,13 @@ Solo libreria standard.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import rules
 import tools
@@ -24,6 +25,8 @@ class Step:
     argv: List[str]  # argv[0] è il nome logico dello strumento, risolto da _resolve al momento dell'esecuzione
     cwd: Path
     required: bool = True
+    # analizza (stdout, exit code) e restituisce gli errori; None = solo exit code
+    parse: Optional[Callable[[str, int], List[str]]] = field(default=None, compare=False, repr=False)
 
 
 def _resolve(proj: Path, name: str) -> Optional[str]:
@@ -77,12 +80,60 @@ def external_steps(proj: Path, cfg: dict) -> List[Step]:
         # nessuna esclusione per Trivy: il flag per ID di controllo non è stabile tra le versioni
         steps.append(Step("trivy", ["trivy", "config", "--exit-code", "1", str(root.resolve())], root, True))
     else:
-        argv = ["checkov", "-d", str(root.resolve()), "--framework", "terraform", "--quiet", "--compact"]
-        skips = rules.scanner_skips(cfg, None)
-        if skips:
-            argv += ["--skip-check", ",".join(skips)]
-        steps.append(Step("checkov", argv, root, True))
+        # niente --skip-check: la baseline del kit è per id, percorso e ambiente e si applica sull'output JSON
+        argv = ["checkov", "-d", str(root.resolve()), "--framework", "terraform", "--quiet", "--compact",
+                "-o", "json"]
+        baseline = rules.scanner_baseline(cfg)
+        steps.append(Step("checkov", argv, root, True,
+                          parse=lambda out, rc: checkov_errors(out, rc, root.resolve(), baseline)))
     return steps
+
+
+def _checkov_reports(data) -> Optional[List[dict]]:
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
+        return None
+    return data
+
+
+def checkov_errors(out: str, rc: int, root: Path, baseline: List[dict]) -> List[str]:
+    """Errori dall'output JSON di Checkov: un errore per controllo fallito non escluso dalla baseline del kit
+    (rules.baseline_allows), con id, risorsa e file:riga relativi a infra_root. Output non JSON con exit code diverso
+    da 0: l'output stesso è l'errore."""
+    try:
+        reports = _checkov_reports(json.loads(out)) if out.strip() else []
+    except ValueError:
+        reports = None
+    if reports is None:
+        return [] if rc == 0 else [f"checkov (exit {rc}):\n{out.strip()[-3000:]}"]
+    failed: List[str] = []
+    seen_failures = 0
+    for rep in reports:
+        results = rep.get("results") if isinstance(rep.get("results"), dict) else {}
+        for fc in results.get("failed_checks") or []:
+            if not isinstance(fc, dict):
+                continue
+            seen_failures += 1
+            path = str(fc.get("file_path") or fc.get("repo_file_path") or "")
+            p = Path(path)
+            if p.is_absolute():
+                try:
+                    path = p.resolve().relative_to(root).as_posix()
+                except (ValueError, OSError):
+                    path = path.lstrip("/")
+            irel = path.lstrip("/")
+            cid = str(fc.get("check_id") or "")
+            if rules.baseline_allows(baseline, cid, irel):
+                continue
+            lines = fc.get("file_line_range") or [0]
+            line = lines[0] if isinstance(lines, list) and lines else 0
+            failed.append(f"- {cid} {fc.get('resource', '')} {irel}:{line} — {fc.get('check_name', '')}")
+    if failed:
+        return [f"checkov ({len(failed)} controlli falliti, fuori dalla baseline del kit):\n" + "\n".join(failed)]
+    if rc != 0 and seen_failures == 0:
+        return [f"checkov (exit {rc}) senza controlli falliti nell'output:\n{out.strip()[-3000:]}"]
+    return []
 
 
 def _install_hint(tool: str) -> str:
@@ -90,9 +141,11 @@ def _install_hint(tool: str) -> str:
 
 
 def run_external(steps: List[Step], strict: bool, proj: Path,
-                 cfg: Optional[dict] = None) -> Tuple[List[str], List[str]]:
-    """Esegue i passi; restituisce (errori, avvisi). `proj` serve a risolvere i binari in .kynfra/bin e venv; con `cfg`
-    controlla anche .tflint.hcl (errore in strict, avviso altrimenti)."""
+                 cfg: Optional[dict] = None, tools_proj: Optional[Path] = None) -> Tuple[List[str], List[str]]:
+    """Esegue i passi; restituisce (errori, avvisi). I binari (.kynfra/bin, venv, verificati sul registro) e i plugin
+    di TFLint si cercano in `tools_proj` (default: `proj`, il progetto stesso); con `cfg` controlla anche .tflint.hcl
+    (errore in strict, avviso altrimenti)."""
+    tools_proj = tools_proj or proj
     errors: List[str] = []
     warnings: List[str] = []
     missing: set = set()
@@ -106,7 +159,7 @@ def run_external(steps: List[Step], strict: bool, proj: Path,
             tool = step.argv[0]
             if tool in missing:
                 continue
-            exe = _resolve(proj, tool)
+            exe = _resolve(tools_proj, tool)
             if exe is None:
                 missing.add(tool)
                 msg = f"{tool} non installato: {_install_hint(tool)}"
@@ -116,7 +169,7 @@ def run_external(steps: List[Step], strict: bool, proj: Path,
                 continue
             env = dict(os.environ, TF_IN_AUTOMATION="1", TF_INPUT="0")
             if tool == "tflint":
-                env["TFLINT_PLUGIN_DIR"] = str(proj / ".kynfra/tflint.d/plugins")
+                env["TFLINT_PLUGIN_DIR"] = str(tools_proj / ".kynfra/tflint.d/plugins")
             if step.name.startswith(("init", "validate")):
                 if step.cwd not in data_dirs:
                     data_dirs[step.cwd] = tempfile.mkdtemp(dir=tmp)
@@ -130,7 +183,9 @@ def run_external(steps: List[Step], strict: bool, proj: Path,
             except OSError as e:
                 errors.append(f"{step.name}: impossibile eseguire {exe}: {e}")
                 continue
-            if r.returncode != 0:
+            if step.parse is not None:
+                errors.extend(step.parse(r.stdout, r.returncode))
+            elif r.returncode != 0:
                 if step.name.startswith("init"):
                     failed_init.add(step.cwd)
                 out = (r.stdout + r.stderr).strip()[-3000:]
