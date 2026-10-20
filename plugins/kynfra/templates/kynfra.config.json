@@ -1,0 +1,14 @@
+{
+  "iac": "__IAC__",
+  "providers": ["aws"],
+  "infra_root": "__INFRA_ROOT__",
+  "project": "__PROJECT__",
+  "region": "__REGION__",
+  "accounts": {"main": {"id": "__ACCOUNT_ID__"}},
+  "environments": {},
+  "tags": {"Owner": "", "CostCenter": ""},
+  "scanner": "checkov",
+  "rules": {},
+  "exceptions": [],
+  "stop_gate": {"enabled": true, "only_if_changes": true, "max_blocks": 3, "commands": []}
+}

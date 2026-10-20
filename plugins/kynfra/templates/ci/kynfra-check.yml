@@ -1,0 +1,28 @@
+name: kynfra-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Strumento __IAC__ (versione del registro, checksum verificato)
+        run: python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py install __IAC__ --approved-by ci
+      - name: Strumento tflint
+        run: python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py install tflint --approved-by ci
+      - name: Strumento tflint-ruleset-aws
+        run: python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py install tflint-ruleset-aws --approved-by ci
+      - name: Strumento checkov
+        run: python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py install checkov --approved-by ci
+      - name: Regole kynfra, fmt, validate, tflint, scanner (nessuna credenziale cloud)
+        run: python3 -B tools/kynfra/plugins/kynfra/scripts/arch_check.py . --strict --external
