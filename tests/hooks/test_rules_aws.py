@@ -983,6 +983,61 @@ class BypassRound1Test(Base):
         self.assertTrue(all(f.severity == "block" for f in out))
 
 
+class BypassRound2Test(Base):
+    def test_prod_stack_toggle_through_local_var_without_value(self):
+        text = ('locals {\n  w = var.web_acl_arn\n}\n'
+                + DIST.replace(NO_WAF, "  web_acl_id = local.w\n"))
+        var = 'variable "web_acl_arn" {\n  type        = string\n  description = "x"\n  default     = null\n}\n'
+        f = self.one(project({PROD + "cdn.tf": text, PROD + "variables.tf": var}, "cloudfront-https"), 0,
+                     contains="web_acl_arn")
+        self.assertEqual(f.path, PROD + "terraform.tfvars")
+
+    def test_module_toggle_shapes_rejected(self):
+        for expr in ("var.waf_enabled ? null : null", "true ? null : aws_wafv2_web_acl.this.arn",
+                     "false ? aws_wafv2_web_acl.this.arn : null",
+                     "var.waf_enabled && false ? aws_wafv2_web_acl.this[0].arn : null",
+                     "try(null, aws_wafv2_web_acl.this.arn)"):
+            text = DIST.replace(NO_WAF, f"  web_acl_id = {expr}\n")
+            self.one(run(MOD + "cdn.tf", text, "cloudfront-https"), 3, contains="waf_enabled")
+
+    def test_module_toggle_shapes_accepted(self):
+        for expr in ("var.web_acl_arn", "var.waf_enabled ? aws_wafv2_web_acl.this[0].arn : null",
+                     "aws_wafv2_web_acl.this[*].arn", "local.acl"):
+            text = 'locals {\n  acl = aws_wafv2_web_acl.this.arn\n}\n' + DIST.replace(NO_WAF, f"  web_acl_id = {expr}\n")
+            self.assertEqual(run(MOD + "cdn.tf", text, "cloudfront-https"), [], expr)
+        self.assertEqual(run(ELB_MOD + "lb.tf", ALB.replace("var.deletion_protection", "true"), "lb-https"), [])
+
+    def test_prod_stack_boolean_toggle_resource_ref_rejected(self):
+        text = ALB.replace("var.deletion_protection", "aws_ssm_parameter.p.insecure_value")
+        self.one(run("envs/prod/elb/lb.tf", text, "lb-https"), 5, contains="deletion protection")
+
+    def sg(self, dyn_for_each, cidr, local='{\n    ssh = { port = 22, cidr = "0.0.0.0/0", cidrs = ["0.0.0.0/0"] }\n  }'):
+        return (f'locals {{\n  rules = {local}\n}}\n\nresource "aws_security_group" "s" {{\n  dynamic "ingress" {{\n'
+                f'    for_each = {dyn_for_each}\n    content {{\n      from_port   = ingress.value.port\n'
+                f'      to_port     = ingress.value.port\n      protocol    = "tcp"\n      cidr_blocks = {cidr}\n'
+                '    }\n  }\n}\n')
+
+    def test_sg_dynamic_iterator_inside_list_and_lookup(self):
+        for cidr in ("[ingress.value.cidr]", 'lookup(ingress.value, "cidrs", [])', 'ingress.value["cidrs"]'):
+            self.one(run(MOD + "sg.tf", self.sg("local.rules", cidr), "sg-open"), 10, contains="22")
+
+    def test_sg_dynamic_identity_for_expression(self):
+        text = self.sg("{ for k, v in local.rules : k => v }", "ingress.value.cidrs")
+        self.one(run(MOD + "sg.tf", text, "sg-open"), 10, contains="22")
+
+    def test_sg_dynamic_unresolvable_for_each_fails_closed(self):
+        text = self.sg("{ for k, v in local.rules : k => v if v.port > 0 }", "ingress.value.cidrs")
+        self.one(run(MOD + "sg.tf", text, "sg-open"), 8, contains="for_each")
+        self.one(run(MOD + "sg.tf", self.sg("var.rules", "[ingress.value.cidr]"), "sg-open"), 8, contains="for_each")
+        self.assertEqual(run(MOD + "sg.tf", self.sg("var.rules", '["10.0.0.0/8"]'), "sg-open"), [])
+
+    def test_var_values_dedup_by_rule(self):
+        text = ('resource "aws_security_group_rule" "s" {\n  type        = "ingress"\n  from_port   = var.port\n'
+                '  to_port     = var.port\n  protocol    = "tcp"\n  cidr_blocks = ["0.0.0.0/0"]\n}\n')
+        var = 'variable "port" {\n  type        = number\n  description = "x"\n  default     = 22\n}\n'
+        self.assertEqual(len(project({MOD + "sg.tf": text, MOD + "variables.tf": var}, "sg-open")), 1)
+
+
 class RegistrationTest(unittest.TestCase):
     def test_rules_registered_for_aws(self):
         self.assertIs(rules.PROVIDER_RULES["aws"], rules_aws.AWS_RULES)

@@ -85,6 +85,9 @@ MESSAGES = {
                     "l'accesso amministrativo usa SSM Session Manager",
     "sg-port": "ingress da {cidr} su porte diverse da 80/443 ({ports}): dal mondo apri solo 80 e 443 (porte "
                "letterali), il resto da security group sorgenti o CIDR interni",
+    "sg-dynamic": "dynamic \"ingress\" con for_each non verificabile e CIDR presi dall'iteratore: scrivi le regole "
+                  "in un local con valori letterali (for_each = local.<nome>) o come blocchi/risorse espliciti, così "
+                  "i guardrail vedono CIDR e porte",
     # iam-least-privilege
     "iam-wildcard": "statement Allow con Action \"*\" (o NotAction) su Resource \"*\": elenca le azioni e gli ARN "
                     "delle risorse necessarie",
@@ -600,16 +603,29 @@ def _toggles_for(rtype: str) -> List[ProdToggle]:
     return [t for t in PROD_TOGGLES if rtype in t.types]
 
 
+REF_PATTERN = r"(?:data\.[A-Za-z_][\w-]*|aws_[\w-]+|module)\.[A-Za-z_][\w-]*(?:\[[^\]]*\])?(?:\.[\w-]+)+"
+
+
+def _arn_toggle(t: ProdToggle) -> bool:
+    """Toggle il cui attributo è un ARN/ID (web_acl_id, kms_key_id), non un booleano (enable_…)."""
+    return not t.attr.startswith("enable_")
+
+
 def _toggle_ok_in_module(raw: str, t: ProdToggle) -> bool:
-    """Nel modulo l'attributo può dipendere solo dalle variabili ammesse e deve citarne una o una risorsa."""
-    used = set(VAR_RE.findall(raw))
-    return not (used - set(t.variables)) and bool(used or RESOURCE_REF.search(raw))
+    """Forme ammesse nel modulo (dopo la risoluzione dei locals): `var.<ammessa>`, `var.<ammessa> ? <rif> : null`,
+    un riferimento a risorsa/data/modulo (anche con [0]/[*]); il letterale true lo valuta il chiamante. Ogni altra
+    espressione (condizionali costanti, try(), &&, …) non è verificabile."""
+    allowed = "|".join(re.escape(v) for v in t.variables)
+    return bool(re.fullmatch(rf"var\.(?:{allowed})", raw)
+                or re.fullmatch(rf"var\.(?:{allowed})\s*\?\s*{REF_PATTERN}\s*:\s*null", raw)
+                or _pure_ref(raw))
 
 
 def _prod_toggle_findings(irel: str, block: hcl.Block, cfg: dict, locs: Dict[str, hcl.Attr]) -> List[Finding]:
     """Toggle "solo prod" nei file: nei moduli l'attributo deve esserci e dipendere da una risorsa o da una variabile
     ammessa (PROD_TOGGLES); negli stack di prod deve essere un letterale vero, una var.<nome> (verificata nei tfvars
-    da `prod_toggles`) o un riferimento a una risorsa. Ogni altra espressione è non verificabile → finding."""
+    da `prod_toggles`) o, per i toggle ARN, un riferimento a una risorsa. Ogni altra espressione è non verificabile
+    → finding."""
     out: List[Finding] = []
     in_module = irel.startswith("modules/")
     if not (in_module or is_prod(irel, cfg)):
@@ -628,7 +644,7 @@ def _prod_toggle_findings(irel: str, block: hcl.Block, cfg: dict, locs: Dict[str
             elif in_module:
                 ok = _toggle_ok_in_module(raw, t)
             else:
-                ok = bool(re.fullmatch(r"var\.[A-Za-z_][\w-]*", raw) or _pure_ref(raw))
+                ok = bool(re.fullmatch(r"var\.[A-Za-z_][\w-]*", raw) or (_arn_toggle(t) and _pure_ref(raw)))
         if not ok:
             key = "prod-module" if in_module else "prod-stack"
             out.append(_f(t.rule, irel, line, key, _ref(block), what=t.what, stack_fix=t.stack_fix,
@@ -638,8 +654,7 @@ def _prod_toggle_findings(irel: str, block: hcl.Block, cfg: dict, locs: Dict[str
 
 def _pure_ref(raw: str) -> bool:
     """`raw` è solo un riferimento a una risorsa/data/modulo (es. aws_wafv2_web_acl.w.arn), senza logica."""
-    return re.fullmatch(r"(data\.[A-Za-z_][\w-]*|aws_[\w-]+|module)\.[A-Za-z_][\w-]*(\[[^\]]*\])?(\.[\w-]+)+",
-                        raw) is not None
+    return re.fullmatch(REF_PATTERN, raw) is not None
 
 
 # ---------------------------------------------------------------- regole per file
@@ -828,36 +843,75 @@ def _plain(v) -> bool:
     return v is not None
 
 
-def _dynamic_rules(dyn: hcl.Block, env: Dict[str, hcl.Attr]) -> List[hcl.Block]:
-    """Regole di un blocco `dynamic "ingress"`: un blocco per ogni elemento del for_each risolto (via locals/var),
-    con `<iteratore>.value[.<chiave>]` sostituito dal valore dell'elemento; il content così com'è se il for_each non
-    è risolvibile."""
+_IDENTITY_MAP = re.compile(r"\{\s*for\s+(\w+)\s*,\s*(\w+)\s+in\s+(.+?)\s*:\s*\1\s*=>\s*\2\s*\}", re.S)
+_IDENTITY_LIST = re.compile(r"\[\s*for\s+(\w+)\s+in\s+(.+?)\s*:\s*\1\s*\]", re.S)
+
+
+def _iter_items(fe: hcl.Attr, env: Dict[str, hcl.Attr]) -> Optional[List[Tuple[object, object]]]:
+    """(chiave, valore) degli elementi del for_each risolto (locals/var, for-expression identità); None se non
+    risolvibile."""
+    r = _resolve(fe, env)
+    raw = r.raw.strip()
+    for _ in range(5):
+        m = _IDENTITY_MAP.fullmatch(raw) or _IDENTITY_LIST.fullmatch(raw)
+        if not m:
+            break
+        inner = hcl.Attr("", r.line, m.group(m.lastindex))
+        r = _resolve(inner, env)
+        raw = r.raw.strip()
+    coll = _value(raw, r.line, env)
+    if isinstance(coll, dict):
+        return list(coll.items())
+    if isinstance(coll, list):
+        return [(v if isinstance(v, str) else i, v) for i, v in enumerate(coll)]
+    return None
+
+
+def _subst_iter(raw: str, it: str, key, item) -> str:
+    """Sostituisce in `raw` ogni `<it>.value.<k>`, `<it>.value["k"]`, `lookup(<it>.value, "k", …)`, `<it>.value` e
+    `<it>.key` con il letterale dell'elemento (se interamente letterale)."""
+    e = re.escape(it)
+
+    def lit(v, fallback: str) -> str:
+        return json.dumps(v) if _plain(v) else fallback
+
+    def field(k):
+        return item.get(k) if isinstance(item, dict) else None
+
+    raw = re.sub(rf"lookup\(\s*{e}\.value\s*,\s*\"([\w-]+)\"\s*(?:,\s*([^()]*?))?\s*\)",
+                 lambda m: lit(field(m.group(1)), m.group(2) if m.group(2) and field(m.group(1)) is None
+                               else m.group(0)), raw)
+    raw = re.sub(rf"(?<![\w.]){e}\.value(?:\.([\w-]+)|\[\"([\w-]+)\"\])",
+                 lambda m: lit(field(m.group(1) or m.group(2)), m.group(0)), raw)
+    raw = re.sub(rf"(?<![\w.]){e}\.value(?![\w.\[])", lambda m: lit(item, m.group(0)), raw)
+    raw = re.sub(rf"(?<![\w.]){e}\.key(?![\w.\[])", lambda m: lit(key, m.group(0)), raw)
+    return raw
+
+
+def _dynamic_rules(dyn: hcl.Block, env: Dict[str, hcl.Attr]) -> Tuple[List[hcl.Block], bool]:
+    """Regole di un `dynamic "ingress"`: un blocco per elemento del for_each risolto, con i riferimenti
+    all'iteratore sostituiti dai valori dell'elemento. Restituisce (blocchi, non_risolto): se il for_each non è
+    risolvibile, il content così com'è e True."""
     contents = dyn.children("content")
     fe = dyn.get("for_each")
     if not contents or fe is None:
-        return contents
-    r = _resolve(fe, env)
-    coll = _value(r.raw, r.line, env)
-    items = list(coll.values()) if isinstance(coll, dict) else coll if isinstance(coll, list) else None
+        return contents, False
+    items = _iter_items(fe, env)
     if items is None:
-        return contents
-    it_attr = dyn.get("iterator")
-    it = it_attr.raw.strip() if it_attr is not None else (dyn.labels[0] if dyn.labels else "ingress")
+        return contents, True
+    it = _iterator(dyn)
     out: List[hcl.Block] = []
     for content in contents:
-        for item in items:
-            attrs: Dict[str, hcl.Attr] = {}
-            for name, a in content.attrs.items():
-                raw = a.raw.strip()
-                m = re.fullmatch(rf"{re.escape(it)}\.value(?:\.([\w-]+)|\[\"([\w-]+)\"\])?", raw)
-                if m:
-                    key = m.group(1) or m.group(2)
-                    v = item if key is None else (item.get(key) if isinstance(item, dict) else None)
-                    if _plain(v):
-                        raw = json.dumps(v)
-                attrs[name] = hcl.Attr(name, a.line, raw)
+        for key, item in items:
+            attrs = {name: hcl.Attr(name, a.line, _subst_iter(a.raw.strip(), it, key, item))
+                     for name, a in content.attrs.items()}
             out.append(hcl.Block(content.type, [], content.line, content.end_line, attrs, []))
-    return out
+    return out, False
+
+
+def _iterator(dyn: hcl.Block) -> str:
+    it_attr = dyn.get("iterator")
+    return it_attr.raw.strip() if it_attr is not None else (dyn.labels[0] if dyn.labels else "ingress")
 
 
 def _sg_findings(irel: str, blocks: List[hcl.Block], env: Dict[str, hcl.Attr]) -> List[Finding]:
@@ -876,8 +930,19 @@ def _sg_findings(irel: str, blocks: List[hcl.Block], env: Dict[str, hcl.Attr]) -
     for sg in _resources(blocks, "aws_security_group", "aws_default_security_group"):
         ingress = list(sg.children("ingress"))
         for dyn in sg.children("dynamic"):
-            if dyn.labels[:1] == ["ingress"]:
-                ingress.extend(_dynamic_rules(dyn, env))
+            if dyn.labels[:1] != ["ingress"]:
+                continue
+            blocks_, unresolved = _dynamic_rules(dyn, env)
+            it = re.escape(_iterator(dyn))
+            # fail closed: CIDR che dipendono dall'iteratore di un for_each non risolvibile
+            if unresolved and any(re.search(rf"(?<![\w.]){it}\.(value|key)", a.raw)
+                                  for c in blocks_ for n, a in c.attrs.items()
+                                  if n in ("cidr_blocks", "ipv6_cidr_blocks")):
+                if (dyn.line, "dyn") not in seen:
+                    seen.add((dyn.line, "dyn"))
+                    out.append(_f("sg-open", irel, dyn.line, "sg-dynamic", _ref(sg)))
+                continue
+            ingress.extend(blocks_)
         for ing in ingress:
             check(ing, ("cidr_blocks", "ipv6_cidr_blocks"), "protocol", ing.line, _ref(sg))
     for r in _resources(blocks, "aws_security_group_rule"):
@@ -1382,8 +1447,8 @@ def var_values_project(files: Files, cfg: dict) -> List[Finding]:
         locs = _locals(blocks)
         env = {**dvars, **locs}
         for check in (_sg_findings, _eks_public):
-            plain = {(f.line, f.message) for f in check(irel, blocks, locs)}
-            out.extend(f for f in check(irel, blocks, env) if (f.line, f.message) not in plain)
+            plain = {(f.path, f.line, f.rule) for f in check(irel, blocks, locs)}
+            out.extend(f for f in check(irel, blocks, env) if (f.path, f.line, f.rule) not in plain)
     return out
 
 
@@ -1444,11 +1509,12 @@ def prod_toggles(files: Files, cfg: dict) -> List[Finding]:
 
     def toggle_vars(dir_files: Files, allowed_only: bool) -> List[Tuple[str, ProdToggle]]:
         found: List[Tuple[str, ProdToggle]] = []
+        dir_locals = _locals(b for _, b, _ in _tops(dir_files))  # locals di tutti i file della cartella
         for _, b, _ in _tops(dir_files):
             if b.type != "resource" or not b.labels:
                 continue
             for t in _toggles_for(b.labels[0]):
-                a = b.get(t.attr)
+                a = _resolve(b.get(t.attr), dir_locals)
                 if a is None:
                     continue
                 for v in VAR_RE.findall(a.raw):
