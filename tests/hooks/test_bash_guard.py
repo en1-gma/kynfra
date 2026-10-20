@@ -669,5 +669,29 @@ class FixRound2Tests(GuardCase):
                             "make -f $MF x", "make --file $(mktemp) x", "make -f<(cat /tmp/m) x"])
         self.assert_allowed(["make fmt", "make -f Makefile fmt"])
 
+    def test_d1_credential_reads(self):
+        self.assert_denied([
+            "aws ssm get-parameter --cli-input-json file://p.json", "aws ssm get-parameter --cli-input-yaml file://p.yml",
+            "aws ssm get-parameters --cli-input-json '{}'", "aws ssm get-parameters-by-path --cli-input-json=x",
+            "kubectl get --raw /api/v1/namespaces/x/secrets", "kubectl get --raw=/api/v1/namespaces/x/secrets/y",
+            "kubectl get --raw /api/v1/secrets",
+            "aws sts get-federation-token --name x", "aws sts assume-role --role-arn r --role-session-name s",
+            "aws sts assume-role-with-web-identity --role-arn r --role-session-name s --web-identity-token t",
+            "aws sso get-role-credentials --role-name r --account-id 1 --access-token t",
+            "aws codeartifact get-authorization-token --domain d", "aws eks get-token --cluster-name c",
+            "aws cognito-identity get-credentials-for-identity --identity-id i",
+            "aws cognito-identity get-open-id-token --identity-id i",
+            "aws cognito-identity get-open-id-token-for-developer-identity --identity-pool-id i",
+            "kubectl config view --raw=1", "kubectl config view --raw=TRUE", "kubectl config view --flatten",
+            "kubectl config view --raw=true", "kubectl config view --flatten=true",
+        ])
+        self.assert_allowed(["aws ssm get-parameter --name x", "kubectl config view", "kubectl get pods -o yaml",
+                             "kubectl get --help", "aws sts get-caller-identity", "kubectl config view --minify"])
+
+    def test_d2_dlx_runners(self):
+        self.assert_denied(["pnpm --package=x dlx y", "pnpm -s dlx y", "yarn -s dlx y", "pnpm --silent dlx y",
+                            "yarn --silent dlx y", "pnpm dlx y", "gem exec rubocop", "gem exec -g x y"])
+        self.assert_allowed(["pnpm exec tsc", "yarn tsc", "pnpm run dlx", "gem list", "gem env"])
+
 if __name__ == "__main__":
     unittest.main()

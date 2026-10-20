@@ -175,6 +175,11 @@ AWS_SECRET_OPS = {
     ("ec2", "get-password-data"): None, ("ecr", "get-login-password"): None,
     ("ecr", "get-authorization-token"): None, ("ecr-public", "get-login-password"): None,
     ("ecr-public", "get-authorization-token"): None, ("sts", "get-session-token"): None,
+    ("sts", "get-federation-token"): None, ("sso", "get-role-credentials"): None,
+    ("codeartifact", "get-authorization-token"): None, ("eks", "get-token"): None,
+    ("cognito-identity", "get-credentials-for-identity"): None,
+    ("cognito-identity", "get-open-id-token"): None,
+    ("cognito-identity", "get-open-id-token-for-developer-identity"): None,
 }
 KUBECTL_SECRET_RESOURCES = {"secret", "secrets"}
 KUBECTL_SAFE_OUTPUT = {"", "wide", "name"}
@@ -834,6 +839,12 @@ class Analyzer:
             self.script(" ".join(t[i:]), ctx.cwds, ctx.depth + 1)
             return None
         raw = args[0].text.rstrip("/").rsplit("/", 1)[-1].lower()
+        if n in ("pnpm", "yarn") and self.has_dlx(t):
+            self.deny(f"{n} dlx: scarica ed esegue un pacchetto")
+            return None
+        if n == "gem" and L > 1 and "exec" in t[1:3]:
+            self.deny("gem exec: scarica ed esegue un pacchetto")
+            return None
         if raw in ("bunx", "pnpx") or (n in ("pnpm", "yarn") and L > 1 and t[1] == "dlx") \
                 or (n == "bun" and L > 1 and t[1] == "x"):
             self.deny_tool(f"{raw if raw in ('bunx', 'pnpx') else n + ' ' + t[1]}: scarica ed esegue un pacchetto")
@@ -1251,6 +1262,12 @@ class Analyzer:
                 self.deny(f"`aws {svc} {op}`" + (f" {flag}" if flag else "") + ": restituisce segreti o credenziali "
                           "in chiaro; l'agente non li legge (li usa il DevOps o la pipeline)")
                 return RW
+        if svc == "ssm" and op in ("get-parameter", "get-parameters", "get-parameters-by-path",
+                                   "get-parameter-history") \
+                and any(a.text.startswith(("--cli-input-json", "--cli-input-yaml")) for a in args[2:]):
+            self.deny(f"`aws ssm {op} --cli-input-*`: l'input da file può includere WithDecryption e restituire "
+                      "segreti in chiaro")
+            return RW
         if (svc, op) == ("s3api", "get-object"):
             self.aws_outfile(args[1:], ctx)
         if op == "help" or op.startswith(("get-", "describe-", "list-")) or (svc, op) == ("s3", "ls") \
@@ -1289,8 +1306,11 @@ class Analyzer:
         elif sub == "get" and self.kubectl_secret_dump(args[1:], pos[1:]):
             self.deny("`kubectl get secret`: con -o yaml|json|jsonpath|template stampa i segreti in chiaro; "
                       "l'agente non li legge")
-        elif sub == "config" and second == "view" and any(a.text in ("--raw", "--raw=true") for a in args[1:]):
-            self.deny("`kubectl config view --raw`: stampa token e chiavi del kubeconfig; l'agente non li legge")
+        elif sub == "get" and any(a.text == "--raw" or a.text.startswith("--raw=") for a in args[1:]):
+            self.deny("`kubectl get --raw`: legge endpoint API arbitrari (anche /secrets); l'agente non li legge")
+        elif sub == "config" and second == "view" and any(
+                a.text.lower().startswith(("--raw", "--flatten")) for a in args[1:]):
+            self.deny("`kubectl config view --raw|--flatten`: stampa token e chiavi del kubeconfig; l'agente non li legge")
         elif sub in ("get", "describe", "explain", "version", "help") or (
                 sub == "config" and second in ("view", "get-contexts") and not pos[1].dyn):
             return RO
@@ -1299,6 +1319,16 @@ class Analyzer:
             self.deny(f"`{label}`: può modificare il cluster (consentiti get, describe, explain, version, "
                       "config view|get-contexts)")
         return RW
+
+    @staticmethod
+    def has_dlx(t: List[str]) -> bool:
+        """`dlx` come sottocomando di pnpm/yarn, anche dopo opzioni (`pnpm -s dlx`, `pnpm --package=x dlx`)."""
+        for i in range(1, len(t)):
+            if t[i] == "dlx":
+                return True
+            if not t[i].startswith("-") and not t[i - 1].startswith("-"):
+                return False  # primo sottocomando reale (run, exec, …)
+        return False
 
     @staticmethod
     def kubectl_secret_dump(rest: List[Arg], resources: List[Arg]) -> bool:
