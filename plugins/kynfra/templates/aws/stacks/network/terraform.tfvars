@@ -1,0 +1,10 @@
+project                 = "{{ project }}"
+environment             = "{{ environment }}"
+region                  = "{{ region }}"
+account_id              = "{{ account_id }}"
+owner                   = "{{ owner }}"
+cost_center             = "{{ cost_center }}"
+vpc_cidr                = "{{ vpc_cidr }}"
+az_count                = {{ az_count }}
+nat_per_az              = {{ nat_per_az }}
+flow_log_retention_days = {{ flow_log_retention_days }}

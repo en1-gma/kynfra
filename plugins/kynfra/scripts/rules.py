@@ -676,6 +676,8 @@ def _literal_occurrences(files: List[Tuple[str, list]], cfg: dict) -> Dict[str, 
             continue
         for block in blocks:
             for b in rules_common._walk_blocks([block]):
+                if b.type == "backend":
+                    continue  # il backend non ammette variabili né locals: il letterale per ambiente è inevitabile
                 for attr in b.attrs.values():
                     for key, value in _domain_literals(attr):
                         dv = _domain_value(key, value, project)

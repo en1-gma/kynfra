@@ -105,6 +105,11 @@ class ReuseTest(unittest.TestCase):
         files = [parsed("modules/net/a.tf", self.CIDR + self.CIDR)]
         self.assertEqual(rules.literal_reuse(files, cfg_for()), [])
 
+    def test_backend_blocks_are_not_counted(self):
+        b = 'terraform {\n  backend "s3" {\n    bucket = "proj-tfstate-123456789012"\n  }\n}\n'
+        files = [parsed("envs/dev/net/backend.tf", b), parsed("envs/prod/net/backend.tf", b)]
+        self.assertEqual(rules.literal_reuse(files, cfg_for(project="proj")), [])
+
     def test_tfvars_are_definitions(self):
         files = [parsed("envs/dev/spa/terraform.tfvars", 'vpc_cidr = "10.0.0.0/16"\n'),
                  parsed("modules/net/a.tf", self.CIDR)]

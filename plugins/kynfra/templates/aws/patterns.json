@@ -12,5 +12,47 @@
       "Conserva lo stato locale del bootstrap (terraform.tfstate) in un posto sicuro e fuori dal repository: descrive solo il bucket dello stato",
       "Gli stack in envs/ usano il backend s3 con bucket {{ state_bucket }}, region {{ region }}, encrypt = true e use_lockfile = true"
     ]
+  },
+  "network": {
+    "description": "VPC su 2-3 zone di disponibilità con subnet pubbliche, private e isolate (dati), NAT (uno per zona in prod, uno solo altrove), endpoint VPC (S3 gateway; ECR, Secrets Manager, STS, CloudWatch Logs interface), flow log su CloudWatch cifrati con KMS e security group di default senza regole.",
+    "requires": [],
+    "inputs": {
+      "vpc_cidr": {
+        "type": "string",
+        "default": "10.0.0.0/16",
+        "help": "CIDR della VPC (da /16 a /20)"
+      },
+      "az_count": {
+        "type": "number",
+        "default": 2,
+        "help": "Zone di disponibilità: 2 o 3"
+      },
+      "nat_per_az": {
+        "type": "bool",
+        "default": false,
+        "help": "Un NAT gateway per zona (true) o uno solo (false)"
+      },
+      "flow_log_retention_days": {
+        "type": "number",
+        "default": 90,
+        "help": "Retention in giorni dei flow log su CloudWatch Logs"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "az_count": "3",
+        "nat_per_az": "true",
+        "flow_log_retention_days": "365"
+      }
+    },
+    "stacks": [
+      "network"
+    ],
+    "shared": false,
+    "next_steps": [
+      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/network && {{ iac_cli }} init && {{ iac_cli }} plan -out=network.tfplan && {{ iac_cli }} apply network.tfplan",
+      "Costi fissi: NAT gateway (uno per zona in prod) ed endpoint VPC interface (cinque per ogni zona): in dev e staging un solo NAT",
+      "Gli stack elb ed eks leggono vpc_id e le subnet con terraform_remote_state (chiave {{ project }}/<env>/network.tfstate)"
+    ]
   }
 }

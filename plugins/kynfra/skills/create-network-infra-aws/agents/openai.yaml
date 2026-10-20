@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra network (AWS)"
+  short_description: "Generate the AWS VPC foundation with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-network-infra-aws to generate the network stack (VPC, subnets, NAT, endpoints, flow logs)."
+policy:
+  allow_implicit_invocation: false
