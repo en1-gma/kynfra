@@ -7,6 +7,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,11 +128,22 @@ def load_config(proj: Path) -> Optional[dict]:
     return normalize_config(raw)
 
 
+def _normalize_infra_root(value) -> str:
+    """infra_root relativo e normalizzato; vuoto, assoluto o fuori dal progetto diventa "."."""
+    v = str(value or ".").replace("\\", "/")
+    if v.startswith("/"):
+        return "."
+    norm = posixpath.normpath(v)
+    if norm in (".", "..") or norm.startswith("../"):
+        return "."
+    return norm.strip("/") or "."
+
+
 def normalize_config(raw: dict) -> dict:
     cfg = dict(raw)
     cfg["iac"] = raw.get("iac") if raw.get("iac") in ("terraform", "opentofu") else "terraform"
     cfg["providers"] = list(raw.get("providers") or ["aws"])
-    cfg["infra_root"] = (str(raw.get("infra_root") or ".").strip("/") or ".")
+    cfg["infra_root"] = _normalize_infra_root(raw.get("infra_root"))
     cfg["project"] = raw.get("project") or ""
     cfg["region"] = raw.get("region") or "eu-south-1"
     cfg["accounts"] = dict(raw.get("accounts") or {})

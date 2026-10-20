@@ -55,6 +55,13 @@ class RulesCoreTest(unittest.TestCase):
         self.assertEqual(rules.infra_rel("infra/envs/dev/spa/main.tf", cfg), "envs/dev/spa/main.tf")
         self.assertEqual(rules.infra_rel("envs/dev/spa/main.tf", cfg_for(".")), "envs/dev/spa/main.tf")
 
+    def test_infra_root_normalization(self):
+        for v in ("./infra", "infra/", "infra//", "infra\\"):
+            self.assertEqual(cfg_for(v)["infra_root"], "infra", v)
+        for v in ("..", "../x", "/abs", "", "."):
+            self.assertEqual(cfg_for(v)["infra_root"], ".", v)
+        self.assertEqual(rules.infra_rel("infra/envs/dev/spa/main.tf", cfg_for("./infra")), "envs/dev/spa/main.tf")
+
     def test_is_iac_file(self):
         for ok in ("a.tf", "a.tf.json", "a.tfvars", "a.tfvars.json", "native/spa/t.yaml", "native/spa/t.bicep"):
             self.assertTrue(rules.is_iac_file(ok), ok)
