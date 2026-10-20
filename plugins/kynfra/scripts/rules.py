@@ -630,10 +630,11 @@ def _provider_project_findings(parsed, cfg: dict) -> List[Finding]:
         for d, group in groups:
             try:
                 found = fn(group, cfg)
-            except Exception as e:  # fail closed, come in check_content
-                found = [Finding(getattr(fn, "rule", _rule_name(fn)), "block", (d + "/") if d else ".", 0,
+            except Exception as e:  # fail closed, come in check_content: un finding per ogni regola coperta
+                names = getattr(fn, "rules", None) or (getattr(fn, "rule", _rule_name(fn)),)
+                found = [Finding(name, "block", (d + "/") if d else ".", 0,
                                  f"errore interno della regola ({type(e).__name__}): segnala il problema e "
-                                 "verifica i file a mano")]
+                                 "verifica i file a mano") for name in names]
             for f in found:
                 f.path = prefix + f.path if f.path != "." else (root or ".")
             out.extend(found)

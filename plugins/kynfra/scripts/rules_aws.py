@@ -18,7 +18,9 @@ usa il modulo la attivi (argomento del modulo, `terraform.tfvars`/`*.auto.tfvars
 
 Gli attributi di sicurezza si verificano sul letterale: un valore che dipende da un'espressione non verificabile
 (variabile, funzione) è trattato come non conforme, salvo dove la spec prevede il valore per ambiente (toggle di prod,
-retention, ARN). I riferimenti `local.<nome>` a letterali dello stesso file si risolvono.
+retention, ARN). I riferimenti `local.<nome>` dello stesso file si risolvono; i `var.<nome>` di sg-open e
+dell'endpoint EKS si risolvono nella regola d'insieme `var_values_project` (default della variabile o tfvars della
+stessa cartella). Una variabile senza default né valore nella cartella resta non verificabile e non dà finding.
 """
 from __future__ import annotations
 
@@ -190,7 +192,10 @@ RESTRICTING_CONDITION_KEYS = {
     "s3:dataaccesspointaccount",
 }
 
-LOCAL_FULL = re.compile(r"local\.([A-Za-z_][\w-]*)")
+# riferimento risolvibile: `local.<nome>` (stesso file) o `var.<nome>` (default/tfvars della stessa cartella)
+REF_FULL = re.compile(r"(local|var)\.[A-Za-z_][\w-]*")
+# riferimento a una risorsa, data source o modulo (es. aws_wafv2_web_acl.w[0].arn)
+RESOURCE_REF = re.compile(r"(?<![\w.])(data\.[A-Za-z_][\w-]*|aws_[\w-]+|module)\.[A-Za-z_][\w-]*(\[[^\]]*\])?\.\w")
 VAR_RE = re.compile(r"\bvar\.([A-Za-z_][\w-]*)")
 FOR_RE = re.compile(r"^[\[{]\s*for\s")
 TFVARS_EXT = (".tfvars", ".tfvars.json")
@@ -220,22 +225,23 @@ def _walk(blocks: Iterable[hcl.Block]) -> Iterable[hcl.Block]:
 
 
 def _locals(blocks: Iterable[hcl.Block]) -> Dict[str, hcl.Attr]:
+    """Ambiente di risoluzione del file: {"local.<nome>": valore}."""
     out: Dict[str, hcl.Attr] = {}
     for b in blocks:
         if b.type == "locals":
-            out.update(b.attrs)
+            out.update((f"local.{k}", a) for k, a in b.attrs.items())
     return out
 
 
 def _resolve(attr: Optional[hcl.Attr], locs: Dict[str, hcl.Attr]) -> Optional[hcl.Attr]:
-    """Segue `local.<nome>` verso il valore definito nello stesso file (fino a 5 livelli)."""
+    """Segue `local.<nome>`/`var.<nome>` presenti nell'ambiente (fino a 5 livelli)."""
     for _ in range(5):
         if attr is None:
             return None
-        m = LOCAL_FULL.fullmatch(attr.raw.strip())
-        if not m or m.group(1) not in locs:
+        raw = attr.raw.strip()
+        if not REF_FULL.fullmatch(raw) or raw not in locs:
             return attr
-        attr = locs[m.group(1)]
+        attr = locs[raw]
     return attr
 
 
@@ -322,9 +328,8 @@ def _value(raw: str, line: int, locs: Dict[str, hcl.Attr], depth: int = 0):
     raw = raw.strip()
     if depth > 20:
         return Expr(raw)
-    m = LOCAL_FULL.fullmatch(raw)
-    if m and m.group(1) in locs:
-        a = locs[m.group(1)]
+    if REF_FULL.fullmatch(raw) and raw in locs:
+        a = locs[raw]
         return _value(a.raw, a.line, locs, depth + 1)
     attr = hcl.Attr("", line, raw)
     if raw.startswith("{") and not FOR_RE.match(raw):
@@ -595,26 +600,46 @@ def _toggles_for(rtype: str) -> List[ProdToggle]:
     return [t for t in PROD_TOGGLES if rtype in t.types]
 
 
-def _prod_toggle_findings(irel: str, block: hcl.Block, cfg: dict) -> List[Finding]:
-    """Nei file di prod l'attributo deve essere attivo; nei moduli deve poterlo essere tramite una variabile ammessa."""
+def _toggle_ok_in_module(raw: str, t: ProdToggle) -> bool:
+    """Nel modulo l'attributo può dipendere solo dalle variabili ammesse e deve citarne una o una risorsa."""
+    used = set(VAR_RE.findall(raw))
+    return not (used - set(t.variables)) and bool(used or RESOURCE_REF.search(raw))
+
+
+def _prod_toggle_findings(irel: str, block: hcl.Block, cfg: dict, locs: Dict[str, hcl.Attr]) -> List[Finding]:
+    """Toggle "solo prod" nei file: nei moduli l'attributo deve esserci e dipendere da una risorsa o da una variabile
+    ammessa (PROD_TOGGLES); negli stack di prod deve essere un letterale vero, una var.<nome> (verificata nei tfvars
+    da `prod_toggles`) o un riferimento a una risorsa. Ogni altra espressione è non verificabile → finding."""
     out: List[Finding] = []
     in_module = irel.startswith("modules/")
     if not (in_module or is_prod(irel, cfg)):
         return out
     for t in _toggles_for(block.labels[0]):
         a = block.get(t.attr)
-        res = _ref(block)
+        r = _resolve(a, locs)
         line = a.line if a is not None else block.line
-        if a is None or _truth(a) is False:
+        if r is None:
+            ok = False
+        else:
+            truth = _truth(r)
+            raw = r.raw.strip()
+            if truth is not None:
+                ok = truth
+            elif in_module:
+                ok = _toggle_ok_in_module(raw, t)
+            else:
+                ok = bool(re.fullmatch(r"var\.[A-Za-z_][\w-]*", raw) or _pure_ref(raw))
+        if not ok:
             key = "prod-module" if in_module else "prod-stack"
-            out.append(_f(t.rule, irel, line, key, res, what=t.what, stack_fix=t.stack_fix,
+            out.append(_f(t.rule, irel, line, key, _ref(block), what=t.what, stack_fix=t.stack_fix,
                           module_fix=t.module_fix, vars=", ".join(t.variables)))
-        elif in_module:
-            used = set(VAR_RE.findall(a.raw))
-            if used - set(t.variables):
-                out.append(_f(t.rule, irel, line, "prod-module", res, what=t.what, module_fix=t.module_fix,
-                              vars=", ".join(t.variables), stack_fix=t.stack_fix))
     return out
+
+
+def _pure_ref(raw: str) -> bool:
+    """`raw` è solo un riferimento a una risorsa/data/modulo (es. aws_wafv2_web_acl.w.arn), senza logica."""
+    return re.fullmatch(r"(data\.[A-Za-z_][\w-]*|aws_[\w-]+|module)\.[A-Za-z_][\w-]*(\[[^\]]*\])?(\.[\w-]+)+",
+                        raw) is not None
 
 
 # ---------------------------------------------------------------- regole per file
@@ -682,7 +707,7 @@ def cloudfront_https(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -
             elif re.search(r"bucket_(regional_)?domain_name|\.s3[.-]", draw) and \
                     o.get("origin_access_control_id") is None:
                 out.append(_f("cloudfront-https", irel, o.line, "cf-oac", res))
-        out.extend(_prod_toggle_findings(irel, d, cfg))
+        out.extend(_prod_toggle_findings(irel, d, cfg, locs))
     return out
 
 
@@ -737,7 +762,7 @@ def lb_https(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[F
         logs = lb.children("access_logs")
         if not logs or not _is_true(logs[0], "enabled", locs) or logs[0].get("bucket") is None:
             out.append(_f("lb-https", irel, logs[0].line if logs else lb.line, "lb-logs", res))
-        out.extend(_prod_toggle_findings(irel, lb, cfg))
+        out.extend(_prod_toggle_findings(irel, lb, cfg, locs))
     return out
 
 
@@ -792,32 +817,80 @@ def _sg_problem(b: hcl.Block, proto_attr: str, locs) -> Optional[Tuple[str, str]
     return "sg-port", ports
 
 
-def sg_open(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
+def _plain(v) -> bool:
+    """Valore interamente letterale (nessuna Expr dentro): si può riscrivere come letterale HCL."""
+    if isinstance(v, Expr):
+        return False
+    if isinstance(v, dict):
+        return all(_plain(x) for x in v.values())
+    if isinstance(v, list):
+        return all(_plain(x) for x in v)
+    return v is not None
+
+
+def _dynamic_rules(dyn: hcl.Block, env: Dict[str, hcl.Attr]) -> List[hcl.Block]:
+    """Regole di un blocco `dynamic "ingress"`: un blocco per ogni elemento del for_each risolto (via locals/var),
+    con `<iteratore>.value[.<chiave>]` sostituito dal valore dell'elemento; il content così com'è se il for_each non
+    è risolvibile."""
+    contents = dyn.children("content")
+    fe = dyn.get("for_each")
+    if not contents or fe is None:
+        return contents
+    r = _resolve(fe, env)
+    coll = _value(r.raw, r.line, env)
+    items = list(coll.values()) if isinstance(coll, dict) else coll if isinstance(coll, list) else None
+    if items is None:
+        return contents
+    it_attr = dyn.get("iterator")
+    it = it_attr.raw.strip() if it_attr is not None else (dyn.labels[0] if dyn.labels else "ingress")
+    out: List[hcl.Block] = []
+    for content in contents:
+        for item in items:
+            attrs: Dict[str, hcl.Attr] = {}
+            for name, a in content.attrs.items():
+                raw = a.raw.strip()
+                m = re.fullmatch(rf"{re.escape(it)}\.value(?:\.([\w-]+)|\[\"([\w-]+)\"\])?", raw)
+                if m:
+                    key = m.group(1) or m.group(2)
+                    v = item if key is None else (item.get(key) if isinstance(item, dict) else None)
+                    if _plain(v):
+                        raw = json.dumps(v)
+                attrs[name] = hcl.Attr(name, a.line, raw)
+            out.append(hcl.Block(content.type, [], content.line, content.end_line, attrs, []))
+    return out
+
+
+def _sg_findings(irel: str, blocks: List[hcl.Block], env: Dict[str, hcl.Attr]) -> List[Finding]:
     out: List[Finding] = []
-    locs = _locals(blocks)
+    seen = set()
 
     def check(rule_block: hcl.Block, cidr_attrs: Tuple[str, ...], proto_attr: str, line: int, res: str) -> None:
-        cidr = _world_cidr([rule_block.get(a) for a in cidr_attrs], locs)
+        cidr = _world_cidr([rule_block.get(a) for a in cidr_attrs], env)
         if cidr is None:
             return
-        prob = _sg_problem(rule_block, proto_attr, locs)
-        if prob:
+        prob = _sg_problem(rule_block, proto_attr, env)
+        if prob and (line, prob) not in seen:
+            seen.add((line, prob))
             out.append(_f("sg-open", irel, line, prob[0], res, cidr=cidr, ports=prob[1]))
 
-    for sg in _resources(blocks, "aws_security_group"):
+    for sg in _resources(blocks, "aws_security_group", "aws_default_security_group"):
         ingress = list(sg.children("ingress"))
         for dyn in sg.children("dynamic"):
             if dyn.labels[:1] == ["ingress"]:
-                ingress.extend(dyn.children("content"))
+                ingress.extend(_dynamic_rules(dyn, env))
         for ing in ingress:
             check(ing, ("cidr_blocks", "ipv6_cidr_blocks"), "protocol", ing.line, _ref(sg))
     for r in _resources(blocks, "aws_security_group_rule"):
-        kind = _lit(r, "type", locs)
-        if kind != "egress":
+        if _lit(r, "type", env) != "egress":
             check(r, ("cidr_blocks", "ipv6_cidr_blocks"), "protocol", r.line, _ref(r))
     for r in _resources(blocks, "aws_vpc_security_group_ingress_rule"):
         check(r, ("cidr_ipv4", "cidr_ipv6"), "ip_protocol", r.line, _ref(r))
     return out
+
+
+def sg_open(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
+    """Ingress aperti al mondo; `var.*` si risolvono nella regola d'insieme (`var_values_project`)."""
+    return _sg_findings(irel, blocks, _locals(blocks))
 
 
 def iam_least_privilege(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
@@ -872,25 +945,33 @@ def kms_rotation(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> Li
 
 def logs_retention(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
     out: List[Finding] = []
+    locs = _locals(blocks)
     for g in _resources(blocks, "aws_cloudwatch_log_group"):
         a = g.get("retention_in_days")
         if a is None or _truth(a) is False:
             out.append(_f("logs-retention", irel, a.line if a else g.line, "logs-retention", _ref(g)))
-        out.extend(_prod_toggle_findings(irel, g, cfg))
+        out.extend(_prod_toggle_findings(irel, g, cfg, locs))
+    return out
+
+
+def _eks_public(irel: str, blocks: List[hcl.Block], env: Dict[str, hcl.Attr]) -> List[Finding]:
+    out: List[Finding] = []
+    for c in _resources(blocks, "aws_eks_cluster"):
+        for vpc in c.children("vpc_config"):
+            if _lit(vpc, "endpoint_public_access", env) is not False:
+                cidrs = vpc.get("public_access_cidrs")
+                v = _resolve(cidrs, env).literal() if cidrs is not None else None
+                if cidrs is None or v == [] or _world_cidr([cidrs], env):
+                    out.append(_f("eks-hardening", irel, vpc.line, "eks-public", _ref(c)))
     return out
 
 
 def eks_hardening(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
     out: List[Finding] = []
     locs = _locals(blocks)
+    out.extend(_eks_public(irel, blocks, locs))
     for c in _resources(blocks, "aws_eks_cluster"):
         res = _ref(c)
-        for vpc in c.children("vpc_config"):
-            if _lit(vpc, "endpoint_public_access", locs) is not False:
-                cidrs = vpc.get("public_access_cidrs")
-                v = _resolve(cidrs, locs).literal() if cidrs is not None else None
-                if cidrs is None or v == [] or _world_cidr([cidrs], locs):
-                    out.append(_f("eks-hardening", irel, vpc.line, "eks-public", res))
         enc = c.children("encryption_config")
         ok = any("secrets" in _as_list(_lit(e, "resources", locs)) and e.children("provider")
                  and e.children("provider")[0].get("key_arn") is not None for e in enc)
@@ -1270,6 +1351,45 @@ def lambda_hardening_project(files: Files, cfg: dict) -> List[Finding]:
 lambda_hardening_project.rule = "lambda-hardening"
 
 
+def _dir_vars(files: Files) -> Dict[str, hcl.Attr]:
+    """{"var.<nome>": valore} della cartella: default delle variabili, sovrascritti dai tfvars della cartella
+    (terraform.tfvars, poi *.auto.tfvars in ordine; l'ultimo vince)."""
+    env: Dict[str, hcl.Attr] = {}
+    for _, b, _ in _tops(files):
+        if b.type == "variable" and b.labels and b.get("default") is not None:
+            env[f"var.{b.labels[0]}"] = b.get("default")
+    names = ("terraform.tfvars", "terraform.tfvars.json")
+    tfvars = sorted((f for f in files if posixpath.basename(f[0]).lower() in names
+                     or f[0].lower().endswith((".auto.tfvars", ".auto.tfvars.json"))),
+                    key=lambda f: _tfvars_order(f[0]))
+    for _, blocks in tfvars:
+        for b in blocks:
+            env.update((f"var.{k}", a) for k, a in b.attrs.items())
+    return env
+
+
+def var_values_project(files: Files, cfg: dict) -> List[Finding]:
+    """sg-open e l'endpoint pubblico di EKS con `var.*` risolte (default o tfvars della stessa cartella): segnala solo
+    ciò che il controllo per file, senza variabili, non ha già visto. Una variabile senza default né valore resta
+    non verificabile (nessun finding)."""
+    dvars = _dir_vars(files)
+    if not dvars:
+        return []
+    out: List[Finding] = []
+    for irel, blocks in files:
+        if irel.lower().endswith(TFVARS_EXT):
+            continue
+        locs = _locals(blocks)
+        env = {**dvars, **locs}
+        for check in (_sg_findings, _eks_public):
+            plain = {(f.line, f.message) for f in check(irel, blocks, locs)}
+            out.extend(f for f in check(irel, blocks, env) if (f.line, f.message) not in plain)
+    return out
+
+
+var_values_project.rules = ("sg-open", "eks-hardening")
+
+
 # ---------------------------------------------------------------- toggle di prod (moduli ↔ tfvars degli stack)
 
 def _module_dir(stack_dir: str, source) -> Optional[str]:
@@ -1354,7 +1474,7 @@ def prod_toggles(files: Files, cfg: dict) -> List[Finding]:
 
         for var, t in toggle_vars(fs, False):
             check_var(var, t)
-        for irel, mb, _ in _tops(fs):
+        for irel, mb, locs in _tops(fs):
             if mb.type != "module":
                 continue
             src = mb.get("source")
@@ -1370,22 +1490,28 @@ def prod_toggles(files: Files, cfg: dict) -> List[Finding]:
                                       stack=stack, var=var,
                                       value=_hint(var, t)))
                     continue
-                m = re.fullmatch(r"var\.([A-Za-z_][\w-]*)", arg.raw.strip())
+                # letterale vero, var.<nome> verificata nei tfvars, o (per gli ARN) un riferimento a una risorsa;
+                # ogni altra espressione (1 == 2, !true, local.off falso…) non è verificabile → finding
+                val = _resolve(arg, locs)
+                m = re.fullmatch(r"var\.([A-Za-z_][\w-]*)", val.raw.strip())
+                truth = _truth(val)
                 if m:
                     check_var(m.group(1), t)
-                elif _truth(arg) is False:
+                elif truth is True or (truth is None and _hint(var, t) == "<ARN>" and _pure_ref(val.raw.strip())):
+                    continue
+                else:
                     out.append(_f(t.rule, irel, arg.line, "prod-arg", mb.address(), what=t.what, var=var,
-                                  raw=arg.raw.strip(),
-                                  value=_hint(var, t)))
+                                  raw=arg.raw.strip(), value=_hint(var, t)))
     return out
 
 
-prod_toggles.rule = "cloudfront-https"
+# copre più regole: i finding hanno la regola del toggle; in caso di errore interno uno per regola
+prod_toggles.rules = tuple(dict.fromkeys(t.rule for t in PROD_TOGGLES))
 prod_toggles.scope = "project"
 
 AWS_PROJECT_RULES: List[Callable[[Files, dict], List[Finding]]] = [
     s3_private_project, cloudfront_https_project, lb_https_project, ecr_hardening_project, api_hardening_project,
-    lambda_hardening_project, prod_toggles,
+    lambda_hardening_project, var_values_project, prod_toggles,
 ]
 
 rules.PROVIDER_RULES["aws"] = AWS_RULES
