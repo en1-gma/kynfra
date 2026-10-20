@@ -87,6 +87,8 @@ STRICT_NAMES = ("secretstring", "secretbinary")
 
 PROVIDER_CRED_ATTRS = {"access_key", "secret_key", "token", "session_token", "access_token", "client_secret",
                        "client_certificate_password", "api_token", "api_key", "password"}
+# riferimento a un data source (credenziale di breve durata, es. data.aws_eks_cluster_auth.c.token): ammesso
+DATA_REF = re.compile(r"data\.[A-Za-z_][\w-]*\.[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*|\[[^\]]*\])*")
 CRED_NAME = re.compile(r"^(aws_)?(access_key(_id)?|secret_(access_)?key|session_token)$", re.I)
 
 REQUIRED_TAGS = ("Project", "Environment", "Owner", "CostCenter", "ManagedBy")
@@ -241,7 +243,7 @@ def _module_problem(mod: hcl.Block) -> Optional[str]:
     if REGISTRY_SOURCE.fullmatch(src):
         ver = mod.get("version")
         value = ver.literal() if ver is not None else None
-        ok = isinstance(value, str) and not re.search(r"[<>!]", value) and _pinned(value)
+        ok = isinstance(value, str) and not re.search(r"[<>!]", value.replace("~>", "")) and _pinned(value)
         return None if ok else MESSAGES["version-module-registry"]
     return MESSAGES["version-module-remote"]
 
@@ -251,7 +253,7 @@ def static_credentials(irel: str, blocks: List[hcl.Block], text: str, cfg: dict)
     for b in blocks:
         if b.type == "provider":
             for a in _attrs_deep(b):
-                if a.name in PROVIDER_CRED_ATTRS:
+                if a.name in PROVIDER_CRED_ATTRS and not DATA_REF.fullmatch(a.raw.strip()):
                     out.append(_f("static-credentials", irel, a.line,
                                   MESSAGES["static-credentials"].format(name=a.name), b.address()))
         elif b.type == "tfvars":
@@ -285,6 +287,11 @@ def secrets(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Fi
 
     for top in blocks:
         res = _addr(top)
+        if top.type == "resource" and top.labels[:1] == ["aws_ssm_parameter"]:
+            ptype, pval = top.get("type"), top.get("value")
+            if ptype is not None and ptype.literal() == "SecureString" and pval is not None \
+                    and _literal_secret(pval, strict=True):
+                add(pval.line, MESSAGES["secrets"], res)
         if top.type == "variable" and top.labels and _sensitive_name(top.labels[0]):
             name = top.labels[0]
             sens = top.get("sensitive")

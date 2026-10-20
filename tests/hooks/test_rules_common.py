@@ -118,10 +118,29 @@ class VersionPinningTest(unittest.TestCase):
                 "version-pinning")
         self.assertEqual(len(f), 1)
 
+    def test_version_pinning_registry_module_pessimistic_ok(self):
+        self.assertEqual(run(STACK + "main.tf",
+                             'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n'
+                             '  version = "~> 5.1"\n}\n', "version-pinning"), [])
+
     def test_version_pinning_registry_module_with_version(self):
         self.assertEqual(run(STACK + "main.tf",
                              'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n'
                              '  version = "5.1.2"\n}\n', "version-pinning"), [])
+
+
+class StaticCredentialsDataRefTest(unittest.TestCase):
+    def test_static_credentials_kubernetes_data_token_ok(self):
+        self.assertEqual(run(STACK + "providers.tf", 'provider "kubernetes" {\n'
+                             '  token = data.aws_eks_cluster_auth.c.token\n}\n', "static-credentials"), [])
+
+    def test_static_credentials_helm_data_token_ok(self):
+        self.assertEqual(run(STACK + "providers.tf", 'provider "helm" {\n  kubernetes {\n'
+                             '    token = data.aws_eks_cluster_auth.c.token\n  }\n}\n', "static-credentials"), [])
+
+    def test_static_credentials_token_from_variable(self):
+        f = run(STACK + "providers.tf", 'provider "kubernetes" {\n  token = var.t\n}\n', "static-credentials")
+        self.assertEqual(len(f), 1)
 
 
 class StaticCredentialsTest(unittest.TestCase):
@@ -207,6 +226,16 @@ class SecretsTest(unittest.TestCase):
     def test_secrets_token_validity_units_ok(self):
         self.assertEqual(run(STACK + "main.tf", 'resource "aws_cognito_user_pool_client" "c" {\n'
                              '  token_validity_units {\n    access_token = "minutes"\n  }\n}\n', "secrets"), [])
+
+    def test_secrets_ssm_secure_string_literal(self):
+        f = run(STACK + "main.tf", 'resource "aws_ssm_parameter" "p" {\n  name  = "/app/db"\n'
+                '  type  = "SecureString"\n  value = "Sup3rS3cret!"\n}\n', "secrets")
+        self.assertEqual([x.line for x in f], [4])
+
+    def test_secrets_ssm_secure_string_wo_ok(self):
+        self.assertEqual(run(STACK + "main.tf", 'resource "aws_ssm_parameter" "p" {\n  name  = "/app/db"\n'
+                             '  type  = "SecureString"\n  value_wo = var.v\n  value_wo_version = 1\n}\n',
+                             "secrets"), [])
 
     def test_secrets_tf_json(self):
         text = '{"resource": {"aws_db_instance": {"db": {"password": "Sup3rS3cret!"}}}}\n'
