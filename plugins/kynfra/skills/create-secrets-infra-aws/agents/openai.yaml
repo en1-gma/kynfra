@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra Secrets (AWS)"
+  short_description: "Generate an AWS Secrets Manager vault with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-secrets-infra-aws to generate the secrets stack (Secrets Manager with a dedicated KMS key)."
+policy:
+  allow_implicit_invocation: false

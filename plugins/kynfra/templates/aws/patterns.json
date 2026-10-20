@@ -116,5 +116,37 @@
       "Con api_origin=backend applica prima lo stack backend dello stesso ambiente (output api_domain_name e api_origin_path, chiave {{ project }}/<env>/backend.tfstate)",
       "Deploy del frontend: carica la build nel bucket bucket_name con Cache-Control \"public, max-age=31536000, immutable\" sugli asset con hash e \"no-cache\" su index.html, poi invalida /index.html sulla distribuzione distribution_id; il ruolo di deploy ha bisogno solo di s3:PutObject/s3:DeleteObject/s3:ListBucket sul bucket e cloudfront:CreateInvalidation sulla distribuzione"
     ]
+  },
+  "secrets": {
+    "description": "Secrets Manager come secret vault: chiave KMS dedicata con rotazione attiva, segreti creati come contenitori senza valore (mappa nome => descrizione, ruoli lettori, Lambda di rotazione opzionale), resource policy per singolo ruolo con deny fuori dall'account e senza TLS, recovery window (30 giorni in prod), rotazione automatica dove c'è la Lambda, replica opzionale in una seconda regione.",
+    "requires": [],
+    "inputs": {
+      "recovery_window_days": {
+        "type": "number",
+        "default": 7,
+        "help": "Giorni di recupero di un segreto cancellato (7-30; in prod 30)"
+      },
+      "replica_region": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "Regione di replica dei segreti; vuoto = nessuna replica"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "recovery_window_days": 30
+      }
+    },
+    "stacks": [
+      "secrets"
+    ],
+    "shared": false,
+    "next_steps": [
+      "Modifica la mappa secrets in {{ infra_root }}/envs/<env>/secrets/terraform.tfvars (nome, descrizione, ARN dei ruoli lettori, Lambda di rotazione opzionale): è un segnaposto con il solo segreto app-db e nessun lettore",
+      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/secrets && {{ iac_cli }} init && {{ iac_cli }} plan -out=secrets.tfplan && {{ iac_cli }} apply secrets.tfplan",
+      "I segreti nascono senza valore: il DevOps lo inserisce fuori da Terraform, es. aws secretsmanager put-secret-value --secret-id {{ project }}/<env>/<nome> --secret-string <valore> (mai nei file né da un agente)",
+      "Le app leggono il segreto a runtime con il proprio ruolo IAM, che deve essere in readers; l'ARN arriva dall'output secret_arns (chiave {{ project }}/<env>/secrets.tfstate)"
+    ]
   }
 }
