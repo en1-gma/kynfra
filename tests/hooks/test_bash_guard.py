@@ -519,5 +519,67 @@ class FixRound1Tests(GuardCase):
                              "pnpm exec tsc"])
 
 
+class FixRound2Tests(GuardCase):
+    """Residui della re-review di 6059ff1..1931eaa (gruppo A)."""
+
+    def test_a1_command_words_case_insensitive(self):
+        self.assert_denied([
+            "flock /tmp/l Terraform apply", "script -q /dev/null Terraform apply", "arch -arm64 Terraform apply",
+            "sandbox-exec -n x Terraform apply", "flock /tmp/l AWS s3 rm s3://x --recursive",
+            "script -q /dev/null KUBECTL apply -f x",
+        ])
+        self.assert_allowed(["docker login --username AWS --password-stdin 123.dkr.ecr.x.amazonaws.com",
+                             "docker login -u AWS --password-stdin 123.dkr.ecr.x.amazonaws.com",
+                             "pgrep -f \"terraform apply\"", "pkill -f 'Terraform apply'"])
+
+    def test_a2_program_runner_options(self):
+        put(self.proj, "evil.sh", "terraform apply\n")
+        put(self.proj, "ok.sh", "cat \"$1\"\n")
+        self.assert_denied([
+            "tar --checkpoint=1 --checkpoint-action=exec='terraform apply' -cf /tmp/x.tar src",
+            "tar --checkpoint-action exec=./evil.sh -cf /tmp/x.tar src",
+            "tar -I ./evil.sh -cf /tmp/x.tar src", "tar -I./evil.sh -cf /tmp/x.tar src",
+            "tar -cI ./evil.sh -f /tmp/x.tar src", "tar cIf ./evil.sh /tmp/x.tar src",
+            "tar -I 'sh -c \"terraform apply\"' -cf /tmp/x.tar src", "tar -I unknownprog -cf /tmp/x.tar src",
+            "tar --use-compress-program=./evil.sh -cf /tmp/x.tar src",
+            "tar --use-compress-program ./missing.sh -cf /tmp/x.tar src",
+            "tar --use-compress=./evil.sh -cf /tmp/x.tar src",
+            "tar --to-command='aws s3 rm s3://x --recursive' -xf /tmp/x.tar -C /tmp",
+            "tar -xf /tmp/x.tar -C /tmp --to-command terraform\\ apply",
+            "tar --to-com='terraform apply' -xf /tmp/x.tar -C /tmp",
+            "bsdtar --use-compress-program=./evil.sh -cf /tmp/x.tar src",
+            "tar -F ./evil.sh -cf /tmp/x.tar src", "tar --info-script=./evil.sh -cf /tmp/x.tar src",
+            "rg --pre ./evil.sh foo", "rg --pre=./evil.sh foo", "rg --pre unknownprog foo",
+            "sort --compress-program=./evil.sh -o /tmp/out.txt in.txt", "sort --compress-program ./evil.sh in.txt",
+            "sort --compress-prog=./evil.sh in.txt",
+            "find . -exec ./evil.sh {} \\;", "find . -execdir terraform apply \\;", "find . -ok terraform apply \\;",
+            "find . -name x -exec sh -c 'terraform apply' \\;",
+        ])
+        self.assert_allowed([
+            "tar -I zstd -cf /tmp/x.tar.zst src", "tar --use-compress-program=pigz -cf /tmp/x.tgz src",
+            "tar --use-compress-program='zstd -19' -cf /tmp/x.tar.zst src",
+            "tar --checkpoint=100 --checkpoint-action=dot -cf /tmp/x.tar src", "tar -czf /tmp/x.tgz src",
+            "tar -tf /tmp/x.tar", "rg --pre-glob '*.gz' foo", "rg --pre ./ok.sh foo", "rg foo",
+            "sort --compress-program=gzip in.txt", "sort -o /tmp/out.txt in.txt", "find . -name '*.tf'",
+        ])
+
+    def test_a3_git_subcommands_that_run_commands(self):
+        put(self.proj, "evil.sh", "terraform apply\n")
+        self.assert_denied([
+            "git bisect run terraform apply", "git bisect run ./evil.sh", "git bisect run sh -c 'terraform apply'",
+            "git submodule foreach 'terraform apply'", "git submodule foreach --recursive terraform apply",
+            "git submodule --quiet foreach 'aws s3 rm s3://x --recursive'",
+            "git rebase --exec 'terraform apply' main", "git rebase -x 'echo hi' main",
+            "git filter-branch --tree-filter 'terraform apply' HEAD", "git filter-branch --msg-filter cat HEAD",
+            "git difftool -x 'terraform apply'", "git difftool --extcmd='terraform apply' HEAD",
+            "git difftool --extcmd ./evil.sh", "git difftool -y -x unknownprog", "git difftool --ext=./evil.sh",
+            "git difftool -x./evil.sh", "git mergetool -x 'terraform apply'",
+        ])
+        self.assert_allowed([
+            "git bisect start", "git bisect good", "git bisect run pytest", "git submodule status",
+            "git submodule foreach 'git status'", "git difftool --extcmd=diff HEAD~1", "git difftool HEAD~1",
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

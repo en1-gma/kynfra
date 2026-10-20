@@ -135,6 +135,17 @@ SCAN_NAMES = ({"terraform", "tofu", "terragrunt", "aws", "kubectl", "helm", "eva
                "pnpm", "yarn", "npx", "go", "pip", "pipx", "uv", "cargo", "gem", "source", "."}
               | CLOUD_DENIED | SHELLS | INTERPRETERS | DOWNLOADERS | PKG_MANAGERS | ALWAYS_INSTALL)
 
+# compressori che tar/sort lanciano con -I/--use-compress-program/--compress-program
+COMPRESSORS = DECOMPRESSORS | {"pigz", "unpigz", "pbzip2", "lbzip2", "lz4", "lzip", "lzop", "plzip", "pixz",
+                               "brotli", "pzstd", "zstdmt"}
+# programmi che il guard sa analizzare come valore di un'opzione che lancia un programma
+KNOWN_PROGRAMS = SCAN_NAMES | READONLY_CMDS | WRITERS | PRODUCERS | COMPRESSORS | {"git", "find"}
+SYSTEM_BIN_RE = re.compile(r"^(?:/usr(?:/local)?|/opt/homebrew)?/s?bin/[^/]+$")
+# opzioni di tar che lanciano un programma (GNU tar accetta anche le abbreviazioni)
+TAR_PROGRAM_OPTS = ("use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command",
+                    "rmt-command", "checkpoint-action")
+TAR_SHORT_VALUE = set("bCfFgHIKLNTVX")
+
 TF_DENIED = {"apply", "destroy", "import", "taint", "untaint", "plan", "force-unlock", "refresh", "test", "console",
              "login", "logout", "push", "env"}
 TF_READONLY = {"fmt", "validate", "version", "graph", "show", "get", "modules", "metadata"}
@@ -225,7 +236,7 @@ class Ctx:
 
 def norm_name(text: str, lower: bool = True) -> str:
     """Nome del comando come lo cerca la shell: basename, senza versione/tag (`terraform:1.9`, `x@latest`).
-    `lower=False` per gli argomenti di un comando sconosciuto: solo argv[0] si confronta senza maiuscole."""
+    `lower=False` per il confronto esatto (argomenti di un comando sconosciuto che seguono un'opzione)."""
     base = text.rstrip("/").rsplit("/", 1)[-1]
     if lower:
         base = base.lower()
@@ -245,6 +256,22 @@ def norm_name(text: str, lower: bool = True) -> str:
     if base in ("gmake", "go-task", "pnpx", "bunx"):
         return {"gmake": "make", "go-task": "task"}.get(base, "npx")
     return base
+
+
+def long_opt(x: str, names: Tuple[str, ...], exact: Set[str] = frozenset(),
+             abbrev: bool = True) -> Optional[Tuple[str, Optional[str]]]:
+    """`--nome[=valore]` se `nome` è una delle opzioni `names`, anche abbreviata come accetta getopt_long
+    (`--use-compress=`); `exact` sono altre opzioni del comando che non vanno scambiate per abbreviazioni.
+    Restituisce (nome completo, valore dopo `=` o None)."""
+    if not x.startswith("--"):
+        return None
+    key, eq, val = x[2:].partition("=")
+    if key in exact:
+        return None
+    for n in names:
+        if n == key or (abbrev and len(key) >= 3 and n.startswith(key)):
+            return n, (val if eq else None)
+    return None
 
 
 def is_env_name(name: str) -> bool:
@@ -926,6 +953,8 @@ class Analyzer:
         if name in WRITERS:
             self.writers(name, args, ctx)
             return RW
+        if name == "rg":
+            self.rg(args, ctx)
         if name in READONLY_CMDS:
             return RO
         if name not in NO_SCAN:
@@ -938,10 +967,96 @@ class Analyzer:
             a = args[i]
             if a.dyn:
                 continue
-            if norm_name(a.text, lower=False) in SCAN_NAMES:
+            # il nome si confronta senza maiuscole (macOS non le distingue), tranne quando la parola è
+            # probabilmente il valore di un'opzione (`docker login --username AWS`, `-u AWS`)
+            prev = args[i - 1].text if i > 1 else ""
+            opt_value = (prev.startswith("--") and prev != "--" and "=" not in prev) \
+                or re.fullmatch(r"-[A-Za-z]", prev) is not None
+            if norm_name(a.text, lower=False) in SCAN_NAMES or (not opt_value and norm_name(a.text) in SCAN_NAMES):
                 self.run(args[i:], ctx.nested())
             elif re.search(r"\s", a.text.strip()):
                 self.script(a.text, ctx.cwds, ctx.depth + 1, strict=False)
+
+    def program_value(self, value: Optional[Arg], label: str, ctx: Ctx) -> None:
+        """Valore di un'opzione che fa lanciare un programma (`tar -I`, `rg --pre`, `git difftool -x`…): si
+        analizza come comando; se è uno script che non si può leggere o un programma sconosciuto si rifiuta."""
+        if value is None:
+            return
+        if value.dyn:
+            self.deny(f"`{label}`: programma non determinabile (variabile o sostituzione)")
+            return
+        words = self.words_of(value.text)
+        if not words:
+            return
+        head = words[0]
+        if head.dyn:
+            self.deny(f"`{label}`: programma non determinabile ({head.text})")
+            return
+        name = norm_name(head.text)
+        if "/" in head.text and not (SYSTEM_BIN_RE.match(head.text) and name in KNOWN_PROGRAMS):
+            if not any(_read_text(p) is not None for p in self.resolve_all(head.text, ctx.cwds)):
+                self.deny(f"`{label} {head.text}`: script che non si può leggere né verificare")
+                return
+        elif "/" not in head.text and name not in KNOWN_PROGRAMS:
+            self.deny(f"`{label} {head.text}`: lancia un programma sconosciuto che non si può verificare")
+            return
+        self.script(value.text, ctx.cwds, ctx.depth + 1)
+
+    def rg(self, args: List[Arg], ctx: Ctx) -> None:
+        """`rg --pre PROG`: ripgrep lancia PROG su ogni file cercato."""
+        t = [a.text for a in args]
+        for i in range(1, len(t)):
+            if t[i] == "--":
+                break
+            lo = long_opt(t[i], ("pre",), abbrev=False)
+            if lo:
+                val = Arg(lo[1], args[i].dyn) if lo[1] is not None else (args[i + 1] if i + 1 < len(t) else None)
+                self.program_value(val, "rg --pre", ctx)
+
+    def tar_programs(self, name: str, rest: List[Arg], ctx: Ctx) -> None:
+        """Opzioni di tar che lanciano programmi: -I/--use-compress-program, -F/--info-script, --to-command,
+        --checkpoint-action=exec=…, --rsh-command, --rmt-command (anche nella forma vecchia `tar cIf prog …`)."""
+        t = [a.text for a in rest]
+        j = 0
+        if t and not t[0].startswith("-"):
+            k = 1
+            for ch in t[0]:
+                if ch in TAR_SHORT_VALUE and k < len(t):
+                    if ch in "IF":
+                        self.program_value(rest[k], f"{name} {ch}", ctx)
+                    k += 1
+            j = k
+        while j < len(t):
+            x = t[j]
+            if x == "--":
+                break
+            lo = long_opt(x, TAR_PROGRAM_OPTS, exact={"checkpoint"})
+            if lo:
+                opt, val = lo
+                if val is not None:
+                    value: Optional[Arg] = Arg(val, rest[j].dyn)
+                else:
+                    value = rest[j + 1] if j + 1 < len(t) else None
+                    j += 1
+                if opt == "checkpoint-action":
+                    if value is not None and value.dyn:
+                        self.program_value(value, f"{name} --{opt}", ctx)
+                    elif value is not None and value.text.startswith("exec="):
+                        self.program_value(Arg(value.text[5:]), f"{name} --{opt}=exec", ctx)
+                else:
+                    self.program_value(value, f"{name} --{opt}", ctx)
+            elif x.startswith("-") and not x.startswith("--"):
+                for pos, ch in enumerate(x[1:], 1):
+                    if ch in TAR_SHORT_VALUE:
+                        if x[pos + 1:]:
+                            value = Arg(x[pos + 1:], rest[j].dyn)
+                        else:
+                            value = rest[j + 1] if j + 1 < len(t) else None
+                            j += 1
+                        if ch in "IF":
+                            self.program_value(value, f"{name} -{ch}", ctx)
+                        break
+            j += 1
 
     def cd(self, args: List[Arg], ctx: Ctx) -> None:
         pos = [a for a in args[1:] if not a.text.startswith("-") or a.text == "-"]
@@ -1939,10 +2054,55 @@ class Analyzer:
         if sub.text == "config":
             self.git_config(args[i + 1:], ctx)
         rest = args[i + 1:]
+        if sub.text == "filter-branch":
+            self.deny("`git filter-branch` riscrive la storia eseguendo filtri shell: non verificabile, lo usa "
+                      "solo l'utente")
+            return RW
+        self.git_runs(sub.text, rest, ctx)
         self.output_opts(rest, cwds, short_o=sub.text in ("archive", "format-patch"),
                          names=("--output", "--output-directory"))
         self.git_tree(sub.text, rest, cwds)
         return RO if sub.text in READONLY_GIT else RW
+
+    def git_runs(self, sub: str, rest: List[Arg], ctx: Ctx) -> None:
+        """Sottocomandi git che lanciano comandi: `bisect run`, `submodule foreach`, `difftool/mergetool -x`."""
+        t = [a.text for a in rest]
+        if sub == "bisect" and t[:1] == ["run"] and len(rest) > 1:
+            self.run(rest[1:], ctx.nested())
+        elif sub == "submodule" and "foreach" in t:
+            k = t.index("foreach") + 1
+            while k < len(t) and t[k].startswith("-"):
+                k += 1
+                if t[k - 1] == "--":
+                    break
+            if k < len(t):
+                self.script(" ".join(t[k:]), ctx.cwds, ctx.depth + 1)
+        elif sub in ("difftool", "mergetool"):
+            label = f"git {sub} --extcmd"
+            j = 0
+            while j < len(t):
+                x = t[j]
+                if x == "--":
+                    break
+                lo = long_opt(x, ("extcmd",))
+                if lo:
+                    if lo[1] is not None:
+                        self.program_value(Arg(lo[1], rest[j].dyn), label, ctx)
+                    else:
+                        self.program_value(rest[j + 1] if j + 1 < len(t) else None, label, ctx)
+                        j += 1
+                elif x.startswith("-") and not x.startswith("--"):
+                    for pos, ch in enumerate(x[1:], 1):
+                        if ch in "xt":
+                            if x[pos + 1:]:
+                                value: Optional[Arg] = Arg(x[pos + 1:], rest[j].dyn)
+                            else:
+                                value = rest[j + 1] if j + 1 < len(t) else None
+                                j += 1
+                            if ch == "x":
+                                self.program_value(value, label, ctx)
+                            break
+                j += 1
 
     def git_tree(self, sub: str, rest: List[Arg], cwds: List[Path]) -> None:
         """git che riscrive il working tree: consentito solo se ogni pathspec è fuori da infra_root e dai file
@@ -2163,11 +2323,16 @@ class Analyzer:
                     self.target(Arg(x[3:]), cw)
         elif name == "sort":
             for i, x in enumerate(t):
+                lo = long_opt(x, ("compress-program",))
+                if lo:
+                    self.program_value(Arg(lo[1], rest[i].dyn) if lo[1] is not None
+                                       else (rest[i + 1] if i + 1 < len(t) else None), "sort --compress-program", ctx)
                 if x in ("-o", "--output") and i + 1 < len(t):
                     self.target(rest[i + 1], cw)
                 elif x.startswith("--output="):
                     self.target(Arg(x.split("=", 1)[1]), cw)
         elif name in ("tar", "bsdtar", "gtar"):
+            self.tar_programs(name, rest, ctx)
             extract = any(x in ("--extract", "--get") for x in t) or any(
                 x.startswith("-") and not x.startswith("--") and "x" in x for x in t) or (
                 t and not t[0].startswith("-") and "x" in t[0])
