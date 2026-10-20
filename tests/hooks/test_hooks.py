@@ -197,6 +197,13 @@ class PreWriteTests(unittest.TestCase):
         with unittest.mock.patch.object(pre_write, "new_findings", side_effect=RuntimeError("boom")):
             self.assertEqual(self.run_pre_inprocess(d, "main.tf"), {})
 
+    def test_internal_error_outside_infra_root_allowed(self):
+        proj = project(infra_root="infra")
+        self.addCleanup(shutil.rmtree, proj, True)
+        with unittest.mock.patch.object(pre_write, "new_findings", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_pre_inprocess(proj, "docs/note.tf"), {})
+            self.assertTrue(denied(self.run_pre_inprocess(proj, "infra/envs/dev/spa/main.tf")))
+
     def test_no_config_noop(self):
         d = Path(tempfile.mkdtemp(prefix="kynfra-noconf-"))
         self.assertEqual(claude_write(d, "envs/dev/web/main.tf", PUBLIC_BUCKET), {})

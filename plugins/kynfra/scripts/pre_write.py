@@ -54,6 +54,15 @@ def _check_op(event: dict, op: hc.FileOp, proj, cfg: dict) -> List[rules.Finding
     return out + rules.check_layout(rel, cfg) + new_findings(rel, op, cfg)
 
 
+def _guarded(op: hc.FileOp, event: dict, proj, cfg: dict) -> bool:
+    """Il file è soggetto alle regole (sotto infra_root, o protetto)? Nel dubbio sì."""
+    try:
+        rel = rules.rel_to_project(str(hc._abs(op.path, event.get("cwd"))), proj)
+        return rel is not None and (rules.infra_rel(rel, cfg) is not None or bool(rules.protected_reason(rel, cfg)))
+    except Exception:
+        return True
+
+
 def main() -> int:
     event = hc.read_event()
     hc.debug_dump(event, "pre")
@@ -66,6 +75,8 @@ def main() -> int:
         try:
             findings += _check_op(event, op, proj, cfg)
         except Exception as e:  # una guardia che si rompe non deve lasciar passare la scrittura (come bash_guard)
+            if not _guarded(op, event, proj, cfg):
+                continue
             findings.append(rules.Finding("internal-error", "block", op.path, 0,
                                           f"errore interno dei controlli ({type(e).__name__}): scrittura non "
                                           "verificabile, segnala il problema"))

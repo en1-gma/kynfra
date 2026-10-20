@@ -65,6 +65,15 @@ def _internal_error(e: BaseException) -> str:
             "segnala il problema e verifica i file a mano")
 
 
+def _allow_non_compliant(why: str, where: str) -> dict:
+    return {"systemMessage": f"kynfra{where}: {why}; chiusura consentita, ma il lavoro NON è conforme."}
+
+
+def _has_project(event: dict) -> bool:
+    cwd = Path(event.get("cwd") or ".").resolve()
+    return rules.load_config(rules.find_project_dir(str(cwd))) is not None or bool(rules.discover_projects(cwd))
+
+
 def _decide(event: dict, cnt_file: Path, max_blocks: int, failures: List[str], notes: str, where: str) -> dict:
     """Blocco con anti-loop: al tentativo max_blocks+1 della stessa catena lascia chiudere con un avviso."""
     count = 0
@@ -76,9 +85,12 @@ def _decide(event: dict, cnt_file: Path, max_blocks: int, failures: List[str], n
     count += 1
     if count > max_blocks:
         cnt_file.unlink(missing_ok=True)
-        return {"systemMessage": f"kynfra{where}: controlli ancora falliti dopo {max_blocks} tentativi; "
-                                 "chiusura consentita, ma il lavoro NON è conforme."}
-    cnt_file.write_text(str(count))
+        return _allow_non_compliant(f"controlli ancora falliti dopo {max_blocks} tentativi", where)
+    try:
+        cnt_file.write_text(str(count))
+    except Exception:  # contatore non scrivibile: un blocco solo per catena, mai un blocco senza fine
+        if event.get("stop_hook_active") is True:
+            return _allow_non_compliant("contatore dei tentativi non scrivibile", where)
     return {"decision": "block",
             "reason": (f"I controlli dell'infrastruttura (kynfra){where} non passano. Correggi prima di chiudere "
                        f"(tentativo {count}/{max_blocks}):\n\n" + "\n\n".join(failures)
@@ -126,13 +138,21 @@ def gate(event: dict, proj: Path, cfg: dict) -> Optional[dict]:
 
 def main() -> int:
     event = hc.read_event()
+    if not isinstance(event, dict):
+        event = {}
     try:
         return _main(event)
-    except Exception as e:  # fail closed: un errore del gate blocca, con l'anti-loop (max_blocks di default)
+    except Exception as e:  # fail closed nei progetti kynfra: blocca, con l'anti-loop (max_blocks di default)
+        try:
+            if not _has_project(event):
+                return 0
+        except Exception:
+            pass  # non si sa: si tratta come un progetto kynfra
         try:
             out = _decide(event, error_counter_path(event), 3, [_internal_error(e)], "", "")
         except Exception:
-            out = {"decision": "block", "reason": _internal_error(e)}
+            out = (_allow_non_compliant(_internal_error(e), "") if event.get("stop_hook_active") is True
+                   else {"decision": "block", "reason": _internal_error(e)})
         print(json.dumps(out, ensure_ascii=False))
         return 0
 
@@ -154,6 +174,7 @@ def _main(event: dict) -> int:
             blocks.append(out["reason"])
         else:
             notes.append(out["systemMessage"])
+    error_counter_path(event).unlink(missing_ok=True)  # giro completo senza errori interni
     if blocks:
         print(json.dumps({"decision": "block", "reason": "\n\n".join(blocks)}, ensure_ascii=False))
     elif notes:

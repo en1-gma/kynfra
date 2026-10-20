@@ -183,15 +183,19 @@ class StopGateTest(Base):
 class StopGateFailClosedTest(Base):
     """Un errore inatteso nei controlli non deve far passare lo stop gate (fail closed, con l'anti-loop)."""
 
-    def run_main(self, active=False):
+    def event(self, active=False, cwd=None):
+        return {"cwd": str(cwd or self.proj), "hook_event_name": "Stop", "session_id": f"fc-{self.tmp.name}",
+                "stop_hook_active": active}
+
+    def run_main(self, active=False, cwd=None, raw=None):
         import contextlib
         import io
-        ev = {"cwd": str(self.proj), "hook_event_name": "Stop", "session_id": f"fc-{self.tmp.name}",
-              "stop_hook_active": active}
+        ev = self.event(active, cwd)
         self.addCleanup(stop_gate.counter_path(ev, self.proj).unlink, True)
         self.addCleanup(stop_gate.error_counter_path(ev).unlink, True)
         buf = io.StringIO()
-        with unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(ev))), contextlib.redirect_stdout(buf):
+        stdin = io.StringIO(json.dumps(ev) if raw is None else raw)
+        with unittest.mock.patch("sys.stdin", stdin), contextlib.redirect_stdout(buf):
             self.assertEqual(stop_gate.main(), 0)
         return json.loads(buf.getvalue()) if buf.getvalue().strip() else {}
 
@@ -215,6 +219,50 @@ class StopGateFailClosedTest(Base):
         self.config()
         with unittest.mock.patch.object(stop_gate, "gate", side_effect=RuntimeError("boom")):
             self.assert_fail_closed()
+
+
+    def assert_block_then_allow(self):
+        self.assertEqual(self.run_main().get("decision"), "block")
+        out = self.run_main(active=True)
+        self.assertNotIn("decision", out)
+        self.assertIn("NON è conforme", out["systemMessage"])
+
+    def test_unwritable_counter_does_not_lock_session(self):
+        self.config()
+        enospc = OSError(28, "No space left on device")
+        with unittest.mock.patch.object(stop_gate, "run_checks", return_value=(["fallito"], [])), \
+                unittest.mock.patch.object(Path, "write_text", side_effect=enospc):
+            self.assert_block_then_allow()
+        with unittest.mock.patch.object(stop_gate, "gate", side_effect=RuntimeError("boom")), \
+                unittest.mock.patch.object(Path, "write_text", side_effect=enospc):
+            self.assert_block_then_allow()
+
+    def test_non_dict_event_no_block(self):
+        empty = self.tmp / "vuota"
+        empty.mkdir()
+        cwd = os.getcwd()
+        os.chdir(empty)
+        self.addCleanup(os.chdir, cwd)
+        for raw in ("null", "[1]"):
+            self.assertEqual(self.run_main(raw=raw), {})
+
+    def test_main_error_without_project_noop(self):
+        empty = self.tmp / "vuota"
+        empty.mkdir()
+        with unittest.mock.patch.object(stop_gate, "_main", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_main(cwd=empty), {})
+            self.config()
+            self.assertEqual(self.run_main().get("decision"), "block")
+
+    def test_error_counter_cleared_after_clean_run(self):
+        self.config()
+        ev = self.event()
+        counter = stop_gate.error_counter_path(ev)
+        counter.write_text("2")
+        self.addCleanup(counter.unlink, True)
+        with unittest.mock.patch.object(stop_gate, "run_checks", return_value=([], [])):
+            self.assertEqual(self.run_main(), {})
+        self.assertFalse(counter.exists())
 
 
 class ArchCheckTest(Base):
