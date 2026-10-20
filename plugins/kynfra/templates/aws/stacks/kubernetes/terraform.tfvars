@@ -1,0 +1,16 @@
+project               = "{{ project }}"
+environment           = "{{ environment }}"
+region                = "{{ region }}"
+account_id            = "{{ account_id }}"
+owner                 = "{{ owner }}"
+cost_center           = "{{ cost_center }}"
+state_bucket          = "{{ state_bucket }}"
+kubernetes_version    = "{{ kubernetes_version }}"
+public_endpoint_cidrs = "{{ public_endpoint_cidrs }}"
+admin_principals      = "{{ admin_principals }}"
+node_instance_types   = "{{ node_instance_types }}"
+node_min_size         = {{ node_min_size }}
+node_max_size         = {{ node_max_size }}
+node_desired_size     = {{ node_desired_size }}
+log_retention_days    = {{ log_retention_days }}
+deletion_protection   = {{ deletion_protection }}

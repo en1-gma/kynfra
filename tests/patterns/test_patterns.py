@@ -73,6 +73,9 @@ VARIANTS = {
     # nei terraform.tfvars generati: struttura che il generatore non sa passare)
     "ecr": [{"repositories": "api,worker,jobs-nightly", "keep_last": "50",
              "pull_principals": "arn:aws:iam::123456789012:role/acme-eks-node,arn:aws:iam::123456789012:role/acme-app"}],
+    # endpoint pubblico con CIDR espliciti, due amministratori e un altro tipo di istanza
+    "eks": [{"public_endpoint_cidrs": "203.0.113.0/24,198.51.100.10/32", "node_instance_types": "m6i.xlarge",
+             "admin_principals": "arn:aws:iam::123456789012:role/acme-devops,arn:aws:iam::123456789012:user/ops"}],
     "secrets": [{"replica_region": "eu-west-1", "_tfvars": [
         ('    description = "Credenziali del database dell\'applicazione"\n    readers     = []\n    # rotation_lambda_arn',
          '    description         = "Credenziali del database dell\'applicazione"\n'

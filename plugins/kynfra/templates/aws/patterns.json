@@ -276,5 +276,83 @@
       "Il push non è concesso dalla repository policy: i ruoli di CI hanno una policy identity con ecr:GetAuthorizationToken e, sull'ARN del repository, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:BatchCheckLayerAvailability; i tag sono immutabili (usa tag unici, es. lo SHA del commit)",
       "pull_principals è facoltativo: aggiungi più tardi gli ARN dei ruoli dei nodi EKS o delle Lambda se vuoi una concessione anche nella resource policy"
     ]
+  },
+  "eks": {
+    "description": "Cluster EKS nelle subnet private dello stack network: endpoint API privato (pubblico solo con CIDR espliciti), cifratura dei Secret con chiave KMS dedicata, tutti i log del control plane su un log group cifrato con retention, access entries con AmazonEKSClusterAdminPolicy (niente aws-auth), node group gestito di sistema con launch template (IMDSv2 obbligatorio, hop limit 1, disco gp3 cifrato con KMS), add-on gestiti (VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent, EBS CSI), ruoli EKS Pod Identity per AWS Load Balancer Controller, Karpenter, KEDA ed EBS CSI, risorse di Karpenter (ruolo e access entry dei nodi, coda SQS di interruzione con regole EventBridge); stack separato kubernetes-addons con il provider helm per AWS Load Balancer Controller, Karpenter (con il chart delle CRD) e KEDA, versioni dei chart bloccate.",
+    "requires": [
+      "network",
+      "ecr"
+    ],
+    "inputs": {
+      "kubernetes_version": {
+        "type": "string",
+        "default": "1.36",
+        "help": "Versione minore di Kubernetes: 1.36 è l'ultima supportata sia da EKS sia dai chart bloccati del kit (KEDA 2.21 arriva a 1.36; EKS offre anche 1.37)"
+      },
+      "public_endpoint_cidrs": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "CIDR ammessi sull'endpoint pubblico dell'API server, separati da virgola (es. 203.0.113.0/24); vuoto = solo endpoint privato. Mai 0.0.0.0/0"
+      },
+      "admin_principals": {
+        "type": "string",
+        "required": true,
+        "example": "arn:aws:iam::123456789012:role/acme-devops",
+        "help": "ARN di ruoli o utenti IAM dell'account amministratori del cluster (access entries), separati da virgola: deve includere l'identità che applica lo stack kubernetes-addons"
+      },
+      "node_instance_types": {
+        "type": "string",
+        "default": "m6i.large,m5.large",
+        "help": "Tipi di istanza x86_64 del node group di sistema, separati da virgola"
+      },
+      "node_min_size": {
+        "type": "number",
+        "default": 2,
+        "help": "Nodi minimi del node group di sistema"
+      },
+      "node_max_size": {
+        "type": "number",
+        "default": 4,
+        "help": "Nodi massimi del node group di sistema"
+      },
+      "node_desired_size": {
+        "type": "number",
+        "default": 2,
+        "help": "Nodi iniziali del node group di sistema"
+      },
+      "log_retention_days": {
+        "type": "number",
+        "default": 90,
+        "help": "Retention in giorni dei log del control plane (almeno 365 in prod)"
+      },
+      "deletion_protection": {
+        "type": "bool",
+        "default": false,
+        "help": "Deletion protection del cluster (sempre attiva in prod)"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "node_min_size": 3,
+        "node_max_size": 6,
+        "node_desired_size": 3,
+        "log_retention_days": 365,
+        "deletion_protection": true
+      }
+    },
+    "stacks": [
+      "kubernetes",
+      "kubernetes-addons"
+    ],
+    "shared": false,
+    "next_steps": [
+      "Prima lo stack network dello stesso ambiente (output vpc_id e private_subnet_ids, chiave {{ project }}/<env>/network.tfstate) e il registry envs/shared/ecr: i nodi fanno il pull con AmazonEC2ContainerRegistryPullOnly; per una concessione anche nella repository policy aggiungi in pull_principals dello stack ecr gli ARN dei ruoli <progetto>-<env>-eks-node e <progetto>-<env>-karpenter-node",
+      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/kubernetes && {{ iac_cli }} init && {{ iac_cli }} plan -out=kubernetes.tfplan && {{ iac_cli }} apply kubernetes.tfplan",
+      "Poi lo stack kubernetes-addons, con un'identità presente in admin_principals e una rete che raggiunge l'endpoint dell'API server (endpoint privato: VPN, Direct Connect o bastion nella VPC con la 443 ammessa nel security group cluster_security_group_id; oppure il proprio IP in public_endpoint_cidrs): cd {{ infra_root }}/envs/<env>/kubernetes-addons && {{ iac_cli }} init && {{ iac_cli }} plan -out=kubernetes-addons.tfplan && {{ iac_cli }} apply kubernetes-addons.tfplan",
+      "Karpenter crea nodi solo con almeno un NodePool e un EC2NodeClass: sono risorse dei workload (kybes), con spec.role = karpenter_node_role_name, subnet node_subnet_ids, security group cluster_security_group_id e node_security_group_id, IMDSv2 obbligatorio e dischi cifrati con node_kms_key_arn (esempio in {{ infra_root }}/modules/eks/README.md)",
+      "I pod raggiungono AWS solo con EKS Pod Identity (aws_eks_pod_identity_association con un ruolo con trust pods.eks.amazonaws.com); gli scaler SQS di KEDA usano il ruolo dell'operatore (identityOwner: operator) sulle code {{ project }}-<env>-*",
+      "Destroy in ordine inverso: prima i NodePool (Karpenter termina i suoi nodi), poi kubernetes-addons, poi kubernetes; in prod prima deletion_protection = false e un apply"
+    ]
   }
 }

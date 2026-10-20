@@ -114,6 +114,36 @@
       "envs": "*",
       "paths": ["modules/elb/**"],
       "reason": "Cifratura SSE-S3 (AES256) obbligata: gli access log dell'Application Load Balancer si consegnano solo a bucket con SSE-S3 come cifratura di default (SSE-KMS non è supportata)."
+    },
+    {
+      "id": "CKV_AWS_338",
+      "envs": "*",
+      "paths": ["modules/eks/**"],
+      "reason": "Log del control plane EKS: 90 giorni in dev e staging per contenere i costi. In prod il modulo impone almeno 365 giorni con una validazione di log_retention_days (environment = prod) e il default di prod è 365 da env_defaults, quindi la voce non nasconde regressioni di prod. Il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
+    },
+    {
+      "id": "CKV_AWS_39",
+      "envs": "*",
+      "paths": ["modules/eks/**"],
+      "reason": "L'endpoint pubblico si accende solo con public_endpoint_cidrs non vuoto (endpoint_public_access = length(var.public_endpoint_cidrs) > 0), con CIDR validati dal modulo (mai 0.0.0.0/0 né ::/0) e verificati dalla regola eks-hardening di kynfra; il default del pattern è l'endpoint solo privato. Checkov non risolve l'espressione e la tratta come endpoint pubblico."
+    },
+    {
+      "id": "CKV_AWS_339",
+      "envs": "*",
+      "paths": ["modules/eks/**"],
+      "reason": "kubernetes_version di default è 1.36, in standard support su EKS (calendario di https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html, verificato il 2026-10-21: 1.34-1.37 standard, 1.31-1.33 extended); l'elenco del controllo nella versione di Checkov del kit si ferma a 1.35. Il modulo valida la forma 1.<minore> e EKS rifiuta le versioni non supportate."
+    },
+    {
+      "id": "CKV_AWS_290",
+      "envs": "*",
+      "paths": ["modules/eks/**"],
+      "reason": "Policy ufficiale dell'AWS Load Balancer Controller v3.6.0 (docs/install/iam_policy.json del progetto kubernetes-sigs/aws-load-balancer-controller), trascritta senza modifiche: alcune azioni di scrittura (CreateSecurityGroup, Authorize/RevokeSecurityGroupIngress, CreateListener/Rule, ModifyListener) non hanno condizioni perché il controller le usa su risorse che crea o che riceve dagli Ingress e dai TargetGroupBinding. Il ruolo è assumibile solo dal service account kube-system/aws-load-balancer-controller di questo cluster (Pod Identity con session tag)."
+    },
+    {
+      "id": "CKV_AWS_355",
+      "envs": "*",
+      "paths": ["modules/eks/**"],
+      "reason": "Policy ufficiale dell'AWS Load Balancer Controller v3.6.0, trascritta senza modifiche: le azioni Describe* di EC2 ed ELB e alcune azioni sui listener e sui security group non supportano ARN di risorsa specifici o li ricevono a runtime, quindi usano Resource = \"*\" come nel documento ufficiale. Il ruolo è assumibile solo dal service account kube-system/aws-load-balancer-controller di questo cluster."
     }
   ],
   "trivy": []

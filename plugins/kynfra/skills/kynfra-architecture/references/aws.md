@@ -70,10 +70,10 @@ Infrastruttura completa letta dal progetto kybes: `schemas/openapi.yaml`, `servi
 - `aws_eks_access_entry` + `aws_eks_access_policy_association` (non `aws-auth`).
 - `aws_launch_template` con `metadata_options { http_tokens = "required"  http_put_response_hop_limit = 1 }` e `block_device_mappings { ebs { encrypted = true  kms_key_id = ... } }`; `aws_eks_node_group` (subnet private, `launch_template { id  version }`).
 - Karpenter: ruolo del nodo, ruolo del controller con Pod Identity, coda SQS per gli eventi di interruzione, regole EventBridge; nodi gestiti da Karpenter con lo stesso IMDSv2 obbligatorio.
-- `aws_eks_addon`: `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver`, con `addon_version` fissata da `versions.json`.
+- `aws_eks_addon`: `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver`, con `addon_version` da `data "aws_eks_addon_version"` (`kubernetes_version = aws_eks_cluster.<nome>.version`, `most_recent = true`) o fissata in `addon_versions`: le versioni degli add-on dipendono dalla versione del cluster, che è un input; `bootstrap_self_managed_addons = false`.
 - `aws_eks_pod_identity_association` per i ruoli dei pod; ruoli con trust `pods.eks.amazonaws.com`.
-- Stack separato `kubernetes-addons` (provider `helm`, versioni bloccate): AWS Load Balancer Controller, Karpenter, KEDA con `helm_release` e `version` fissa. Il provider si autentica con `aws eks get-token` via `exec` o dati del cluster, non con credenziali statiche.
-- Dipendenze: `network`.
+- Stack separato `kubernetes-addons` (provider `helm`, versioni bloccate): AWS Load Balancer Controller, Karpenter, KEDA con `helm_release` e `version` fissa. Il provider si autentica con il token di `data "aws_eks_cluster_auth"` (o `aws eks get-token` via `exec`), mai con credenziali statiche. NodePool ed EC2NodeClass di Karpenter sono dei workload (kybes).
+- Dipendenze: `network`, `ecr`.
 
 ## ecr
 

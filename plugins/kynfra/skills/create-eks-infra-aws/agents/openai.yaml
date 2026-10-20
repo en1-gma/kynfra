@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra EKS (AWS)"
+  short_description: "Generate an AWS EKS cluster with Karpenter, KEDA and the AWS Load Balancer Controller with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-eks-infra-aws to generate the EKS stacks (private endpoint, access entries, IMDSv2 nodes, managed add-ons, Pod Identity, Karpenter, KEDA, AWS Load Balancer Controller)."
+policy:
+  allow_implicit_invocation: false
