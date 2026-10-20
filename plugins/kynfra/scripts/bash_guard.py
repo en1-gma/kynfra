@@ -101,7 +101,8 @@ EXTRACTORS = {"tar", "bsdtar", "gtar", "unzip", "funzip", "7z", "7za", "7zz", "c
 NO_SCAN = READONLY_CMDS | WRITERS | {"mkdir", "rm", "rmdir", "chmod", "chown", "chgrp", "tflint", "checkov", "trivy",
                                      "gh", "git", "find", "kill", "set", "shopt", "unset", "return", "exit", "shift",
                                      "wait", "read", "export", "declare", "typeset", "local", "readonly", "alias",
-                                     "unalias", "pytest", "tsc", "eslint", "prettier", "mktemp", "open", "code"}
+                                     "unalias", "pytest", "tsc", "eslint", "prettier", "mktemp", "open", "code",
+                                     "pgrep", "pkill", "killall"}
 
 # comandi che producono file (decompressione, decodifica, copia di alberi): i percorsi di output sono scritture
 DECOMPRESSORS = {"gunzip", "gzip", "bunzip2", "bzip2", "unxz", "xz", "unzstd", "zstd", "uncompress", "unlzma",
@@ -144,6 +145,19 @@ KUBECTL_VALUE_OPTS = {"-n", "--namespace", "--context", "--kubeconfig", "--clust
                       "--token", "--as", "--as-group", "--as-uid", "--request-timeout", "--certificate-authority",
                       "--client-certificate", "--client-key", "--tls-server-name", "--cache-dir", "-v", "--v",
                       "--password", "--username", "--profile", "--profile-output", "--vmodule", "--log-file"}
+# letture che restituiscono segreti in chiaro: (servizio, operazione) -> opzione che le rende tali (None = sempre);
+# kubectl: risorse `secret(s)` con output che include i dati, `config view --raw`
+TOOLS_INSTALL_VALUE_OPTS = {"--approved-by"}
+AWS_SECRET_OPS = {
+    ("secretsmanager", "get-secret-value"): None, ("secretsmanager", "batch-get-secret-value"): None,
+    ("ssm", "get-parameter"): "--with-decryption", ("ssm", "get-parameters"): "--with-decryption",
+    ("ssm", "get-parameters-by-path"): "--with-decryption", ("ssm", "get-parameter-history"): "--with-decryption",
+    ("ec2", "get-password-data"): None, ("ecr", "get-login-password"): None,
+    ("ecr", "get-authorization-token"): None, ("ecr-public", "get-login-password"): None,
+    ("ecr-public", "get-authorization-token"): None, ("sts", "get-session-token"): None,
+}
+KUBECTL_SECRET_RESOURCES = {"secret", "secrets"}
+KUBECTL_SAFE_OUTPUT = {"", "wide", "name"}
 HELM_VALUE_OPTS = {"--kube-context", "--kubeconfig", "-n", "--namespace", "--registry-config", "--repository-cache",
                    "--repository-config", "--burst-limit", "--kube-apiserver", "--kube-as-user", "--kube-as-group",
                    "--kube-token", "--kube-ca-file", "--kube-tls-server-name", "--qps"}
@@ -209,9 +223,12 @@ class Ctx:
         return Ctx(self.cwds, self.depth + 1)
 
 
-def norm_name(text: str) -> str:
-    """Nome del comando come lo cerca la shell: basename, senza versione/tag (`terraform:1.9`, `x@latest`)."""
-    base = text.rstrip("/").rsplit("/", 1)[-1].lower()
+def norm_name(text: str, lower: bool = True) -> str:
+    """Nome del comando come lo cerca la shell: basename, senza versione/tag (`terraform:1.9`, `x@latest`).
+    `lower=False` per gli argomenti di un comando sconosciuto: solo argv[0] si confronta senza maiuscole."""
+    base = text.rstrip("/").rsplit("/", 1)[-1]
+    if lower:
+        base = base.lower()
     base = re.sub(r"\.exe$", "", base)
     if base and base[0] != "@":
         base = re.split(r"[@:]", base, 1)[0]
@@ -434,6 +451,10 @@ class Analyzer:
 
     def check_assigns(self, assigns: List[Tuple[str, str]], ctx: Ctx) -> None:
         for name, value in assigns:
+            low = name.lower()
+            if (low == "npm_config_global" and value.lower() not in ("", "false", "0")) \
+                    or (low == "npm_config_location" and value.lower() == "global"):
+                self.deny_tool(f"{name}={value}: installazione globale di pacchetti npm")
             if name.upper().startswith("TF_CLI_ARGS"):
                 self.deny(f"variabile {name}: inietta opzioni nei comandi terraform/tofu e non è consentita")
             self.exec_env(name, value, ctx)
@@ -712,20 +733,44 @@ class Analyzer:
             i = skip_opts(1, {"-n", "--interval", "-d", "--differences", "-q", "--equexit"})
             self.script(" ".join(t[i:]), ctx.cwds, ctx.depth + 1)
             return None
+        raw = args[0].text.rstrip("/").rsplit("/", 1)[-1].lower()
+        if raw in ("bunx", "pnpx") or (n in ("pnpm", "yarn") and L > 1 and t[1] == "dlx") \
+                or (n == "bun" and L > 1 and t[1] == "x"):
+            self.deny_tool(f"{raw if raw in ('bunx', 'pnpx') else n + ' ' + t[1]}: scarica ed esegue un pacchetto")
+            return None
         if n == "npx" or (n == "npm" and L > 1 and t[1] in ("exec", "x")) \
-                or (n == "pnpm" and L > 1 and t[1] in ("exec", "dlx")) \
-                or (n == "yarn" and L > 1 and t[1] in ("dlx", "exec")) or (n == "bun" and L > 1 and t[1] == "x"):
+                or (n in ("pnpm", "yarn") and L > 1 and t[1] == "exec"):
+            local_only = n in ("pnpm", "yarn")
+            label = "npx" if n == "npx" else f"{n} {t[1]}"
             i = 1 if n == "npx" else 2
+            packages: List[str] = []
             while i < L and t[i].startswith("-"):
                 if t[i] in ("-c", "--call") and i + 1 < L:
+                    if not local_only and packages:
+                        self.npx_packages(label, packages, ctx)
                     self.script(t[i + 1], ctx.cwds, ctx.depth + 1)
                     return None
                 if t[i] == "--":
                     i += 1
                     break
-                i += 2 if t[i] in ("-p", "--package") else 1
+                if t[i] in ("-y", "--yes") or t[i].startswith("--yes="):
+                    if not local_only and t[i] != "--yes=false":
+                        self.deny_tool(f"{label} {t[i]}: scarica ed esegue pacchetti senza chiedere")
+                if t[i] in ("-p", "--package") and i + 1 < L:
+                    packages.append(t[i + 1])
+                    i += 2
+                    continue
+                if t[i].startswith("--package="):
+                    packages.append(t[i].split("=", 1)[1])
+                i += 1
+            if not local_only:
+                if not packages and i < L:
+                    packages.append(t[i])
+                self.npx_packages(label, packages, ctx, [a.dyn for a in args])
             return args[i:] or None
         if n in ("uv", "poetry", "pipenv", "rye", "pdm", "hatch") and L > 1 and t[1] == "run":
+            if n == "uv" and any(re.match(r"--with(?:-requirements|-editable)?(?:=|$)", x) for x in t[2:]):
+                self.deny_tool("uv run --with: scarica pacchetti non dichiarati nel progetto")
             i = skip_opts(2, {"--with", "--python", "-p", "--project", "--directory", "--package", "--extra",
                               "--group", "--env-file", "--index", "--with-requirements", "--from", "-e", "--env"})
             rest = args[i:]
@@ -740,6 +785,31 @@ class Analyzer:
         if n == "direnv" and L > 2 and t[1] == "exec":
             return args[3:] or None
         return args
+
+    def npx_packages(self, label: str, packages: List[str], ctx: Ctx, dyns: Optional[List[bool]] = None) -> None:
+        """`npx`/`npm exec` scaricano il pacchetto se non è installato: consentiti solo i pacchetti dichiarati nel
+        package.json del progetto o già presenti in node_modules/.bin."""
+        if dyns and any(dyns):
+            self.deny_tool(f"{label} con pacchetto non determinabile")
+            return
+        manifests = [m for m in (self.find_upward(c, ("package.json",)) for c in ctx.cwds if c != UNKNOWN_DIR) if m]
+        deps: Set[str] = set()
+        for m in manifests:
+            try:
+                data = json.loads(_read_text(m) or "{}")
+            except ValueError:
+                continue
+            for key in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                section = data.get(key) if isinstance(data, dict) else None
+                if isinstance(section, dict):
+                    deps.update(section)
+        for pkg in packages:
+            local = (pkg not in ("", ".") and "@" not in pkg[1:]
+                     and (pkg in deps or any((m.parent / "node_modules" / ".bin" / pkg).is_file()
+                                             for m in manifests)))
+            if not local:
+                self.deny_tool(f"{label} {pkg}: pacchetto non dichiarato nel package.json del progetto, verrebbe "
+                               "scaricato ed eseguito")
 
     # ------------------------------------------------------------ smistamento
 
@@ -813,6 +883,8 @@ class Analyzer:
             return RW
         if name in PKG_MANAGERS:
             return self.pkg_manager(name, args, ctx)
+        if name in ("nix", "nix-shell", "dpkg", "rpm", "installer"):
+            return self.system_installer(name, args, ctx)
         if name in ("pip", "pipx", "uv", "cargo", "gem", "go"):
             return self.lang_installer(name, args, ctx)
         if name in ("npm", "pnpm", "yarn"):
@@ -866,7 +938,7 @@ class Analyzer:
             a = args[i]
             if a.dyn:
                 continue
-            if norm_name(a.text) in SCAN_NAMES:
+            if norm_name(a.text, lower=False) in SCAN_NAMES:
                 self.run(args[i:], ctx.nested())
             elif re.search(r"\s", a.text.strip()):
                 self.script(a.text, ctx.cwds, ctx.depth + 1, strict=False)
@@ -980,6 +1052,12 @@ class Analyzer:
             self.deny(f"`aws {pos[0].text}`: operazione mancante o alias della CLI, non verificabile")
             return RW
         svc, op = pos[0].text, pos[1].text
+        if (svc, op) in AWS_SECRET_OPS:
+            flag = AWS_SECRET_OPS[(svc, op)]
+            if flag is None or any(a.text == flag or a.text.startswith(flag + "=") for a in args[2:]):
+                self.deny(f"`aws {svc} {op}`" + (f" {flag}" if flag else "") + ": restituisce segreti o credenziali "
+                          "in chiaro; l'agente non li legge (li usa il DevOps o la pipeline)")
+                return RW
         if (svc, op) == ("s3api", "get-object"):
             self.aws_outfile(args[1:], ctx)
         if op == "help" or op.startswith(("get-", "describe-", "list-")) or (svc, op) == ("s3", "ls") \
@@ -1015,6 +1093,11 @@ class Analyzer:
         second = pos[1].text if len(pos) > 1 else ""
         if pos[0].dyn:
             self.deny("`kubectl`: sottocomando non determinabile")
+        elif sub == "get" and self.kubectl_secret_dump(args[1:], pos[1:]):
+            self.deny("`kubectl get secret`: con -o yaml|json|jsonpath|template stampa i segreti in chiaro; "
+                      "l'agente non li legge")
+        elif sub == "config" and second == "view" and any(a.text in ("--raw", "--raw=true") for a in args[1:]):
+            self.deny("`kubectl config view --raw`: stampa token e chiavi del kubeconfig; l'agente non li legge")
         elif sub in ("get", "describe", "explain", "version", "help") or (
                 sub == "config" and second in ("view", "get-contexts") and not pos[1].dyn):
             return RO
@@ -1023,6 +1106,30 @@ class Analyzer:
             self.deny(f"`{label}`: può modificare il cluster (consentiti get, describe, explain, version, "
                       "config view|get-contexts)")
         return RW
+
+    @staticmethod
+    def kubectl_secret_dump(rest: List[Arg], resources: List[Arg]) -> bool:
+        """`kubectl get` di risorse secret con un formato di output che include i dati (tutti tranne wide/name)."""
+        def is_secret(a: Arg) -> bool:
+            return a.dyn or any(part.split("/", 1)[0].split(".", 1)[0].lower() in KUBECTL_SECRET_RESOURCES
+                                for part in a.text.split(","))
+        if not any(is_secret(a) for a in resources):
+            return False
+        for i, a in enumerate(rest):
+            t = a.text
+            if t in ("-o", "--output"):
+                fmt = rest[i + 1].text if i + 1 < len(rest) else ""
+            elif t.startswith(("--output=", "-o=")):
+                fmt = t.split("=", 1)[1]
+            elif t.startswith("-o"):
+                fmt = t[2:]
+            elif t == "--template" or t.startswith("--template="):
+                return True
+            else:
+                continue
+            if a.dyn or fmt.split("=", 1)[0].lower() not in KUBECTL_SAFE_OUTPUT:
+                return True
+        return False
 
     def helm(self, args: List[Arg], ctx: Ctx) -> str:
         pos = _opt_split(args[1:], HELM_VALUE_OPTS)
@@ -1222,9 +1329,31 @@ class Analyzer:
             if kit and not other:
                 if kit[0].name == "tools.py" and rest and rest[0].text == "install":
                     self.installs += 1
+                    self.tools_install(rest[1:], ctx)
                 return KIT
         self.run_file(script.text, ctx, "python")
         return RW
+
+    def tools_install(self, rest: List[Arg], ctx: Ctx) -> None:
+        """`tools.py install` deve nominare un solo strumento, letterale: l'approvazione vale per quello."""
+        tools: List[Arg] = []
+        bad = ctx.xargs
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a.text in TOOLS_INSTALL_VALUE_OPTS:
+                i += 2
+                continue
+            if a.text.split("=", 1)[0] in TOOLS_INSTALL_VALUE_OPTS:
+                i += 1
+                continue
+            if a.text.startswith("-") or a.dyn or a.globby:
+                bad = True
+            tools.append(a)
+            i += 1
+        if bad or len(tools) != 1:
+            self.deny("tools.py install: nomina esattamente uno strumento, scritto per esteso (niente --all, liste, "
+                      "variabili, cicli o xargs): l'approvazione vale per uno strumento", tool=True)
 
     def pymod(self, mod: str, rest: List[Arg], ctx: Ctx) -> str:
         if mod in ("pip", "pipx", "uv"):
@@ -1446,6 +1575,34 @@ class Analyzer:
                 self.deny_tool(f"{name} {' '.join(t[:2])}")
             return RO
         self.deny_tool(f"{name} {pos[0]}")
+        return RW
+
+    def system_installer(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        """nix run|shell|profile install, nix-shell -p, dpkg -i, rpm -i|-U|-F, installer -pkg: installano o
+        scaricano ed eseguono pacchetti."""
+        t = [a.text for a in args[1:]]
+        what = None
+        if name == "nix":
+            pos = [a.text for a in _opt_split(args[1:], {"--extra-experimental-features", "--experimental-features",
+                                                         "-I", "--include", "--store", "--log-format"})]
+            if pos and (pos[0] in ("run", "shell", "develop") or pos[:2] in (["profile", "install"],
+                                                                            ["profile", "add"])):
+                what = "nix " + " ".join(pos[:2] if pos[0] == "profile" else pos[:1])
+        elif name == "nix-shell":
+            if any(x in ("-p", "--packages") or re.fullmatch(r"-[a-zA-Z]*p", x) for x in t):
+                what = "nix-shell -p"
+        elif name == "dpkg":
+            if any(x in ("--install", "--unpack") or re.fullmatch(r"-[a-zA-Z]*i[a-zA-Z]*", x) for x in t):
+                what = "dpkg -i"
+        elif name == "rpm":
+            if any(x in ("--install", "--upgrade", "--freshen", "--reinstall")
+                   or (re.fullmatch(r"-[a-zA-Z]+", x) and re.search(r"[iUF]", x) and "q" not in x) for x in t):
+                what = "rpm -i/-U"
+        elif name == "installer":
+            if any(x in ("-pkg", "--pkg") for x in t):
+                what = "installer -pkg"
+        if what:
+            self.deny_tool(what)
         return RW
 
     def lang_installer(self, name: str, args: List[Arg], ctx: Ctx) -> str:
