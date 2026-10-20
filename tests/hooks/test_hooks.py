@@ -138,6 +138,11 @@ class PreWriteTests(unittest.TestCase):
         out = codex_patch(proj, "*** Update File: envs/dev/web/backend.tf\n@@\n-    encrypt      = true\n")
         self.assertTrue(denied(out), out)
 
+    def test_write_git_hook_denied(self):
+        out = claude_write(project(), ".git/hooks/pre-commit", "#!/bin/sh\nterraform apply\n")
+        self.assertTrue(denied(out), out)
+        self.assertIn("protected-files", reason(out))
+
     def test_apply_patch_delete_protected_denied(self):
         proj = project()
         put(proj, ".terraform.lock.hcl", "# lock\n")

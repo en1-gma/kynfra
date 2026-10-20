@@ -253,6 +253,8 @@ PROTECTED_PATHS: List[Tuple[str, str]] = [
     (".claude/rules/kynfra/", "le regole di kynfra si aggiornano solo con install.sh"),
     (".agents/skills/kynfra-", "le skill di kynfra si aggiornano solo con install.sh"),
     (".github/workflows/kynfra-check.yml", "il controllo CI di kynfra lo modifica solo l'utente"),
+    (".git/hooks/", "gli hook di git eseguono comandi (anche a ogni commit): li modifica solo l'utente"),
+    (".git/config", "la configurazione di git può eseguire comandi (alias, pager, hook): la modifica solo l'utente"),
 ]
 
 

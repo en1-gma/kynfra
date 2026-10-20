@@ -94,6 +94,13 @@ class RulesCoreTest(unittest.TestCase):
         self.assertEqual(rules.check_protected("infra/envs/dev/spa/main.tf", cfg), [])
         self.assertEqual(rules.check_protected("other/.terraform.lock.hcl", cfg), [])
 
+    def test_git_hooks_and_config_protected(self):
+        cfg = cfg_for("infra")
+        for rel in (".git/hooks/pre-commit", ".git/hooks/post-checkout", ".git/config", ".GIT/Hooks/pre-push"):
+            self.assertEqual([x.rule for x in rules.check_protected(rel, cfg)], ["protected-files"], rel)
+        for rel in (".github/workflows/ci.yml", ".gitignore", "docs/.git-notes.md"):
+            self.assertEqual(rules.check_protected(rel, cfg), [], rel)
+
     def test_stack_of(self):
         self.assertEqual(rules.stack_of("envs/prod/spa/main.tf"), ("prod", "spa"))
         self.assertIsNone(rules.stack_of("modules/spa/main.tf"))
