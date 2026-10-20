@@ -385,5 +385,139 @@ class HookOutputTests(unittest.TestCase):
             shutil.rmtree(root)
 
 
+class FixRound1Tests(GuardCase):
+    """Bypass trovati in review (fix round 1): un test per probe, più i falsi positivi da evitare."""
+
+    def test_ro_command_output_option_is_a_write(self):
+        self.assert_denied([
+            "git log -1 --format='tformat:{\"rules\":{\"protected-files\":\"off\"}}' --output=.kynfra/config.json",
+            "git show --output=.kynfra/config.json HEAD:x", "git diff --output=infra/envs/dev/spa/main.tf",
+            "git diff --output envs/dev/spa/main.tf", "tree -o .kynfra/config.json",
+        ])
+        self.assert_allowed(["git diff --output=/tmp/d.patch", "tree -o /tmp/tree.txt", "git log --oneline"])
+
+    def test_dev_stdin_scripts_are_analysed(self):
+        self.assert_denied([
+            "bash /dev/stdin <<< 'terraform apply'", ". /dev/stdin <<'E'\nterraform apply\nE",
+            "bash /dev/fd/0 <<< 'terraform apply'", "source /dev/fd/3 3<<< 'terraform apply'",
+            "python3 /dev/stdin <<< 'import os; os.system(\"terraform apply\")'", "bash /dev/fd/5",
+            "echo 'terraform apply' | bash /dev/stdin", "sh /proc/self/fd/0 <<< 'terraform destroy'",
+        ])
+        self.assert_allowed(["bash /dev/stdin <<< 'terraform validate'"])
+
+    def test_writes_through_other_commands(self):
+        self.assert_denied([
+            "git checkout HEAD~1 -- envs/dev/spa/main.tf", "git checkout HEAD~1 -- infra/",
+            "git restore --source=HEAD~2 main.tf", "git stash apply", "git stash pop", "git cherry-pick abc123",
+            "git mv notes.txt envs/dev/spa/x.tf", "git update-index --cacheinfo 100644,abc,main.tf",
+            "git checkout main", "git switch main", "git merge feature", "git reset --hard HEAD~1",
+            "git pull", "git rebase main", "git read-tree -u HEAD", "git worktree add wt main",
+            "ditto /tmp/x envs/dev/spa/main.tf", "gunzip main.tf.gz", "base64 -d -o main.tf /tmp/x.b64",
+            "xxd -r /tmp/x.hex main.tf", "openssl enc -d -in /tmp/x -out main.tf",
+            "pax -rw /tmp/mod infra/modules", "cpio -p infra/modules < /tmp/list",
+            "split -b 10 --additional-suffix=.tf /tmp/x envs/dev/spa/part",
+            "helm template x . --output-dir native/spa",
+            "aws s3api get-object --bucket b --key terraform .kynfra/bin/terraform",
+            "aws s3api get-object --bucket b --key k envs/dev/spa/main.tf",
+            "python3 scripts/gen.py --out envs/dev/spa/main.tf", "mytool --config .kynfra/config.json",
+        ])
+        self.assert_allowed([
+            "git checkout -b feat/x", "git switch -c feat/y", "git stash", "git stash list", "git reset HEAD~1",
+            "git restore --staged notes.txt", "gunzip -c /tmp/x.gz", "base64 -d /tmp/x.b64",
+            "aws s3api get-object --bucket b --key k /tmp/out.json", "tflint --filter main.tf",
+            "checkov -f main.tf", "terraform fmt main.tf", "terraform validate", "rm -rf infra/envs/dev/old",
+            "docker compose --env-file .env up -d",
+        ])
+
+    def test_writes_through_other_commands_scoped_by_infra_root(self):
+        shutil.rmtree(self.proj)
+        self.proj = make_project(infra_root="infra")
+        self.assert_allowed(["git checkout HEAD~1 -- src/app.ts", "git restore src/app.ts"])
+        self.assert_denied(["git checkout HEAD~1 -- infra/envs/dev/spa/main.tf", "git checkout HEAD~1 -- infra",
+                            "git checkout HEAD~1 -- .kynfra/config.json", "git checkout HEAD~1 -- ."])
+
+    def test_env_vars_that_run_code(self):
+        self.assert_denied([
+            "GIT_SSH_COMMAND='terraform apply' git fetch", "GIT_EDITOR='terraform apply' git commit",
+            "GIT_PAGER='terraform apply' git log", "PAGER='terraform apply' git log",
+            "GIT_EXTERNAL_DIFF=/tmp/x.sh git diff",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=x git log",
+            "git --config-env=core.pager=EVIL log", "BASH_ENV=/tmp/x.sh bash -c true", "ENV=/tmp/x.sh sh -c true",
+            "PROMPT_COMMAND='terraform apply' bash -i", "LD_PRELOAD=/tmp/x.so ls",
+            "DYLD_INSERT_LIBRARIES=/tmp/x.dylib ls", "NODE_OPTIONS='--require /tmp/x.js' node -v",
+            "PYTHONPATH=/tmp python3 -c 'print(1)'", "PYTHONSTARTUP=/tmp/x.py python3",
+            "PATH=/tmp/evil:$PATH ls", "export PATH=/tmp/evil:$PATH", "env PATH=/tmp/evil terraform validate",
+            "MAKEFILES=/tmp/x.mk make fmt", "MAKEFLAGS='-f /tmp/x.mk' make fmt", "make SHELL=/tmp/x.sh fmt",
+            f"PYTHONPATH=/tmp python3 -B {KIT}/arch_check.py",
+            f"PATH=/tmp/evil:$PATH python3 -B {KIT}/stop_gate.py", "declare -x LD_PRELOAD=/tmp/x.so",
+        ])
+        put(self.proj, "Makefile", "SHELL := /tmp/evil.sh\nfmt:\n\tterraform fmt\n")
+        self.assert_denied(["make fmt"])
+        self.assert_allowed(["GIT_PAGER=cat git log", "GIT_EDITOR=true git commit --amend --no-edit",
+                             "PATH=$PATH:/opt/bin ls", "export PATH=\"$PATH:$HOME/.local/bin\""])
+
+    def test_input_redirect_into_shell(self):
+        put(self.proj, "deploy.sh", "terraform apply\n")
+        put(self.proj, "x.py", "import os\nos.system('terraform destroy')\n")
+        self.assert_denied(["bash < deploy.sh", "sh 0< deploy.sh", "python3 < x.py"])
+        put(self.proj, "ok.sh", "terraform validate\n")
+        self.assert_allowed(["bash < ok.sh", "wc -l < deploy.sh"])
+
+    def test_inline_makefile(self):
+        self.assert_denied([
+            "make -f /dev/stdin <<< $'x:\\n\\tterraform apply'", "make -f - x <<'E'\nx:\n\tterraform apply\nE",
+            "make --eval=$'x:\\n\\tterraform apply' x", "make -E $'x:\\n\\tterraform apply' x",
+            "echo x | make -f -",
+        ])
+
+    def test_at_and_crontab(self):
+        self.assert_denied(["at now <<< 'terraform apply'", "echo 'terraform apply' | at now",
+                            "batch <<< 'terraform apply'", "echo '* * * * * terraform apply' | crontab -",
+                            "crontab /tmp/cron.txt", "at -f deploy.sh now"])
+        self.assert_allowed(["crontab -l", "atq"])
+
+    def test_secret_reads_denied(self):
+        self.assert_denied([
+            "aws secretsmanager get-secret-value --secret-id x", "aws ssm get-parameter --name x --with-decryption",
+            "aws ssm get-parameters --names a b --with-decryption",
+            "aws ssm get-parameters-by-path --path / --with-decryption", "aws ec2 get-password-data --instance-id i",
+            "aws ecr get-login-password", "aws ecr get-login-password | docker login --password-stdin x",
+            "aws sts get-session-token", "kubectl get secret x -o yaml", "kubectl get secrets -o json",
+            "kubectl -n x get secret/db -o jsonpath='{.data.password}'", "kubectl get secret x -oyaml",
+            "kubectl config view --raw",
+        ])
+        self.assert_allowed(["aws ssm get-parameter --name x", "kubectl get secrets", "kubectl describe secret x",
+                             "kubectl get pods -o yaml", "kubectl config view"])
+
+    def test_minor_false_positives(self):
+        self.assert_allowed(["docker login --username AWS --password-stdin 123.dkr.ecr.x.amazonaws.com",
+                             "pgrep -f \"terraform apply\"", "pkill -f 'terraform plan'", "ps aux | grep terraform"])
+
+    def test_tf_cli_args_via_builtins(self):
+        self.assert_denied(["read TF_CLI_ARGS <<< '-auto-approve'", "printf -v TF_CLI_ARGS_apply %s -auto-approve",
+                            "mapfile TF_CLI_ARGS < /tmp/x", "readarray -t TF_CLI_ARGS < /tmp/x",
+                            "declare -x TF_CLI_ARGS", "typeset -x TF_CLI_ARGS_plan", "export TF_CLI_ARGS",
+                            "read GIT_SSH_COMMAND <<< x"])
+
+    def test_tools_install_names_exactly_one_tool(self):
+        self.assert_denied([f"python3 -B {KIT}/tools.py install tflint checkov",
+                            f"python3 -B {KIT}/tools.py install --all", f"python3 -B {KIT}/tools.py install",
+                            f"for t in tflint checkov; do python3 -B {KIT}/tools.py install $t; done",
+                            f"echo tflint | xargs python3 -B {KIT}/tools.py install"])
+        self.assert_allowed([f"python3 -B {KIT}/tools.py install tflint", f"python3 -B {KIT}/tools.py status"])
+
+    def test_package_runners_that_download(self):
+        put(self.proj, "package.json", json.dumps({"devDependencies": {"typescript": "5.0.0", "eslint": "9"}}))
+        put(self.proj, "node_modules/.bin/tsc", "#!/usr/bin/env node\n")
+        self.assert_denied(["npx -y cowsay hi", "npx --yes eslint .", "npx cowsay hi", "npm exec cowsay",
+                            "pnpm dlx cowsay", "yarn dlx cowsay", "bunx cowsay", "bun x cowsay",
+                            "uv run --with requests python3 x.py", "nix run nixpkgs#terraform", "nix shell nixpkgs#x",
+                            "nix profile install nixpkgs#x", "nix-shell -p terraform", "dpkg -i x.deb", "rpm -i x.rpm",
+                            "rpm -Uvh x.rpm", "installer -pkg x.pkg -target /", "npm_config_global=true npm i x",
+                            "NPM_CONFIG_GLOBAL=true npm install x"])
+        self.assert_allowed(["npx tsc --noEmit", "npx eslint .", "npm exec tsc", "uv run python3 -c 'print(1)'",
+                             "pnpm exec tsc"])
+
+
 if __name__ == "__main__":
     unittest.main()

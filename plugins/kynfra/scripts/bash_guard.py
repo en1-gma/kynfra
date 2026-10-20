@@ -72,13 +72,24 @@ READONLY_GIT = {"diff", "log", "status", "show", "blame", "ls-files", "rev-parse
                 "fetch", "branch", "remote", "describe", "shortlog", "reflog", "ls-tree", "cat-file"}
 WRITERS = {"tee", "sed", "gsed", "perl", "awk", "gawk", "mawk", "nawk", "yq", "cp", "mv", "install", "ln", "rsync",
            "scp", "dd", "truncate", "touch", "sort", "sponge", "ed", "ex", "vi", "vim", "nvim", "tar", "bsdtar",
-           "gtar", "unzip", "7z", "7za", "7zz", "cpio"}
+           "gtar", "unzip", "7z", "7za", "7zz", "cpio", "ditto"}
 EXTRACTORS = {"tar", "bsdtar", "gtar", "unzip", "funzip", "7z", "7za", "7zz", "cpio", "dd", "tee", "sponge",
               "install"}
 NO_SCAN = READONLY_CMDS | WRITERS | {"mkdir", "rm", "rmdir", "chmod", "chown", "chgrp", "tflint", "checkov", "trivy",
                                      "gh", "git", "find", "kill", "set", "shopt", "unset", "return", "exit", "shift",
                                      "wait", "read", "export", "declare", "typeset", "local", "readonly", "alias",
                                      "unalias", "pytest", "tsc", "eslint", "prettier", "mktemp", "open", "code"}
+
+# comandi che producono file (decompressione, decodifica, copia di alberi): i percorsi di output sono scritture
+DECOMPRESSORS = {"gunzip", "gzip", "bunzip2", "bzip2", "unxz", "xz", "unzstd", "zstd", "uncompress", "unlzma",
+                 "lzma"}
+PRODUCERS = DECOMPRESSORS | {"base64", "xxd", "openssl", "pax", "split"}
+DECOMP_SUFFIXES = {".gz": "", ".tgz": ".tar", ".z": "", ".bz2": "", ".tbz2": ".tar", ".xz": "", ".txz": ".tar",
+                   ".zst": "", ".lzma": ""}
+# git che riscrive (tutto o in parte) il working tree; checkout/switch/restore/stash/reset/mv/update-index a parte
+GIT_TREE_WRITERS = {"merge", "cherry-pick", "pull", "rebase", "revert", "read-tree"}
+# comandi che ricevono file IaC come argomento senza scriverli (o con controlli propri)
+IAC_ARG_EXEMPT = {"terraform", "tofu", "terragrunt", "git", "aws", "kubectl", "helm", "bat", "tfsec", "terrascan"}
 
 TF_NAME_RE = re.compile(r"(terraform|tofu|opentofu|tf|terragrunt)(?:[-_.]?v?\d[\w.]*)?")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh", "pwsh"}
@@ -461,12 +472,53 @@ class Analyzer:
         if kind in (KIT, DELEGATED):
             return
         ro = kind == RO and not ctx.write_redir
+        if kind == RO and name in READONLY_CMDS:
+            self.output_opts(args[1:], ctx.cwds, short_o=name == "tree")
         if not ro:
             if self.protect and self.mentions_protected(args[1:] + ctx.redir_targets, ctx.cwds):
                 self.deny("il comando tocca file protetti di kynfra (configurazione, kit, hook o impostazioni "
                           "dell'agente): li modifica solo l'utente")
+            if name not in NO_SCAN and name not in IAC_ARG_EXEMPT and name not in PRODUCERS:
+                self.iac_args(name, args[1:], ctx.cwds)
             if any(TF_CLI_RE.search(a.text) for a in args[1:]):
                 self.deny("variabile TF_CLI_ARGS*: inietta opzioni nei comandi terraform/tofu e non è consentita")
+
+    def output_opts(self, rest: List[Arg], cwds: List[Path], short_o: bool = False,
+                    names: Tuple[str, ...] = ("--output",)) -> None:
+        """Valori di `--output[=]` (e `-o`, se il comando lo usa per un file): sono scritture anche nei comandi
+        di sola lettura (`git log --output=…`, `tree -o …`)."""
+        for i, a in enumerate(rest):
+            t = a.text
+            name, eq, value = t.partition("=")
+            if eq and name in names:
+                self.target(Arg(value, a.dyn, a.globby), cwds)
+            elif (t in names or (short_o and t == "-o")) and i + 1 < len(rest):
+                self.target(rest[i + 1], cwds)
+            elif short_o and t.startswith("-o") and len(t) > 2:
+                self.target(Arg(t[2:], a.dyn, a.globby), cwds)
+
+    def iac_args(self, name: str, rest: List[Arg], cwds: List[Path]) -> None:
+        """Comando qualsiasi che riceve un file IaC come argomento: può scriverlo senza passare dai controlli."""
+        for a in rest:
+            t = a.text
+            if a.dyn or not t:
+                continue
+            if t.startswith("-"):
+                if "=" not in t:
+                    continue
+                t = t.split("=", 1)[1]
+            for c in self.candidates(Arg(t, a.dyn, a.globby), cwds):
+                if UNKNOWN_DIR in cwds and not os.path.isabs(os.path.expanduser(c)) \
+                        and c.lower().endswith(rules.IAC_EXT):
+                    self.deny(f"`{name}` riceve il file IaC {c} in una cartella non determinabile: usa Write/Edit")
+                    return
+                for p in self.resolve_all(c, cwds):
+                    rel = rules.rel_to_project(str(p), self.proj)
+                    irel = rules.infra_rel(rel, self.cfg) if rel is not None else None
+                    if irel is not None and rules.is_iac_file(irel):
+                        self.deny(f"`{name}` riceve il file IaC {rel} come argomento e può scriverlo senza passare "
+                                  "dai controlli: i file IaC si scrivono con Write/Edit")
+                        return
 
     def mentions_protected(self, args: List[Arg], cwds: List[Path]) -> bool:
         for a in args:
@@ -691,8 +743,12 @@ class Analyzer:
         if name in ("patch",):
             self.deny("git apply/patch scrivono file senza passare dai controlli: applica le modifiche con Write/Edit")
             return RW
-        if (name == "install.sh" or "/" in args[0].text) and name not in WRITERS and name not in READONLY_CMDS:
+        if (name == "install.sh" or "/" in args[0].text) and name not in WRITERS and name not in READONLY_CMDS \
+                and name not in PRODUCERS:
             return self.exec_file(args[0], args[1:], ctx)
+        if name in PRODUCERS:
+            self.producers(name, args, ctx)
+            return RW
         if name in WRITERS:
             self.writers(name, args, ctx)
             return RW
@@ -822,12 +878,30 @@ class Analyzer:
             self.deny(f"`aws {pos[0].text}`: operazione mancante o alias della CLI, non verificabile")
             return RW
         svc, op = pos[0].text, pos[1].text
+        if (svc, op) == ("s3api", "get-object"):
+            self.aws_outfile(args[1:], ctx)
         if op == "help" or op.startswith(("get-", "describe-", "list-")) or (svc, op) == ("s3", "ls") \
                 or (svc == "s3api" and op.startswith("head-")):
             return RO
         self.deny(f"`aws {svc} {op}`: operazione che può modificare l'account cloud (consentite solo get-*, "
                   "describe-*, list-*, sts get-caller-identity, s3 ls, s3api head-*)")
         return RW
+
+    def aws_outfile(self, rest: List[Arg], ctx: Ctx) -> None:
+        """`aws s3api get-object … <outfile>`: l'unico posizionale dopo servizio e operazione è il file scritto."""
+        flags = {"--debug", "--no-verify-ssl", "--no-paginate", "--no-sign-request", "--no-cli-pager",
+                 "--cli-auto-prompt", "--no-cli-auto-prompt"}
+        pos: List[Arg] = []
+        i = 0
+        while i < len(rest):
+            t = rest[i].text
+            if t.startswith("--"):
+                i += 1 if ("=" in t or t in flags) else 2
+                continue
+            pos.append(rest[i])
+            i += 1
+        for a in pos[2:]:
+            self.target(a, ctx.cwds)
 
     def kubectl(self, args: List[Arg], ctx: Ctx) -> str:
         pos = _opt_split(args[1:], KUBECTL_VALUE_OPTS)
@@ -858,6 +932,11 @@ class Analyzer:
         if not pos[0].dyn and sub in ("template", "lint", "show", "version", "list", "ls", "status", "help"):
             if any(a.text.startswith("--post-renderer") for a in args):
                 self.deny("`helm --post-renderer`: esegue un programma arbitrario")
+            for i, a in enumerate(args):
+                if a.text == "--output-dir" and i + 1 < len(args):
+                    self.target(args[i + 1], ctx.cwds, extract=True)
+                elif a.text.startswith("--output-dir="):
+                    self.target(Arg(a.text.split("=", 1)[1], a.dyn, a.globby), ctx.cwds, extract=True)
             return RO
         self.deny(f"`helm {sub}`: può modificare il cluster (consentiti template, lint, show, version, list, status)")
         return RW
@@ -1464,6 +1543,7 @@ class Analyzer:
 
     def git(self, args: List[Arg], ctx: Ctx) -> str:
         i = 1
+        cwds = ctx.cwds
         while i < len(args):
             x = args[i].text
             if x in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path",
@@ -1471,6 +1551,9 @@ class Analyzer:
                 if x == "-c" and i + 1 < len(args):
                     key, _, val = args[i + 1].text.partition("=")
                     self.git_key(key, val, ctx)
+                if x in ("-C", "--work-tree") and i + 1 < len(args):
+                    d = args[i + 1]
+                    cwds = [UNKNOWN_DIR] if d.dyn else self.resolve_all(d.text, cwds)
                 i += 2
                 continue
             if x.startswith("-"):
@@ -1488,7 +1571,100 @@ class Analyzer:
             return RW
         if sub.text == "config":
             self.git_config(args[i + 1:], ctx)
+        rest = args[i + 1:]
+        self.output_opts(rest, cwds, short_o=sub.text in ("archive", "format-patch"),
+                         names=("--output", "--output-directory"))
+        self.git_tree(sub.text, rest, cwds)
         return RO if sub.text in READONLY_GIT else RW
+
+    def git_tree(self, sub: str, rest: List[Arg], cwds: List[Path]) -> None:
+        """git che riscrive il working tree: consentito solo se ogni pathspec è fuori da infra_root e dai file
+        protetti; senza pathspec (cambio di branch, merge, stash apply…) tocca tutto l'albero e si rifiuta."""
+        t = [a.text for a in rest]
+
+        def short(ch: str) -> bool:
+            return any(x.startswith("-") and not x.startswith("--") and ch in x[1:] for x in t)
+
+        def split(value_opts: Set[str]) -> Tuple[List[Arg], Optional[List[Arg]]]:
+            if "--" in t:
+                k = t.index("--")
+                return _opt_split(rest[:k], value_opts), rest[k + 1:]
+            return _opt_split(rest, value_opts), None
+
+        whole = False
+        paths: List[Arg] = []
+        if sub == "checkout":
+            before, after = split({"-b", "-B", "--orphan", "--conflict", "--pathspec-from-file"})
+            creates = any(x in ("-b", "-B", "--orphan") for x in t)
+            if after is not None:
+                paths, whole = after, not after
+            elif not before:
+                whole = any(x.startswith("--pathspec-from-file") for x in t)
+            elif creates:
+                whole = True
+            elif len(before) == 1:
+                if not before[0].dyn and any(p.exists() for p in self.resolve_all(before[0].text, cwds)):
+                    paths = before
+                else:
+                    whole = True
+            else:
+                paths = before[1:]
+        elif sub == "switch":
+            before, _ = split({"-c", "-C", "--create", "--force-create", "--orphan", "--conflict"})
+            whole = bool(before)
+        elif sub == "restore":
+            if (("--staged" in t or short("S")) and not ("--worktree" in t or short("W"))):
+                return
+            before, after = split({"-s", "--source", "--conflict", "--pathspec-from-file"})
+            paths = after if after is not None else before
+            whole = any(x.startswith("--pathspec-from-file") for x in t)
+        elif sub == "stash":
+            pos = _opt_split(rest, {"-m", "--message"})
+            whole = bool(pos) and pos[0].text in ("apply", "pop", "branch")
+        elif sub == "reset":
+            whole = any(x in ("--hard", "--merge", "--keep") for x in t)
+        elif sub in GIT_TREE_WRITERS:
+            whole = True
+        elif sub == "worktree":
+            pos = _opt_split(rest, set())
+            whole = bool(pos) and pos[0].text in ("add", "move")
+        elif sub == "checkout-index":
+            whole = any(x in ("-a", "--all", "--stdin") for x in t)
+            paths = _opt_split(rest, {"--prefix", "--stage"})
+        elif sub == "update-index":
+            whole = any(x in ("--index-info", "--stdin") for x in t)
+            paths = [Arg(a.text.rsplit(",", 1)[-1], a.dyn, a.globby) for a in _opt_split(rest, set())]
+        elif sub == "mv":
+            self.writers("mv", [Arg("mv")] + rest, Ctx(cwds, 0))
+            return
+        else:
+            return
+        if whole and UNKNOWN_DIR not in cwds and all(rules.rel_to_project(str(c), self.proj) is None
+                                                     for c in cwds):
+            whole = False  # repository fuori dal progetto (git -C altrove)
+        if not whole:
+            whole = any(self.git_path_guarded(a, cwds) for a in paths)
+        if whole:
+            self.deny(f"`git {sub}` riscrive file del working tree (IaC sotto infra_root o file protetti) senza "
+                      "passare dai controlli: modifica i file con Write/Edit, o lascia l'operazione all'utente")
+
+    def git_path_guarded(self, a: Arg, cwds: List[Path]) -> bool:
+        """Pathspec che può toccare IaC sotto infra_root, .env o file protetti (o non determinabile)."""
+        if a.dyn or a.globby or re.search(r"[*?\[]", a.text) or a.text.startswith(":"):
+            return True
+        if UNKNOWN_DIR in cwds and not os.path.isabs(os.path.expanduser(a.text)):
+            return True
+        for p in self.resolve_all(a.text, cwds):
+            rel = rules.rel_to_project(str(p), self.proj)
+            if rel is None:
+                continue
+            rel = "" if rel == "." else rel
+            low = rel.lower()
+            if rel == "" or self.in_infra_scope(rel) or rules.protected_reason(rel, self.cfg) \
+                    or is_env_name(low.rsplit("/", 1)[-1]) or low == ".git" or low.startswith(".git/") \
+                    or any(pre.startswith(low + "/") for pre, _ in rules.PROTECTED_PATHS):
+                return True
+        return False
 
     def git_config(self, args: List[Arg], ctx: Ctx) -> None:
         t = [a.text for a in args]
@@ -1581,7 +1757,7 @@ class Analyzer:
             if any(x in ("-i", "--inplace") or x.startswith("--inplace") for x in t):
                 for a in positional({"-o", "--output-format", "-p", "--input-format", "--from-file"}):
                     self.target(a, cw)
-        elif name in ("cp", "mv", "install", "ln", "rsync", "scp"):
+        elif name in ("cp", "mv", "install", "ln", "rsync", "scp", "ditto"):
             if name == "install" and any(x in ("-d", "--directory") for x in t):
                 return
             tdir = None
@@ -1604,6 +1780,9 @@ class Analyzer:
             sources = [Arg(s.text, True, s.globby) if ":" in s.text and name in ("rsync", "scp") else s
                        for s in sources]
             dir_hint = tdir is not None or any(s.dyn or self.any_dir(s, cw) for s in sources)
+            if name == "ditto" and tdir is None:
+                # ditto copia il contenuto della sorgente nella destinazione: il nome di destinazione è il file
+                self.target(dest, cw)
             self.target(dest, cw, sources=sources, dir_hint=dir_hint)
         elif name == "dd":
             for x in t:
@@ -1639,6 +1818,62 @@ class Analyzer:
         elif name == "cpio":
             if any(x.startswith("-i") or x == "--extract" for x in t):
                 self.target(Arg("."), cw, extract=True)
+            elif any(x == "--pass-through" or (x.startswith("-") and not x.startswith("--") and "p" in x[1:])
+                     for x in t):
+                pos = positional({"-H", "-F", "-E", "-R", "-I", "-O", "-M", "-C", "--format", "--file"})
+                self.target(pos[-1] if pos else Arg("."), cw, extract=True)
+
+    def producers(self, name: str, args: List[Arg], ctx: Ctx) -> None:
+        """Comandi che producono file (decompressori, base64, xxd, openssl, pax, split): i percorsi di output
+        passano dai controlli delle scritture."""
+        rest = args[1:]
+        t = [a.text for a in rest]
+        cw = ctx.cwds
+
+        def short(ch: str) -> bool:
+            return any(x.startswith("-") and not x.startswith("--") and ch in x[1:] for x in t)
+
+        if name in DECOMPRESSORS:
+            decomp = name.startswith("un") or name.startswith("gun") or name.startswith("bun") \
+                or any(x in ("--decompress", "--uncompress") for x in t) or short("d")
+            if not decomp:
+                return
+            self.output_opts(rest, cw, short_o=name in ("zstd", "unzstd"), names=("--output",))
+            if any(x in ("--stdout", "--to-stdout", "--list", "--test") for x in t) or short("c") or short("l") \
+                    or short("t"):
+                return
+            for a in _opt_split(rest, {"-o", "-S", "--suffix", "-T", "--threads"}):
+                low = a.text.lower()
+                ext = next((e for e in DECOMP_SUFFIXES if low.endswith(e)), None)
+                if ext is not None:
+                    self.target(Arg(a.text[:-len(ext)] + DECOMP_SUFFIXES[ext], a.dyn, a.globby), cw)
+        elif name == "base64":
+            self.output_opts(rest, cw, short_o=True)
+        elif name == "xxd":
+            pos = _opt_split(rest, {"-c", "-cols", "-g", "-groupsize", "-l", "-len", "-s", "-seek", "-o", "-n",
+                                    "-name"})
+            if len(pos) >= 2:
+                self.target(pos[1], cw)
+        elif name == "openssl":
+            for i, x in enumerate(t[:-1]):
+                if x in ("-out", "-keyout"):
+                    self.target(rest[i + 1], cw)
+        elif name == "pax":
+            if short("r"):
+                pos = _opt_split(rest, {"-f", "-s", "-o", "-x", "-b", "-p", "-B", "-G", "-T", "-U"})
+                dest = pos[-1] if short("w") and pos else Arg(".")
+                self.target(dest, cw, extract=True)
+        elif name == "split":
+            pos = _opt_split(rest, {"-b", "--bytes", "-l", "--lines", "-n", "--number", "-a", "--suffix-length",
+                                    "-C", "--line-bytes", "-t", "--separator", "--additional-suffix", "--filter"})
+            suffix = ""
+            for i, x in enumerate(t):
+                if x == "--additional-suffix" and i + 1 < len(t):
+                    suffix = t[i + 1]
+                elif x.startswith("--additional-suffix="):
+                    suffix = x.split("=", 1)[1]
+            prefix = pos[1] if len(pos) > 1 else Arg("x")
+            self.target(Arg(prefix.text + "aa" + suffix, prefix.dyn, prefix.globby), cw)
 
     def any_dir(self, a: Arg, cwds: List[Path]) -> bool:
         for t in self.candidates(a, cwds):

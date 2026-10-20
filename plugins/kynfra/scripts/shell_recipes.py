@@ -40,11 +40,12 @@ def _balanced(text: str, start: int) -> int:
     return j
 
 
-def _make_lines(mf: Path, seen: Set[Path]) -> List[str]:
+def _make_lines(mf: Path, seen: Set[Path], text: Optional[str] = None) -> List[str]:
     if mf in seen or len(seen) > 20:
         return []
     seen.add(mf)
-    text = read_text(mf) or ""
+    if text is None:
+        text = read_text(mf) or ""
     text = re.sub(r"\\\n[ \t]*", " ", text)
     out: List[str] = []
     for line in text.split("\n"):
@@ -59,9 +60,15 @@ def _make_lines(mf: Path, seen: Set[Path]) -> List[str]:
     return out
 
 
-def make_recipes(mf: Path, goals: List[str], overrides: Dict[str, str]) -> str:
+def make_lines(mf: Path, text: Optional[str] = None) -> List[str]:
+    """Righe del Makefile `mf` con gli `include` risolti; `text` sostituisce il contenuto del file (Makefile letto
+    da stdin o da `--eval`, con `mf` come riferimento per la cartella)."""
+    return _make_lines(mf.resolve(), set(), text)
+
+
+def make_recipes(mf: Path, goals: List[str], overrides: Dict[str, str], text: Optional[str] = None) -> str:
     """Testo delle ricette che `make <goals>` eseguirebbe (con dipendenze e variabili), più i `$(shell …)`."""
-    lines = _make_lines(mf.resolve(), set())
+    lines = make_lines(mf, text)
     mvars: Dict[str, str] = {"MAKE": "make", "SHELL": "/bin/sh", "CURDIR": str(mf.parent)}
     rules_: Dict[str, Tuple[List[str], List[str]]] = {}
     first: Optional[str] = None
