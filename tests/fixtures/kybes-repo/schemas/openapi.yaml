@@ -1,0 +1,71 @@
+---
+# Fixture kynfra: progetto kybes con 4 operazioni
+openapi: 3.0.3
+info:
+  title: "Gestionale API"
+  version: 0.1.0
+  description: |
+    Sorgente di verità per API Gateway.
+    Riga due: con # non un commento.
+servers:
+  - url: https://api.example.com
+components:
+  securitySchemes:
+    sso:
+      type: openIdConnect
+      openIdConnectUrl: 'https://login.example.com/.well-known/openid-configuration'
+  schemas:
+    Ordine:
+      type: object
+      required: [id, cliente]
+      properties:
+        id: { type: string, format: uuid }
+        cliente: { type: string }
+        righe:
+          type: array
+          items: { $ref: '#/components/schemas/Riga' }
+    Riga:
+      type: object
+      properties:
+        sku: { type: string }
+        quantita: { type: integer, minimum: 1 }
+security:
+  - sso: []
+paths:
+  /v1/ordini:
+    get:
+      operationId: listaOrdini
+      x-kybes-handler: ordini/functions/lista-ordini  # estensione esplicita
+      responses:
+        "200":
+          description: Elenco degli ordini
+    post:
+      operationId: creaOrdine
+      x-kybes-handler: "ordini/functions/crea-ordine"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Ordine' }
+      responses:
+        "201": { description: Creato }
+  /v1/magazzino/giacenze:
+    get:
+      operationId: listaGiacenze
+      security: []
+      description: >
+        Giacenze pubbliche,
+        senza autenticazione.
+      responses:
+        "200": { description: OK }
+  /v1/magazzino/giacenze/{sku}:
+    get:
+      operationId: leggiGiacenza
+      parameters:
+        - name: sku
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+        "404": { description: Non trovata }

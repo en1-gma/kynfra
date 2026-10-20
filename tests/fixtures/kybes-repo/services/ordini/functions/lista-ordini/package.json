@@ -1,0 +1,7 @@
+{
+  "name": "lista-ordini",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "engines": { "node": ">=20" }
+}

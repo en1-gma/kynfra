@@ -783,14 +783,17 @@ def _provider_project_findings(parsed, cfg: dict) -> List[Finding]:
 
 def check_project(proj: Path, cfg: dict, stop_gate: bool = False, stats: Optional[dict] = None) -> List[Finding]:
     """Controlli sull'intero progetto: check_content su ogni file IaC, regole d'insieme per stack e bootstrap,
-    regole d'insieme dei provider (es. rules_aws.AWS_PROJECT_RULES), literal-reuse (con la soglia bloccante solo se
-    `stop_gate`). Percorsi relativi al progetto. Se `stats` è un dict lo riempie con i numeri di literal-reuse."""
+    regole d'insieme dei provider (es. rules_aws.AWS_PROJECT_RULES), api-coverage nei repo kybes (kybes.py),
+    literal-reuse (con la soglia bloccante solo se `stop_gate`). Percorsi relativi al progetto. Se `stats` è un dict lo riempie con i numeri di literal-reuse."""
     parsed = _parse_project(proj, cfg)
     per_file: List[Finding] = []
     for rel, _, text, _ in parsed:
         per_file.extend(check_content(rel, text, cfg))
     extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
     extra.extend(_provider_project_findings(parsed, cfg))
+    if cfg.get("kybes"):
+        import kybes
+        extra.extend(kybes.project_findings(proj, cfg))
     reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate, stats)
     out = per_file + _post_process(extra, cfg)  # unico punto che segnala le eccezioni malformate
     for f in _post_process(reuse, cfg, report_config=False):

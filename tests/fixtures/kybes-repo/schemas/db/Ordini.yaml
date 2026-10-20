@@ -1,0 +1,4 @@
+table: Ordini
+columns:
+  id: { type: uuid, primary: true }
+  cliente: { type: string, length: 120 }
