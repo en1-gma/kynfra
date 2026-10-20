@@ -1,0 +1,2439 @@
+#!/usr/bin/env python3
+"""PreToolUse su Bash (Claude Code) e sulla shell di Codex: impedisce all'agente di toccare gli account cloud,
+di scaricare strumenti fuori da `tools.py` e di scrivere da shell i file IaC o protetti.
+
+Nega:
+- `terraform`/`tofu` (anche `tf`, `terragrunt`, percorsi assoluti, `.kynfra/bin/terraform`) salvo i sottocomandi di
+  sola lettura (`fmt`, `validate`, `version`, `providers`, `graph`, `show`, `output -json`, `state list|show`,
+  `workspace list|show|select`, `init -backend=false`); ogni assegnazione `TF_CLI_ARGS*`;
+- le CLI cloud in modalità mutante: `aws` (consentiti `get-*`, `describe-*`, `list-*`, `s3 ls`, `s3api head-*`),
+  `kubectl` (salvo `get`/`describe`/`explain`/`version`/`config view|get-contexts`), `helm` (salvo
+  `template`/`lint`/`show`/`version`/`list`/`status`), `az`, `gcloud`, `vercel` e simili; il codice inline che usa
+  gli SDK cloud o lancia questi comandi;
+- download e installazioni di strumenti (`curl | sh`, `curl -o`, `wget`, gestori di pacchetti, `pip install`,
+  `npm i -g`, `go install`, `tfenv`…): gli strumenti si installano con `tools.py install <tool>`, uno per comando;
+- le scritture da shell dei file IaC sotto `infra_root`, dei `.env*`, degli hook di git e dei file protetti
+  (`.kynfra/`, kit, impostazioni dell'agente), `git apply`/`patch`, `install.sh --force/--uninstall`.
+
+Il comando viene scomposto come farebbe la shell (virgolette, escape, `;`/`&&`/`||`/`|`/a capo, `$(…)` e backtick,
+heredoc, variabili assegnate nel comando, alias, funzioni) e i comandi che ne lanciano altri (`env`, `sudo`,
+`nohup`, `xargs`, `bash -c`, `eval`, `docker run`, `ssh`…) vengono analizzati ricorsivamente. Le ricette di
+`make`/`npm run`/`just`/`task` e gli script del repo lanciati dall'agente vengono letti e controllati con le
+stesse regole; se il file non esiste o non è leggibile il comando è consentito (restano lo stop gate e la CI).
+
+È un controllo euristico: ciò che non si può determinare (comando in una variabile ignota, script da pipe,
+percorso di scrittura calcolato) viene rifiutato.
+"""
+from __future__ import annotations
+
+import codecs
+import glob as globmod
+import json
+import os
+import re
+import shlex
+import sys
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hook_common as hc  # noqa: E402
+import rules  # noqa: E402
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+KIT_REL = "tools/kynfra/plugins/kynfra"
+KIT_SCRIPTS = ("arch_check", "stop_gate", "generate", "tools")
+MAX_DEPTH = 10
+MAX_FILE = 512 * 1024
+UNKNOWN_DIR = Path("/__kynfra_cartella_ignota__")
+
+PROTECTED_RE = re.compile(
+    r"\.kynfra\b|tools/kynfra\b|\.codex/(?:hooks\.json|config\.toml|agents)"
+    r"|\.claude/(?:settings(?:\.local)?\.json|rules/kynfra)|\.agents/skills/kynfra|kynfra-check\.ya?ml"
+    r"|disableallhooks|claude_project_dir|kynfra_project_dir|\.terraform\.lock\.hcl", re.I)
+TF_CLI_RE = re.compile(r"\bTF_CLI_ARGS\w*=")
+ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)\+?=(.*)$", re.S)
+SAFE_REDIRECT = {"/dev/null", "/dev/stderr", "/dev/stdout", "/dev/tty", "-"}
+SAFE_OUT = {"-", "/dev/null", "/dev/stdout", "/dev/stderr"}
+SAFE_DYN_TARGET = re.compile(r"^(?:\$\(\s*mktemp\b|\$\{?TMPDIR\b|/tmp/|/private/tmp/|/var/folders/|/dev/)")
+
+RESERVED = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "in", "esac", "function", "!",
+            "{", "}", "coproc"}
+READONLY_CMDS = {"cat", "less", "more", "head", "tail", "ls", "grep", "egrep", "fgrep", "rg", "wc", "diff", "stat",
+                 "file", "jq", "echo", "printf", "test", "[", "[[", "cd", "pwd", "realpath", "readlink", "tree", "du",
+                 "sha256sum", "shasum", "md5", "md5sum", "true", "false", ":", "which", "type", "basename",
+                 "dirname", "date", "whoami", "id", "uname", "hostname", "printenv", "cut", "tr", "nl", "column",
+                 "sleep", "cmp", "comm", "whereis", "man"}
+# git che non riscrive file del working tree (commit e push registrano solo ciò che è già su disco)
+READONLY_GIT = {"diff", "log", "status", "show", "blame", "ls-files", "rev-parse", "grep", "add", "commit", "push",
+                "fetch", "branch", "remote", "describe", "shortlog", "reflog", "ls-tree", "cat-file"}
+WRITERS = {"tee", "sed", "gsed", "perl", "awk", "gawk", "mawk", "nawk", "yq", "cp", "mv", "install", "ln", "rsync",
+           "scp", "dd", "truncate", "touch", "sort", "sponge", "ed", "ex", "vi", "vim", "nvim", "tar", "bsdtar",
+           "gtar", "unzip", "7z", "7za", "7zz", "cpio"}
+EXTRACTORS = {"tar", "bsdtar", "gtar", "unzip", "funzip", "7z", "7za", "7zz", "cpio", "dd", "tee", "sponge",
+              "install"}
+NO_SCAN = READONLY_CMDS | WRITERS | {"mkdir", "rm", "rmdir", "chmod", "chown", "chgrp", "tflint", "checkov", "trivy",
+                                     "gh", "git", "find", "kill", "set", "shopt", "unset", "return", "exit", "shift",
+                                     "wait", "read", "export", "declare", "typeset", "local", "readonly", "alias",
+                                     "unalias", "pytest", "tsc", "eslint", "prettier", "mktemp", "open", "code"}
+
+TF_NAME_RE = re.compile(r"(terraform|tofu|opentofu|tf|terragrunt)(?:[-_.]?v?\d[\w.]*)?")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh", "pwsh"}
+INTERPRETERS = {"python", "node", "deno", "bun", "ts-node", "tsx", "ruby", "perl", "php"}
+CLOUD_DENIED = {"az", "gcloud", "gsutil", "bq", "vercel", "netlify", "flyctl", "fly", "doctl", "heroku", "pulumi",
+                "cdk", "cdktf", "sam", "serverless", "sls", "eksctl", "copilot", "amplify", "firebase", "wrangler",
+                "oci", "ibmcloud", "aliyun", "hcloud", "linode-cli", "scw"}
+VERSION_HELP = {"--version", "-v", "-V", "version", "--help", "-h", "help"}
+PKG_MANAGERS = {"brew", "apt", "apt-get", "aptitude", "yum", "dnf", "microdnf", "apk", "zypper", "port", "snap",
+                "flatpak", "choco", "scoop", "winget", "pkg", "emerge", "nix-env", "conda", "mamba", "micromamba",
+                "asdf", "mise", "rtx", "sdk", "proto", "aqua", "tenv", "tfenv", "tofuenv", "tgenv", "pyenv", "nvm",
+                "volta", "fnm", "rustup", "pacman", "yay"}
+PKG_SAFE = {"list", "ls", "search", "show", "info", "policy", "help", "version", "outdated", "config", "doctor",
+            "deps", "uses", "leaves", "desc", "home", "commands", "shellenv", "madison", "depends", "rdepends",
+            "current", "which", "where"}
+ALWAYS_INSTALL = {"tfswitch", "tgswitch", "uvx", "aria2c", "axel"}
+DOWNLOADERS = {"curl", "wget", "aria2c", "axel"}
+SCAN_NAMES = ({"terraform", "tofu", "terragrunt", "aws", "kubectl", "helm", "eval", "make", "just", "task", "npm",
+               "pnpm", "yarn", "npx", "go", "pip", "pipx", "uv", "cargo", "gem", "source", "."}
+              | CLOUD_DENIED | SHELLS | INTERPRETERS | DOWNLOADERS | PKG_MANAGERS | ALWAYS_INSTALL)
+
+TF_DENIED = {"apply", "destroy", "import", "taint", "untaint", "plan", "force-unlock", "refresh", "test", "console",
+             "login", "logout", "push", "env"}
+TF_READONLY = {"fmt", "validate", "version", "graph", "show", "get", "modules", "metadata"}
+
+AWS_VALUE_OPTS = {"--profile", "--region", "--output", "--endpoint-url", "--query", "--ca-bundle",
+                  "--cli-read-timeout", "--cli-connect-timeout", "--color", "--cli-binary-format"}
+KUBECTL_VALUE_OPTS = {"-n", "--namespace", "--context", "--kubeconfig", "--cluster", "--user", "-s", "--server",
+                      "--token", "--as", "--as-group", "--as-uid", "--request-timeout", "--certificate-authority",
+                      "--client-certificate", "--client-key", "--tls-server-name", "--cache-dir", "-v", "--v",
+                      "--password", "--username", "--profile", "--profile-output", "--vmodule", "--log-file"}
+HELM_VALUE_OPTS = {"--kube-context", "--kubeconfig", "-n", "--namespace", "--registry-config", "--repository-cache",
+                   "--repository-config", "--burst-limit", "--kube-apiserver", "--kube-as-user", "--kube-as-group",
+                   "--kube-token", "--kube-ca-file", "--kube-tls-server-name", "--qps"}
+GIT_EXEC_KEYS = {"core.hookspath", "core.fsmonitor", "core.sshcommand", "core.pager", "core.editor", "core.askpass",
+                 "sequence.editor", "diff.external", "gpg.program", "gpg.ssh.program", "credential.helper",
+                 "uploadpack.packobjectshook", "core.gitproxy", "ssh.variant", "merge.tool", "diff.tool"}
+GIT_EXEC_KEY_RE = re.compile(r"(?:filter|diff|merge|mergetool|difftool)\..+\.(?:clean|smudge|process|textconv|driver"
+                             r"|command|cmd)|pager\..+|credential\..+\.helper|alias\..+")
+
+# codice inline (python -c, node -e, heredoc, script del repo): euristiche
+SPAWN_RE = re.compile(r"subprocess|\bos\.(?:system|popen|exec\w*|spawn\w*|posix_spawn\w*|startfile)|\bpty\.spawn"
+                      r"|child_process|\bexec(?:Sync|File(?:Sync)?)?\s*\(|\bspawn(?:Sync)?\s*\(|\bsystem\s*\("
+                      r"|\bpopen\s*\(|IO\.popen|Open3|Bun\.(?:spawn|\$)|Deno\.(?:Command|run)|\bshell_exec"
+                      r"|\bpassthru|\bproc_open|\bqx\s*[/{(\[]|%x\s*[{(\[]|__import__|\bpexpect|\bplumbum")
+AWK_SPAWN_RE = re.compile(r"\|\s*getline|print[^;\n]*\|\s*\"")
+TICK_RE = re.compile(r"`[^`]+`")
+CLOUD_WORD_RE = re.compile(r"\b(?:terraform|tofu|terragrunt|aws|az|gcloud|gsutil|kubectl|helm|vercel|pulumi|cdktf"
+                           r"|cdk|eksctl)\b")
+INSTALL_WORD_RE = re.compile(r"\b(?:curl|wget|brew|pipx?|pip3|apt-get|apt|yum|dnf|apk|tfenv|tfswitch|asdf|mise"
+                             r"|uvx)\b")
+SDK_RE = re.compile(r"\b(?:boto3|botocore|aioboto3|aiobotocore)\b|@aws-sdk/|['\"]aws-sdk['\"]"
+                    r"|\bazure\.(?:mgmt|identity|storage|keyvault)|@azure/|\bgoogle\.cloud\b|@google-cloud/"
+                    r"|googleapiclient|from\s+kubernetes\s+import|\bkubernetes\.client|@kubernetes/client-node"
+                    r"|\bimport\s+pulumi|@pulumi/")
+WRITE_RE = re.compile(r"\b(?:open|fopen|writeFile\w*|write_text|write_bytes|createWriteStream|appendFile\w*"
+                      r"|copyfile\w*|copy2?|copytree|copyfileobj|move|rename\w*|replace|symlink\w*"
+                      r"|file_put_contents|writeTextFile|Bun\.write|File\.(?:write|open)|IO\.write)\s*\(")
+AWK_WRITE_RE = re.compile(r">>?\s*\"[^\"]+\"")
+NET_RE = re.compile(r"urlretrieve|urlopen|\brequests\.|\bhttpx\b|urllib3|\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\("
+                    r"|\baxios\b|Net::HTTP|open-uri|LWP::|HTTP::Tiny|curl_exec|Invoke-WebRequest"
+                    r"|file_get_contents\s*\(\s*['\"]https?:")
+SAVE_DOWNLOAD_RE = re.compile(r"urlretrieve|\bwget\.download|\.download_file\s*\(|\bhf_hub_download")
+OBFUSCATED_RE = re.compile(r"\b(?:exec|eval)\s*\([^\n]*(?:b64decode|b85decode|a85decode|decompress|fromhex"
+                           r"|codecs\.decode|rot13|\bchr\s*\(|atob|Buffer\.from)")
+IAC_MENTION_RE = re.compile(r"\.tf\b|\.tfvars\b|\.tf\.json\b|(?:^|[/'\"`\s])\.env|native/|\.git/hooks|\.git/config")
+
+KIT, DELEGATED, RO, RW = "kit", "delegated", "ro", "rw"
+
+
+# ---------------------------------------------------------------- lexer
+
+@dataclass
+class Word:
+    parts: List[Tuple[str, str, bool]] = field(default_factory=list)  # (lit|var|pvar|sub|dyn, valore, quotato)
+
+    def add(self, kind: str, value: str, quoted: bool) -> None:
+        self.parts.append((kind, value, quoted))
+
+
+@dataclass
+class Cmd:
+    words: List[Word] = field(default_factory=list)
+    redirs: List[Tuple[str, Word]] = field(default_factory=list)
+    stdin: List[Word] = field(default_factory=list)  # heredoc e herestring
+    pipeline: int = 0
+    pos: int = 0
+    name: str = ""
+    download: bool = False
+    stdin_exec: bool = False
+    writes: bool = False
+
+    def empty(self) -> bool:
+        return not self.words and not self.redirs and not self.stdin
+
+
+REDIR_RE = re.compile(r"(?:\d+|\{[A-Za-z_]\w*\})?(?:&>>|&>|>>|>\||>&|>|<<<|<<-|<<|<>|<&|<)")
+WORD_END = set(" \t\r\n;&|()<>")
+
+
+def _ansi_c(raw: str) -> str:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            return codecs.decode(raw.encode("latin-1", "backslashreplace"), "unicode_escape")
+        except Exception:
+            return raw.replace("\\", "")
+
+
+class Lexer:
+    """Scompone un testo di shell in comandi semplici, raccogliendo le sostituzioni di comando da analizzare."""
+
+    def __init__(self, text: str):
+        self.s = text
+        self.i = 0
+        self.n = len(text)
+        self.subs: List[str] = []
+
+    def parse(self, stop: Optional[str] = None) -> List[Cmd]:
+        s = self.s
+        cmds: List[Cmd] = []
+        state = {"cur": Cmd(), "pipeline": 0, "pos": 0}
+        pending: List[Tuple[Cmd, str, bool, bool]] = []
+        depth = 0
+
+        def finish(pipe: bool) -> None:
+            cur = state["cur"]
+            if not cur.empty():
+                cur.pipeline, cur.pos = state["pipeline"], state["pos"]
+                cmds.append(cur)
+                if pipe:
+                    state["pos"] += 1
+                else:
+                    state["pipeline"] += 1
+                    state["pos"] = 0
+            elif not pipe:
+                state["pipeline"] += 1
+                state["pos"] = 0
+            state["cur"] = Cmd()
+
+        while self.i < self.n:
+            c = s[self.i]
+            if c in " \t\r":
+                self.i += 1
+                continue
+            if s.startswith("\\\n", self.i):
+                self.i += 2
+                continue
+            if c == "\n":
+                self.i += 1
+                finish(False)
+                for cmd, delim, strip, quoted in pending:
+                    self._heredoc(cmd, delim, strip, quoted)
+                pending = []
+                continue
+            if c == "#":
+                j = s.find("\n", self.i)
+                self.i = self.n if j < 0 else j
+                continue
+            if c == ")" and depth == 0 and stop == ")":
+                self.i += 1
+                finish(False)
+                return cmds
+            m = REDIR_RE.match(s, self.i)
+            if m and not (c in "<>" and s.startswith("(", self.i + 1)):
+                op = re.sub(r"^(?:\d+|\{\w+\})", "", m.group(0))
+                self.i = m.end()
+                while self.i < self.n and s[self.i] in " \t":
+                    self.i += 1
+                w, raw = self._word()
+                if op in ("<<", "<<-"):
+                    quoted = any(q in raw for q in "'\"\\")
+                    delim = raw.replace("'", "").replace('"', "").replace("\\", "")
+                    pending.append((state["cur"], delim, op == "<<-", quoted))
+                elif op == "<<<":
+                    state["cur"].stdin.append(w)
+                else:
+                    state["cur"].redirs.append((op, w))
+                continue
+            if c in ";&|()":
+                two = s[self.i:self.i + 2]
+                if two in ("&&", "||", ";;", ";&"):
+                    self.i += 2
+                    finish(False)
+                elif two == "|&":
+                    self.i += 2
+                    finish(True)
+                else:
+                    self.i += 1
+                    if c == "(":
+                        depth += 1
+                    elif c == ")" and depth > 0:
+                        depth -= 1
+                    finish(c == "|")
+                continue
+            w, _ = self._word()
+            state["cur"].words.append(w)
+        finish(False)
+        for cmd, delim, strip, quoted in pending:
+            self._heredoc(cmd, delim, strip, quoted)
+        return cmds
+
+    def _word(self) -> Tuple[Word, str]:
+        s = self.s
+        start = self.i
+        w = Word()
+        buf: List[str] = []
+
+        def flush() -> None:
+            if buf:
+                w.add("lit", "".join(buf), False)
+                buf.clear()
+
+        if self.i < self.n and s[self.i] in "<>" and s.startswith("(", self.i + 1):
+            self.i += 2
+            w.add("sub", self._until_paren(), False)
+            return w, s[start:self.i]
+        while self.i < self.n:
+            c = s[self.i]
+            if c in WORD_END:
+                break
+            if c == "\\":
+                if self.i + 1 < self.n:
+                    nxt = s[self.i + 1]
+                    self.i += 2
+                    if nxt != "\n":
+                        flush()
+                        w.add("lit", nxt, True)
+                else:
+                    self.i += 1
+                continue
+            if c == "'":
+                flush()
+                j = s.find("'", self.i + 1)
+                j = self.n if j < 0 else j
+                w.add("lit", s[self.i + 1:j], True)
+                self.i = j + 1
+                continue
+            if c == '"':
+                flush()
+                self.i += 1
+                self._dq(w, end_quote=True)
+                continue
+            if c == "$":
+                flush()
+                self._dollar(w, quoted=False)
+                continue
+            if c == "`":
+                flush()
+                self._backtick(w, quoted=False)
+                continue
+            buf.append(c)
+            self.i += 1
+        flush()
+        return w, s[start:self.i]
+
+    def _dq(self, w: Word, end_quote: bool) -> None:
+        s = self.s
+        buf: List[str] = []
+
+        def flush() -> None:
+            if buf:
+                w.add("lit", "".join(buf), True)
+                buf.clear()
+
+        while self.i < self.n:
+            c = s[self.i]
+            if c == '"' and end_quote:
+                self.i += 1
+                break
+            if c == "\\" and self.i + 1 < self.n and s[self.i + 1] in '$`"\\\n':
+                if s[self.i + 1] != "\n":
+                    buf.append(s[self.i + 1])
+                self.i += 2
+                continue
+            if c == "$":
+                flush()
+                self._dollar(w, quoted=True)
+                continue
+            if c == "`":
+                flush()
+                self._backtick(w, quoted=True)
+                continue
+            buf.append(c)
+            self.i += 1
+        flush()
+
+    def _until_paren(self) -> str:
+        """Testo fino alla `)` che chiude (self.i è subito dopo la `(`), rispettando quoting e heredoc."""
+        start = self.i
+        sub = Lexer(self.s)
+        sub.i = self.i
+        sub.parse(stop=")")
+        self.i = sub.i
+        inner = self.s[start:max(start, self.i - 1)]
+        self.subs.append(inner)
+        return inner
+
+    def _dollar(self, w: Word, quoted: bool) -> None:
+        s = self.s
+        i = self.i
+        nxt = s[i + 1:i + 2]
+        if nxt == "'" and not quoted:
+            j = i + 2
+            while j < self.n and s[j] != "'":
+                j += 2 if s[j] == "\\" else 1
+            w.add("lit", _ansi_c(s[i + 2:j]), True)
+            self.i = j + 1
+            return
+        if nxt == '"' and not quoted:
+            self.i = i + 2
+            self._dq(w, end_quote=True)
+            return
+        if nxt == "(":
+            arith = s.startswith("$((", i)
+            self.i = i + 2
+            inner = self._until_paren()
+            if arith and self.i < self.n and s[self.i] == ")":
+                self.i += 1
+            w.add("dyn" if arith else "sub", inner, quoted)
+            return
+        if nxt == "{":
+            j, level = i + 2, 1
+            while j < self.n and level:
+                if s[j] == "{":
+                    level += 1
+                elif s[j] == "}":
+                    level -= 1
+                j += 1
+            inner = s[i + 2:j - 1]
+            self.i = j
+            if re.fullmatch(r"[A-Za-z_]\w*", inner):
+                w.add("var", inner, quoted)
+            else:
+                if "$(" in inner or "`" in inner:
+                    sub = Lexer(inner)
+                    sub._dq(Word(), end_quote=False)
+                    self.subs += sub.subs
+                w.add("pvar", inner, quoted)
+            return
+        m = re.match(r"[A-Za-z_]\w*", s[i + 1:i + 200])
+        if m:
+            w.add("var", m.group(0), quoted)
+            self.i = i + 1 + m.end()
+            return
+        if nxt and nxt in "@*#?$!-0123456789":
+            w.add("dyn", nxt, quoted)
+            self.i = i + 2
+            return
+        w.add("lit", "$", quoted)
+        self.i = i + 1
+
+    def _backtick(self, w: Word, quoted: bool) -> None:
+        s = self.s
+        j = self.i + 1
+        buf: List[str] = []
+        while j < self.n and s[j] != "`":
+            if s[j] == "\\" and j + 1 < self.n:
+                buf.append(s[j + 1] if s[j + 1] in "`\\$" else s[j:j + 2])
+                j += 2
+                continue
+            buf.append(s[j])
+            j += 1
+        inner = "".join(buf)
+        self.i = j + 1
+        self.subs.append(inner)
+        w.add("sub", inner, quoted)
+
+    def _heredoc(self, cmd: Cmd, delim: str, strip: bool, quoted: bool) -> None:
+        lines: List[str] = []
+        while self.i < self.n:
+            j = self.s.find("\n", self.i)
+            line = self.s[self.i:j if j >= 0 else self.n]
+            self.i = j + 1 if j >= 0 else self.n
+            cmp = line.lstrip("\t") if strip else line
+            if cmp == delim:
+                break
+            lines.append(cmp)
+        body = "\n".join(lines)
+        w = Word()
+        if quoted:
+            w.add("lit", body, True)
+        else:
+            sub = Lexer(body)
+            sub._dq(w, end_quote=False)
+            self.subs += sub.subs
+        cmd.stdin.append(w)
+
+
+# ---------------------------------------------------------------- analisi
+
+@dataclass
+class Arg:
+    text: str
+    dyn: bool = False
+    globby: bool = False
+
+
+@dataclass
+class Ctx:
+    cwds: List[Path]
+    depth: int
+    stdin: List[str] = field(default_factory=list)
+    piped: bool = False
+    cmd: Optional[Cmd] = None
+    redir_targets: List[Arg] = field(default_factory=list)
+    write_redir: bool = False
+    xargs: bool = False
+    env: Dict[str, str] = field(default_factory=dict)
+
+    def nested(self) -> "Ctx":
+        return Ctx(self.cwds, self.depth + 1)
+
+
+def norm_name(text: str) -> str:
+    """Nome del comando come lo cerca la shell: basename, senza versione/tag (`terraform:1.9`, `x@latest`)."""
+    base = text.rstrip("/").rsplit("/", 1)[-1].lower()
+    base = re.sub(r"\.exe$", "", base)
+    if base and base[0] != "@":
+        base = re.split(r"[@:]", base, 1)[0]
+    m = TF_NAME_RE.fullmatch(base)
+    if m:
+        name = m.group(1)
+        return {"tf": "terraform", "opentofu": "tofu"}.get(name, name)
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|pypy\d*|py", base):
+        return "python"
+    if re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", base):
+        return "pip"
+    if base == "nodejs":
+        return "node"
+    if base in ("gmake", "go-task", "pnpx", "bunx"):
+        return {"gmake": "make", "go-task": "task"}.get(base, "npx")
+    return base
+
+
+def is_env_name(name: str) -> bool:
+    return name.startswith(".env")
+
+
+def brace_expand(s: str, limit: int = 64) -> List[str]:
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", s)
+    if not m:
+        return [s]
+    out: List[str] = []
+    for alt in m.group(1).split(","):
+        out += brace_expand(s[:m.start()] + alt + s[m.end():], limit)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _read_text(p: Path) -> Optional[str]:
+    try:
+        if not p.is_file() or p.stat().st_size > MAX_FILE:
+            return None
+        data = p.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _opt_split(args: List[Arg], value_opts: Set[str]) -> List[Arg]:
+    """Argomenti posizionali, saltando le opzioni e i valori delle opzioni che ne hanno uno."""
+    pos: List[Arg] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        t = a.text
+        if t == "--":
+            continue
+        if t.startswith("-") and len(t) > 1:
+            if "=" not in t and t in value_opts:
+                skip = True
+            continue
+        pos.append(a)
+    return pos
+
+
+class Analyzer:
+    def __init__(self, proj: Path, cfg: dict, cwd: Path):
+        self.proj = proj.resolve()
+        self.cfg = cfg
+        self.reasons: List[str] = []
+        self.tool = False
+        self.writes: Set[str] = set()
+        self.executed: Set[str] = set()
+        self.installs = 0
+        self.protect = cfg.get("rules", {}).get("protected-files", "block") != "off"
+        self.vars: Dict[str, Optional[str]] = {
+            "HOME": str(Path.home()), "PWD": str(cwd), "CLAUDE_PROJECT_DIR": str(self.proj),
+            "KYNFRA_PROJECT_DIR": str(self.proj), "CLAUDE_PLUGIN_ROOT": str(PLUGIN_DIR)}
+        for k in ("TMPDIR", "USER"):
+            if os.environ.get(k):
+                self.vars[k] = os.environ[k]
+        self.aliases: Dict[str, str] = {}
+        bases = [self.proj / KIT_REL, PLUGIN_DIR]
+        self.kit_scripts = {str((b / "scripts" / f"{n}.py").resolve()) for b in bases for n in KIT_SCRIPTS}
+        self.kit_install = {str((b / "install.sh").resolve()) for b in bases}
+        self.kit_setup = {str((self.proj / "tools/kynfra/setup.sh").resolve())}
+
+    # ------------------------------------------------------------ esito
+
+    def deny(self, msg: str, tool: bool = False) -> None:
+        if msg not in self.reasons:
+            self.reasons.append(msg)
+        self.tool = self.tool or tool
+
+    def deny_tool(self, what: str) -> None:
+        self.deny(f"download o installazione di strumenti fuori da tools.py ({what}): gli strumenti si installano "
+                  "solo con /kynfra:tools, uno alla volta e con l'approvazione dell'utente", tool=True)
+
+    def finish(self) -> None:
+        if self.writes & self.executed:
+            self.deny("script scritto e lanciato nello stesso comando: il contenuto non è verificabile")
+        if self.installs > 1:
+            self.deny("tools.py install: un solo strumento per comando (l'approvazione vale per uno strumento)",
+                      tool=True)
+
+    # ------------------------------------------------------------ espansione
+
+    def expand(self, w: Word) -> List[Arg]:
+        out: List[str] = []
+        dyn = globby = split = False
+        first = w.parts[0] if w.parts else None
+        assign = bool(first and first[0] == "lit" and not first[2] and ASSIGN_RE.match(first[1]))
+        for kind, val, quoted in w.parts:
+            if kind == "lit":
+                out.append(val)
+                if not quoted and re.search(r"[*?\[]|\{[^}]*,", val):
+                    globby = True
+            elif kind in ("var", "pvar"):
+                m = re.match(r"([A-Za-z_]\w*)", val)
+                name = m.group(1) if m and not val.startswith("#") else None
+                value = self.vars.get(name) if name else None
+                if value is None:
+                    dyn = True
+                    out.append("${" + val + "}")
+                else:
+                    out.append(value)
+                    if not quoted and not assign and re.search(r"\s", value):
+                        split = True
+            elif kind == "sub":
+                dyn = True
+                out.append("$(" + val + ")")
+            else:
+                dyn = True
+                out.append("$" + val)
+        text = "".join(out)
+        if split:
+            return [Arg(t, dyn, globby) for t in text.split()]
+        return [Arg(text, dyn, globby)]
+
+    def expand_join(self, w: Word) -> str:
+        return " ".join(a.text for a in self.expand(w))
+
+    def words_of(self, text: str) -> List[Arg]:
+        lx = Lexer(text)
+        cmds = lx.parse()
+        out: List[Arg] = []
+        if cmds:
+            for w in cmds[0].words:
+                out += self.expand(w)
+        return out
+
+    def candidates(self, a: Arg, cwds: List[Path]) -> List[str]:
+        texts = brace_expand(a.text) if a.globby else [a.text]
+        out = list(texts)
+        if a.globby:
+            for t in texts:
+                if not re.search(r"[*?\[]", t):
+                    continue
+                pat = os.path.expanduser(t)
+                roots = [None] if os.path.isabs(pat) else [c for c in cwds if c != UNKNOWN_DIR]
+                for r in roots:
+                    try:
+                        found = globmod.glob(pat, root_dir=str(r)) if r else globmod.glob(pat)
+                    except Exception:
+                        found = []
+                    out += found[:200]
+        return out
+
+    def resolve_all(self, text: str, cwds: List[Path]) -> List[Path]:
+        t = os.path.expanduser(text)
+        if os.path.isabs(t):
+            return [Path(t).resolve()]
+        return [(c / t).resolve() for c in cwds if c != UNKNOWN_DIR]
+
+    # ------------------------------------------------------------ script e comandi
+
+    def script(self, text: str, cwds: List[Path], depth: int, strict: bool = True) -> None:
+        if depth > MAX_DEPTH:
+            self.deny("comando annidato troppo in profondità: non verificabile")
+            return
+        lx = Lexer(text)
+        try:
+            cmds = lx.parse()
+        except Exception:
+            if strict:
+                self.deny("comando non analizzabile: non verificabile")
+            return
+        cwds = list(cwds)
+        for sub in lx.subs:
+            self.script(sub, cwds, depth + 1)
+        pipelines: Dict[int, List[Cmd]] = {}
+        for cmd in cmds:
+            pipelines.setdefault(cmd.pipeline, []).append(cmd)
+        for cmd in cmds:
+            self.command(cmd, cwds, depth)
+        for pl in pipelines.values():
+            self.pipeline_checks(pl)
+
+    def pipeline_checks(self, pl: List[Cmd]) -> None:
+        for k, c in enumerate(pl):
+            downloaded = any(x.download for x in pl[:k])
+            if c.stdin_exec:
+                if downloaded:
+                    self.deny_tool("download eseguito da una shell o da un interprete, es. curl | sh")
+                else:
+                    self.deny(f"comandi passati da una pipe a `{c.name}`: il contenuto non è verificabile")
+            elif downloaded and (c.writes or c.name in EXTRACTORS):
+                self.deny_tool("download salvato o estratto su file")
+
+    def command(self, cmd: Cmd, cwds: List[Path], depth: int) -> None:
+        args: List[Arg] = []
+        for w in cmd.words:
+            args += self.expand(w)
+        ctx = Ctx(cwds, depth, piped=cmd.pos > 0, cmd=cmd)
+        for op, w in cmd.redirs:
+            if op not in (">", ">>", ">|", "&>", "&>>", "<>", ">&"):
+                continue
+            for a in self.expand(w):
+                if op == ">&" and re.fullmatch(r"\d+-?|-", a.text):
+                    continue
+                if a.text in SAFE_REDIRECT:
+                    continue
+                ctx.write_redir = True
+                ctx.redir_targets.append(a)
+                self.target(a, cwds)
+        cmd.writes = ctx.write_redir
+        ctx.stdin = [self.expand_join(w) for w in cmd.stdin]
+        self.run(args, ctx)
+
+    def check_assigns(self, assigns: List[Tuple[str, str]]) -> None:
+        for name, value in assigns:
+            if name.upper().startswith("TF_CLI_ARGS"):
+                self.deny(f"variabile {name}: inietta opzioni nei comandi terraform/tofu e non è consentita")
+            if self.protect and PROTECTED_RE.search(f"{name}={value}"):
+                self.deny(f"variabile {name}: tocca la configurazione o i file protetti di kynfra")
+
+    def set_var(self, name: str, value: str, dyn: bool) -> None:
+        self.vars[name] = None if dyn else value
+
+    def run(self, args: List[Arg], ctx: Ctx) -> None:
+        args = list(args)
+        while True:
+            while args and args[0].text in RESERVED and not args[0].dyn:
+                args = args[1:]
+            if args and args[0].text in ("for", "select", "case") and not args[0].dyn:
+                if args[0].text != "case" and len(args) > 1:
+                    self.vars[args[1].text] = None
+                return
+            assigns: List[Tuple[str, str]] = []
+            dyns: List[bool] = []
+            while args and ASSIGN_RE.match(args[0].text):
+                m = ASSIGN_RE.match(args[0].text)
+                assigns.append((m.group(1), m.group(2)))
+                dyns.append(args[0].dyn)
+                args = args[1:]
+                if not args:
+                    # assegnazioni da sole: valgono per i comandi successivi della stessa riga
+                    self.check_assigns(assigns)
+                    for (name, value), dyn in zip(assigns, dyns):
+                        self.set_var(name, value, dyn)
+                    return
+            self.check_assigns(assigns)
+            ctx.env.update(dict(assigns))
+            if not args:
+                return
+            new = self.unwrap(args, ctx)
+            if new is None:
+                return
+            if new is args:
+                break
+            args = new
+            if not args:
+                return
+        head = args[0]
+        if head.dyn:
+            self.deny(f"comando non determinabile ({head.text}): variabili o sostituzioni nel nome del comando "
+                      "non si possono verificare")
+            return
+        if head.text in self.aliases and ctx.depth < MAX_DEPTH:
+            alias = self.aliases.pop(head.text)
+            try:
+                self.script(alias + " " + " ".join(shlex.quote(a.text) for a in args[1:]), ctx.cwds, ctx.depth + 1)
+            finally:
+                self.aliases[head.text] = alias
+            return
+        name = norm_name(head.text)
+        if ctx.cmd is not None and not ctx.cmd.name:
+            ctx.cmd.name = name
+        if ctx.xargs and (name in SHELLS or name in INTERPRETERS or name in WRITERS
+                          or name in ("eval", "source", ".", "make", "npm", "pnpm", "yarn", "just", "task")):
+            self.deny(f"`xargs {name}`: argomenti letti da stdin, comando non verificabile")
+            return
+        kind = self.dispatch(name, args, ctx)
+        if kind in (KIT, DELEGATED):
+            return
+        ro = kind == RO and not ctx.write_redir
+        if not ro:
+            if self.protect and self.mentions_protected(args[1:] + ctx.redir_targets, ctx.cwds):
+                self.deny("il comando tocca file protetti di kynfra (configurazione, kit, hook o impostazioni "
+                          "dell'agente): li modifica solo l'utente")
+            if any(TF_CLI_RE.search(a.text) for a in args[1:]):
+                self.deny("variabile TF_CLI_ARGS*: inietta opzioni nei comandi terraform/tofu e non è consentita")
+
+    def mentions_protected(self, args: List[Arg], cwds: List[Path]) -> bool:
+        for a in args:
+            for t in self.candidates(a, cwds):
+                if PROTECTED_RE.search(t):
+                    return True
+        return False
+
+    # ------------------------------------------------------------ wrapper
+
+    def unwrap(self, args: List[Arg], ctx: Ctx) -> Optional[List[Arg]]:
+        """Toglie i comandi che ne lanciano un altro. Restituisce gli argomenti del comando interno, `args` se non
+        c'è nulla da togliere, None se il comando è già stato gestito."""
+        if args[0].dyn:
+            return args
+        n = norm_name(args[0].text)
+        t = [a.text for a in args]
+        L = len(t)
+
+        def skip_opts(i: int, value_opts: Set[str] = frozenset(), stop_at_assign: bool = False) -> int:
+            while i < L:
+                x = t[i]
+                if x == "--":
+                    return i + 1
+                if stop_at_assign and ASSIGN_RE.match(x):
+                    return i
+                if x.startswith("-") and len(x) > 1:
+                    i += 2 if x in value_opts else 1
+                    continue
+                return i
+            return i
+
+        if n == "env":
+            i = 1
+            while i < L:
+                x = t[i]
+                if x in ("-S", "--split-string") or (x.startswith("-S") and len(x) > 2) \
+                        or x.startswith("--split-string="):
+                    if x in ("-S", "--split-string"):
+                        s, nxt = (t[i + 1] if i + 1 < L else ""), i + 2
+                    else:
+                        s, nxt = (x[2:] if x.startswith("-S") else x.split("=", 1)[1]), i + 1
+                    return self.words_of(s) + args[nxt:]
+                if x in ("-u", "--unset", "-C", "--chdir", "-P"):
+                    i += 2
+                    continue
+                if x == "--":
+                    i += 1
+                    break
+                if x.startswith("-"):
+                    i += 1
+                    continue
+                break
+            return args[i:] or None
+        if n == "command":
+            i = 1
+            while i < L and t[i].startswith("-"):
+                if any(ch in t[i] for ch in "vV"):
+                    return None
+                i += 1
+            return args[i:] or None
+        if n == "exec":
+            i = 1
+            while i < L and t[i].startswith("-"):
+                i += 2 if t[i] == "-a" else 1
+            return args[i:] or None
+        if n in ("nohup", "builtin", "unbuffer", "chronic", "noglob", "nocorrect"):
+            return args[1:] or None
+        if n == "time":
+            i = 1
+            while i < L and t[i].startswith("-"):
+                if t[i] in ("-o", "--output") and i + 1 < L:
+                    self.target(args[i + 1], ctx.cwds)
+                    i += 2
+                    continue
+                i += 1
+            return args[i:] or None
+        if n in ("sudo", "doas"):
+            i = skip_opts(1, {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user", "--group",
+                              "--host", "--prompt", "--chdir", "--role", "--type", "--other-user", "--close-from",
+                              "--command-timeout"}, stop_at_assign=True)
+            return args[i:] or None
+        if n == "nice":
+            return args[skip_opts(1, {"-n", "--adjustment"}):] or None
+        if n == "ionice":
+            return args[skip_opts(1, {"-c", "-n", "-p", "-t", "--class", "--classdata"}):] or None
+        if n in ("timeout", "gtimeout"):
+            i = skip_opts(1, {"-s", "-k", "--signal", "--kill-after"})
+            return args[i + 1:] or None
+        if n == "stdbuf":
+            return args[skip_opts(1, {"-i", "-o", "-e", "--input", "--output", "--error"}):] or None
+        if n == "caffeinate":
+            return args[skip_opts(1, {"-t", "-w"}):] or None
+        if n == "xargs":
+            i = skip_opts(1, {"-I", "-L", "-n", "-P", "-s", "-E", "-d", "-a", "-R", "-S", "--max-args",
+                              "--max-procs", "--delimiter", "--arg-file", "--replace", "--max-lines", "--eof"})
+            ctx.xargs = True
+            return args[i:] or None
+        if n == "watch":
+            i = skip_opts(1, {"-n", "--interval", "-d", "--differences", "-q", "--equexit"})
+            self.script(" ".join(t[i:]), ctx.cwds, ctx.depth + 1)
+            return None
+        if n == "npx" or (n == "npm" and L > 1 and t[1] in ("exec", "x")) \
+                or (n == "pnpm" and L > 1 and t[1] in ("exec", "dlx")) \
+                or (n == "yarn" and L > 1 and t[1] in ("dlx", "exec")) or (n == "bun" and L > 1 and t[1] == "x"):
+            i = 1 if n == "npx" else 2
+            while i < L and t[i].startswith("-"):
+                if t[i] in ("-c", "--call") and i + 1 < L:
+                    self.script(t[i + 1], ctx.cwds, ctx.depth + 1)
+                    return None
+                if t[i] == "--":
+                    i += 1
+                    break
+                i += 2 if t[i] in ("-p", "--package") else 1
+            return args[i:] or None
+        if n in ("uv", "poetry", "pipenv", "rye", "pdm", "hatch") and L > 1 and t[1] == "run":
+            i = skip_opts(2, {"--with", "--python", "-p", "--project", "--directory", "--package", "--extra",
+                              "--group", "--env-file", "--index", "--with-requirements", "--from", "-e", "--env"})
+            rest = args[i:]
+            if rest and rest[0].text.endswith(".py"):
+                rest = [Arg("python")] + rest
+            return rest or None
+        if n == "aws-vault" and L > 1 and t[1] == "exec":
+            if "--" in t:
+                return args[t.index("--") + 1:] or None
+            i = skip_opts(2)
+            return args[i + 1:] or None
+        if n == "direnv" and L > 2 and t[1] == "exec":
+            return args[3:] or None
+        return args
+
+    # ------------------------------------------------------------ smistamento
+
+    def dispatch(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        if name in ("cd", "pushd"):
+            self.cd(args, ctx)
+            return RO
+        if name in ("terraform", "tofu", "terragrunt"):
+            return self.terraform(name, args, ctx)
+        if name == "aws":
+            return self.aws(args, ctx)
+        if name == "kubectl":
+            return self.kubectl(args, ctx)
+        if name == "helm":
+            return self.helm(args, ctx)
+        if name in CLOUD_DENIED:
+            if len(args) == 2 and args[1].text in VERSION_HELP:
+                return RO
+            self.deny(f"`{name}`: CLI cloud non consentita all'agente (modifica account o fa deploy); "
+                      "la usa il DevOps")
+            return RW
+        if name == "busybox" and len(args) > 1:
+            self.run(args[1:], ctx)
+            return DELEGATED
+        if name in SHELLS:
+            return self.shell(name, args, ctx)
+        if name == "eval":
+            self.script(" ".join(a.text for a in args[1:]), ctx.cwds, ctx.depth + 1)
+            return DELEGATED
+        if name in ("source", "."):
+            if len(args) < 2:
+                return RO
+            return self.exec_file(args[1], args[2:], ctx, lang="sh")
+        if name in ("export", "declare", "typeset", "local", "readonly"):
+            assigns = []
+            for a in args[1:]:
+                m = ASSIGN_RE.match(a.text)
+                if m:
+                    assigns.append((m.group(1), m.group(2)))
+                    self.set_var(m.group(1), m.group(2), a.dyn)
+            self.check_assigns(assigns)
+            return DELEGATED
+        if name == "alias":
+            for a in args[1:]:
+                m = re.match(r"^([^=\s]+)=(.*)$", a.text, re.S)
+                if m:
+                    self.aliases[m.group(1)] = m.group(2)
+            return DELEGATED
+        if name == "unalias":
+            for a in args[1:]:
+                self.aliases.pop(a.text, None)
+            return DELEGATED
+        if name == "python":
+            return self.python(args, ctx)
+        if name in ("node", "deno", "bun", "ts-node", "tsx"):
+            return self.node(name, args, ctx)
+        if name in ("ruby", "perl", "php"):
+            return self.ruby_perl(name, args, ctx)
+        if name in ("awk", "gawk", "mawk", "nawk"):
+            return self.awk(args, ctx)
+        if name == "curl":
+            return self.curl(args, ctx)
+        if name == "wget":
+            return self.wget(args, ctx)
+        if name in ALWAYS_INSTALL:
+            if len(args) == 2 and args[1].text in VERSION_HELP:
+                return RO
+            self.deny_tool(name)
+            return RW
+        if name in PKG_MANAGERS:
+            return self.pkg_manager(name, args, ctx)
+        if name in ("pip", "pipx", "uv", "cargo", "gem", "go"):
+            return self.lang_installer(name, args, ctx)
+        if name in ("npm", "pnpm", "yarn"):
+            return self.node_pm(name, args, ctx)
+        if name == "make":
+            return self.make(args, ctx)
+        if name == "just":
+            return self.just(args, ctx)
+        if name == "task":
+            return self.task(args, ctx)
+        if name == "git":
+            return self.git(args, ctx)
+        if name == "gh":
+            pos = _opt_split(args[1:], {"-R", "--repo"})
+            pair = tuple(a.text for a in pos[:2])
+            if pair in (("release", "download"), ("extension", "install"), ("ext", "install")):
+                self.deny_tool("gh " + " ".join(pair))
+            return RW
+        if name == "find":
+            return self.find(args, ctx)
+        if name in ("patch",):
+            self.deny("git apply/patch scrivono file senza passare dai controlli: applica le modifiche con Write/Edit")
+            return RW
+        if (name == "install.sh" or "/" in args[0].text) and name not in WRITERS and name not in READONLY_CMDS:
+            return self.exec_file(args[0], args[1:], ctx)
+        if name in WRITERS:
+            self.writers(name, args, ctx)
+            return RW
+        if name in READONLY_CMDS:
+            return RO
+        if name not in NO_SCAN:
+            self.generic(args, ctx)
+        return RW
+
+    def generic(self, args: List[Arg], ctx: Ctx) -> None:
+        """Comando sconosciuto (docker, ssh, trap, flock…): analizza i comandi che porta come argomenti."""
+        for i in range(1, len(args)):
+            a = args[i]
+            if a.dyn:
+                continue
+            if norm_name(a.text) in SCAN_NAMES:
+                self.run(args[i:], ctx.nested())
+            elif re.search(r"\s", a.text.strip()):
+                self.script(a.text, ctx.cwds, ctx.depth + 1, strict=False)
+
+    def cd(self, args: List[Arg], ctx: Ctx) -> None:
+        pos = [a for a in args[1:] if not a.text.startswith("-") or a.text == "-"]
+        if pos and pos[0].text == "-":
+            return
+        if pos and pos[0].dyn:
+            new = [UNKNOWN_DIR]
+        elif not pos:
+            new = [Path.home()]
+        else:
+            new = self.resolve_all(pos[0].text, ctx.cwds)
+        for p in new:
+            if p not in ctx.cwds and len(ctx.cwds) < 32:
+                ctx.cwds.append(p)
+
+    # ------------------------------------------------------------ terraform / tofu
+
+    def terraform(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        rest = args[1:]
+        i = 0
+        while i < len(rest) and rest[i].text.startswith("-"):
+            if rest[i].text in ("-version", "--version", "-v", "-help", "--help", "-h"):
+                return RO
+            i += 1
+        if i >= len(rest):
+            if ctx.xargs:
+                self.deny(f"`xargs {name}`: sottocomando letto da stdin, non verificabile")
+            return RO
+        sub_arg = rest[i]
+        sub = sub_arg.text
+        opts = rest[i + 1:]
+        label = f"`{name} {sub}`"
+        if sub_arg.dyn:
+            self.deny(f"{label}: sottocomando non determinabile (variabile o sostituzione)")
+            return RW
+        if name == "terragrunt":
+            return self.terragrunt(sub, opts)
+        if ctx.xargs and sub not in ("fmt", "validate", "version"):
+            self.deny(f"`xargs {name} {sub}`: argomenti letti da stdin, non verificabile")
+            return RW
+        pos = [a for a in opts if not a.text.startswith("-")]
+        first = pos[0].text if pos else ""
+        if sub in TF_READONLY:
+            return RW
+        if sub == "providers":
+            if first in ("lock", "mirror"):
+                self.deny(f"{label} {first}: scarica provider o riscrive .terraform.lock.hcl; lo fa "
+                          "`terraform init -backend=false` nello stop gate o l'utente")
+            return RW
+        if sub == "output":
+            if not any(a.text in ("-json", "--json") for a in opts):
+                self.deny(f"{label}: consentito solo `{name} output -json`")
+            return RW
+        if sub == "init":
+            backend = None
+            for a in opts:
+                m = re.fullmatch(r"--?backend=(.*)", a.text)
+                if m:
+                    backend = m.group(1).strip().lower()
+            if any(a.dyn for a in opts):
+                self.deny(f"{label}: opzioni non determinabili (variabili o sostituzioni)")
+            elif backend not in ("false", "0", "f"):
+                self.deny(f"{label} con backend reale: l'agente può lanciare solo `{name} init -backend=false`")
+            elif any(re.match(r"--?from-module", a.text) for a in opts):
+                self.deny(f"{label} -from-module: scrive file IaC senza passare dalle regole")
+            return RW
+        if sub == "state":
+            if first not in ("list", "show") or pos[0].dyn:
+                self.deny(f"{label} {first}".rstrip() + ": consentiti solo `state list` e `state show`")
+            return RW
+        if sub == "workspace":
+            if first in ("list", "show") or (first == "select" and not any(
+                    a.text.startswith(("-or-create", "--or-create")) and not a.text.endswith("=false") for a in opts)):
+                return RW
+            self.deny(f"{label} {first}".rstrip() + ": consentiti solo `workspace list|show|select`")
+            return RW
+        if sub in TF_DENIED:
+            why = "richiede credenziali: lo lancia il DevOps" if sub == "plan" else \
+                "modifica lo stato o l'account cloud: lo esegue il DevOps (pipeline o utente), non l'agente"
+            self.deny(f"{label}: {why}")
+            return RW
+        self.deny(f"{label}: sottocomando non consentito all'agente (consentiti fmt, validate, version, providers, "
+                  "graph, show, output -json, state list|show, workspace list|show|select, init -backend=false)")
+        return RW
+
+    def terragrunt(self, sub: str, opts: List[Arg]) -> str:
+        first = next((a.text for a in opts if not a.text.startswith("-")), "")
+        if sub in ("hclfmt", "fmt", "version", "help"):
+            return RW
+        if sub == "hcl" and first in ("fmt", "format", "validate"):
+            return RW
+        self.deny(f"`terragrunt {sub}`: terragrunt inizializza il backend reale e può creare risorse "
+                  "(anche con validate/run-all); consentiti solo hclfmt e hcl fmt|validate")
+        return RW
+
+    # ------------------------------------------------------------ CLI cloud
+
+    def aws(self, args: List[Arg], ctx: Ctx) -> str:
+        pos = _opt_split(args[1:], AWS_VALUE_OPTS)[:2]
+        if not pos or pos[0].text == "help":
+            if ctx.xargs:
+                self.deny("`xargs aws`: operazione letta da stdin, non verificabile")
+            return RO
+        if any(a.dyn for a in pos):
+            self.deny("`aws`: servizio o operazione non determinabili (variabile o sostituzione)")
+            return RW
+        if len(pos) < 2:
+            self.deny(f"`aws {pos[0].text}`: operazione mancante o alias della CLI, non verificabile")
+            return RW
+        svc, op = pos[0].text, pos[1].text
+        if op == "help" or op.startswith(("get-", "describe-", "list-")) or (svc, op) == ("s3", "ls") \
+                or (svc == "s3api" and op.startswith("head-")):
+            return RO
+        self.deny(f"`aws {svc} {op}`: operazione che può modificare l'account cloud (consentite solo get-*, "
+                  "describe-*, list-*, sts get-caller-identity, s3 ls, s3api head-*)")
+        return RW
+
+    def kubectl(self, args: List[Arg], ctx: Ctx) -> str:
+        pos = _opt_split(args[1:], KUBECTL_VALUE_OPTS)
+        if not pos:
+            if ctx.xargs:
+                self.deny("`xargs kubectl`: sottocomando letto da stdin, non verificabile")
+            return RO
+        sub = pos[0].text
+        second = pos[1].text if len(pos) > 1 else ""
+        if pos[0].dyn:
+            self.deny("`kubectl`: sottocomando non determinabile")
+        elif sub in ("get", "describe", "explain", "version", "help") or (
+                sub == "config" and second in ("view", "get-contexts") and not pos[1].dyn):
+            return RO
+        else:
+            label = f"kubectl {sub} {second}".rstrip()
+            self.deny(f"`{label}`: può modificare il cluster (consentiti get, describe, explain, version, "
+                      "config view|get-contexts)")
+        return RW
+
+    def helm(self, args: List[Arg], ctx: Ctx) -> str:
+        pos = _opt_split(args[1:], HELM_VALUE_OPTS)
+        if not pos:
+            if ctx.xargs:
+                self.deny("`xargs helm`: sottocomando letto da stdin, non verificabile")
+            return RO
+        sub = pos[0].text
+        if not pos[0].dyn and sub in ("template", "lint", "show", "version", "list", "ls", "status", "help"):
+            if any(a.text.startswith("--post-renderer") for a in args):
+                self.deny("`helm --post-renderer`: esegue un programma arbitrario")
+            return RO
+        self.deny(f"`helm {sub}`: può modificare il cluster (consentiti template, lint, show, version, list, status)")
+        return RW
+
+    # ------------------------------------------------------------ shell e interpreti
+
+    def shell(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        i, has_c, from_stdin = 1, False, False
+        while i < len(args):
+            x = args[i].text
+            if x in ("--", "-"):
+                i += 1
+                break
+            if x in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+                i += 2
+                continue
+            if x.startswith("--"):
+                i += 1
+                continue
+            if x[:1] in "-+" and len(x) > 1:
+                has_c = has_c or (x[0] == "-" and "c" in x[1:])
+                from_stdin = from_stdin or "s" in x[1:]
+                i += 1
+                continue
+            break
+        rest = args[i:]
+        if has_c:
+            if not rest:
+                return RO
+            if rest[0].dyn:
+                self.deny(f"`{name} -c`: stringa di comando non determinabile (variabile o sostituzione)")
+            self.script(rest[0].text, ctx.cwds, ctx.depth + 1)
+            return DELEGATED
+        if rest and not from_stdin:
+            return self.exec_file(rest[0], rest[1:], ctx, lang="sh")
+        return self.stdin_code(name, ctx, lang="sh")
+
+    def stdin_code(self, name: str, ctx: Ctx, lang: str) -> str:
+        """Interprete senza script: legge il codice da heredoc/herestring o dalla pipe."""
+        if ctx.stdin:
+            for body in ctx.stdin:
+                if lang == "sh":
+                    self.script(body, ctx.cwds, ctx.depth + 1)
+                else:
+                    self.check_code(body, f"codice passato a {name}", lang)
+            return DELEGATED
+        if ctx.piped and ctx.cmd is not None:
+            ctx.cmd.stdin_exec = True
+        return DELEGATED
+
+    def exec_file(self, path: Arg, rest: List[Arg], ctx: Ctx, lang: Optional[str] = None) -> str:
+        """Esecuzione di uno script: il kit è consentito, gli altri script si leggono e si controllano."""
+        flags = [a.text for a in rest]
+        if norm_name(path.text) == "install.sh" and any(re.match(r"--(?:force|uninstall)\b", f) for f in flags):
+            self.deny("install.sh con --force o --uninstall lo esegue solo l'utente")
+            return KIT
+        if path.dyn:
+            self.deny(f"script non determinabile ({path.text}): variabili, sostituzioni o `<(…)` non si possono "
+                      "verificare")
+            if re.search(r"\b(?:curl|wget)\b", path.text):
+                self.deny_tool("script scaricato ed eseguito")
+            return RW
+        if path.text.startswith(("/dev/", "/proc/")):
+            if ctx.piped and ctx.cmd is not None:
+                ctx.cmd.stdin_exec = True
+            return DELEGATED
+        resolved = self.resolve_all(path.text, ctx.cwds)
+        for p in resolved:
+            sp = str(p)
+            if sp in self.kit_install or (sp in self.kit_setup and len(flags) <= 1
+                                          and all(f in ("local", "project", "user") for f in flags)):
+                return KIT
+        self.run_file(path.text, ctx, lang)
+        return RW
+
+    def run_file(self, path_text: str, ctx: Ctx, lang: Optional[str] = None) -> None:
+        for p in self.resolve_all(path_text, ctx.cwds):
+            self.executed.add(str(p))
+        for p in self.resolve_all(path_text, ctx.cwds):
+            text = _read_text(p)
+            if text is None:
+                continue
+            first = text.split("\n", 1)[0]
+            shebang = first[2:] if first.startswith("#!") else ""
+            code_lang = lang
+            if code_lang in (None, "sh") and shebang:
+                for key in ("python", "node", "deno", "bun", "ruby", "perl", "php"):
+                    if re.search(rf"\b{key}", shebang):
+                        code_lang = key
+                        break
+            if code_lang in (None, "sh"):
+                self.script(text, ctx.cwds, ctx.depth + 1)
+            else:
+                self.check_code(text, f"script {path_text}", code_lang)
+            return
+
+    def check_code(self, code: str, origin: str, lang: str = "python") -> None:
+        spawn = bool(SPAWN_RE.search(code)) or (lang in ("ruby", "perl", "php") and bool(TICK_RE.search(code))) \
+            or (lang == "awk" and bool(AWK_SPAWN_RE.search(code)))
+        write = bool(WRITE_RE.search(code)) or (lang == "awk" and bool(AWK_WRITE_RE.search(code)))
+        if SDK_RE.search(code):
+            self.deny(f"{origin}: usa gli SDK cloud (boto3, @aws-sdk, azure, google-cloud…): l'agente non tocca "
+                      "gli account cloud")
+        if spawn and CLOUD_WORD_RE.search(code):
+            self.deny(f"{origin}: lancia terraform/tofu o CLI cloud da codice, non verificabile")
+        if spawn and INSTALL_WORD_RE.search(code):
+            self.deny_tool(f"{origin} lancia download o gestori di pacchetti")
+        if SAVE_DOWNLOAD_RE.search(code) or (NET_RE.search(code) and (write or spawn)):
+            self.deny_tool(f"{origin} scarica file")
+        root = self.cfg.get("infra_root", ".")
+        if write and (IAC_MENTION_RE.search(code) or PROTECTED_RE.search(code)
+                      or (root not in ("", ".") and root + "/" in code)):
+            self.deny(f"{origin}: scrive file IaC, .env o protetti; il codice IaC si scrive con Write/Edit")
+        if OBFUSCATED_RE.search(code):
+            self.deny(f"{origin}: esegue codice offuscato (decodifica + exec/eval), non verificabile")
+
+    def python(self, args: List[Arg], ctx: Ctx) -> str:
+        i, opts = 1, []
+        while i < len(args):
+            x = args[i].text
+            if x == "-":
+                return self.stdin_code("python", ctx, "python")
+            if x == "--":
+                i += 1
+                break
+            if x.startswith("--"):
+                opts.append(x)
+                i += 1
+                continue
+            if x.startswith("-") and len(x) > 1:
+                for j in range(1, len(x)):
+                    ch = x[j]
+                    if ch in "cm":
+                        value = x[j + 1:]
+                        nxt = i + 1
+                        if not value:
+                            value = args[i + 1].text if i + 1 < len(args) else ""
+                            nxt = i + 2
+                        if ch == "c":
+                            self.check_code(value, "codice python inline")
+                            return RW
+                        return self.pymod(value, args[nxt:], ctx)
+                    if ch in "WXQ":
+                        if j == len(x) - 1:
+                            i += 1
+                        break
+                opts.append(x)
+                i += 1
+                continue
+            break
+        if i >= len(args):
+            return self.stdin_code("python", ctx, "python")
+        script, rest = args[i], args[i + 1:]
+        if script.dyn:
+            self.deny(f"script python non determinabile ({script.text}): non verificabile")
+            return RW
+        if all(re.fullmatch(r"-[BIuEsSOq]+", o) for o in opts):
+            paths = self.resolve_all(script.text, ctx.cwds)
+            kit = [p for p in paths if str(p) in self.kit_scripts]
+            other = [p for p in paths if str(p) not in self.kit_scripts and p.is_file()]
+            if kit and not other:
+                if kit[0].name == "tools.py" and rest and rest[0].text == "install":
+                    self.installs += 1
+                return KIT
+        self.run_file(script.text, ctx, "python")
+        return RW
+
+    def pymod(self, mod: str, rest: List[Arg], ctx: Ctx) -> str:
+        if mod in ("pip", "pipx", "uv"):
+            return self.lang_installer(mod, [Arg(mod)] + rest, ctx)
+        if mod == "awscli":
+            return self.aws([Arg("aws")] + rest, ctx)
+        rel = mod.replace(".", "/")
+        for c in ctx.cwds:
+            for cand in (c / f"{rel}.py", c / rel / "__main__.py"):
+                if c != UNKNOWN_DIR and cand.is_file():
+                    self.run_file(str(cand), ctx, "python")
+                    return RW
+        return RW
+
+    def node(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        if name in ("deno", "bun") and len(t) > 1 and not t[1].startswith("-"):
+            sub = t[1]
+            if sub == "eval":
+                self.check_code(" ".join(t[2:]), f"codice {name} inline", "node")
+                return RW
+            if sub in ("install", "i", "add", "update", "compile") and (
+                    name == "deno" or any(x in ("-g", "--global") for x in t)):
+                self.deny_tool(f"{name} {sub}")
+                return RW
+            if sub == "run":
+                pos = [a for a in args[2:] if not a.text.startswith("-")]
+                if not pos:
+                    return RW
+                if pos[0].text.startswith(("http://", "https://", "npm:", "jsr:")):
+                    self.deny_tool(f"{name} run di codice remoto")
+                    return RW
+                if name == "bun" and self.npm_scripts(["bun", "run"] + [a.text for a in pos], ctx, pos[0].text,
+                                                      [a.text for a in pos[1:]]):
+                    return RW
+                self.run_file(pos[0].text, ctx, "node")
+                return RW
+            if sub in ("test", "task", "fmt", "lint", "check", "build", "upgrade", "init", "repl"):
+                return RW
+        i = 1
+        while i < len(t):
+            x = t[i]
+            if x in ("-e", "--eval", "-p", "--print", "-pe"):
+                self.check_code(t[i + 1] if i + 1 < len(t) else "", f"codice {name} inline", "node")
+                return RW
+            if x in ("-r", "--require", "--import", "--loader", "--experimental-loader") and i + 1 < len(t):
+                if t[i + 1].startswith((".", "/")):
+                    self.run_file(t[i + 1], ctx, "node")
+                i += 2
+                continue
+            if x == "-":
+                return self.stdin_code(name, ctx, "node")
+            if x == "--":
+                i += 1
+                break
+            if x.startswith("-"):
+                i += 1
+                continue
+            break
+        if i >= len(args):
+            return self.stdin_code(name, ctx, "node")
+        if args[i].dyn:
+            self.deny(f"script {name} non determinabile ({args[i].text}): non verificabile")
+            return RW
+        self.run_file(args[i].text, ctx, "node")
+        return RW
+
+    def ruby_perl(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        codes: List[str] = []
+        inplace = False
+        pos: List[Arg] = []
+        code_flags = {"ruby": "e", "perl": "eE", "php": "r"}[name]
+        i = 1
+        while i < len(args):
+            x = args[i].text
+            if x == "--":
+                pos += args[i + 1:]
+                break
+            if x.startswith("-") and len(x) > 1 and not x.startswith("--"):
+                consumed = False
+                for j in range(1, len(x)):
+                    ch = x[j]
+                    if ch in code_flags:
+                        value = x[j + 1:]
+                        if not value and i + 1 < len(args):
+                            value = args[i + 1].text
+                            consumed = True
+                        codes.append(value)
+                        break
+                    if ch == "i" and name == "perl":
+                        inplace = True
+                        break
+                    if ch in "IMmxCdF" and name == "perl":
+                        break
+                i += 2 if consumed else 1
+                continue
+            if x.startswith("--"):
+                i += 1
+                continue
+            pos.append(args[i])
+            i += 1
+        if codes:
+            for c in codes:
+                self.check_code(c, f"codice {name} inline", name)
+            if inplace:
+                for a in pos:
+                    self.target(a, ctx.cwds)
+            return RW
+        if pos:
+            if pos[0].dyn:
+                self.deny(f"script {name} non determinabile ({pos[0].text}): non verificabile")
+                return RW
+            self.run_file(pos[0].text, ctx, name)
+            return RW
+        return self.stdin_code(name, ctx, name)
+
+    def awk(self, args: List[Arg], ctx: Ctx) -> str:
+        i, prog, progfile, inplace = 1, None, None, False
+        while i < len(args):
+            x = args[i].text
+            if x in ("-F", "-v", "-f", "-i", "-e", "-l", "-E", "--include", "--source", "--file"):
+                val = args[i + 1].text if i + 1 < len(args) else ""
+                if x in ("-f", "-E", "--file"):
+                    progfile = val
+                elif x in ("-i", "--include", "-l") and val == "inplace":
+                    inplace = True
+                elif x in ("-e", "--source"):
+                    prog = val
+                i += 2
+                continue
+            if x.startswith(("--include=inplace", "-iinplace")):
+                inplace = True
+            if x == "--":
+                i += 1
+                break
+            if x.startswith("-") and len(x) > 1:
+                i += 1
+                continue
+            break
+        files = args[i:]
+        if prog is None and progfile is None and files:
+            prog, files = files[0].text, files[1:]
+        if progfile:
+            for p in self.resolve_all(progfile, ctx.cwds):
+                prog = _read_text(p) or prog
+        if prog:
+            self.check_code(prog, "programma awk", "awk")
+        if inplace:
+            for a in files:
+                self.target(a, ctx.cwds)
+        return RW
+
+    # ------------------------------------------------------------ download e installazioni
+
+    def curl(self, args: List[Arg], ctx: Ctx) -> str:
+        value_short = set("AbcCdDeEFHKmoPQrTtuUwxXyYz")
+        to_file = False
+        i = 1
+        while i < len(args):
+            x = args[i].text
+            nxt = args[i + 1].text if i + 1 < len(args) else ""
+            if x == "--":
+                break
+            if x.startswith("--"):
+                opt, eq, val = x.partition("=")
+                if opt in ("--output", "--output-dir"):
+                    v = val if eq else nxt
+                    i += 0 if eq else 1
+                    to_file = to_file or opt == "--output-dir" or v not in SAFE_OUT
+                elif opt in ("--remote-name", "--remote-name-all", "--remote-header-name", "--config"):
+                    to_file = True
+            elif x.startswith("-") and len(x) > 1:
+                for j in range(1, len(x)):
+                    ch = x[j]
+                    if ch in value_short:
+                        v = x[j + 1:]
+                        if not v:
+                            v = nxt
+                            i += 1
+                        if (ch == "o" and v not in SAFE_OUT) or ch == "K":
+                            to_file = True
+                        break
+                    if ch == "O":
+                        to_file = True
+            i += 1
+        if ctx.cmd is not None:
+            ctx.cmd.download = True
+        if to_file or ctx.write_redir:
+            self.deny_tool("curl verso un file")
+        return RW
+
+    def wget(self, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        safe = any(x in ("--spider", "--version", "-V", "--help", "-h") for x in t)
+        for i, x in enumerate(t[1:], 1):
+            nxt = t[i + 1] if i + 1 < len(t) else ""
+            if x.startswith("--output-document"):
+                v = x.split("=", 1)[1] if "=" in x else nxt
+                safe = safe or v in SAFE_OUT
+            elif x.startswith("-") and not x.startswith("--") and "O" in x:
+                v = x[x.index("O") + 1:] or nxt
+                safe = safe or v in SAFE_OUT
+        if ctx.cmd is not None:
+            ctx.cmd.download = True
+        if not safe or ctx.write_redir:
+            self.deny_tool("wget verso un file")
+        return RW
+
+    def pkg_manager(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args[1:]]
+        if name in ("pacman", "yay"):
+            if not t or t[0].startswith("-Q") or t[0] in VERSION_HELP:
+                return RO
+            self.deny_tool(f"{name} {t[0]}")
+            return RW
+        pos = [x for x in t if not x.startswith("-")]
+        if not pos or pos[0] in PKG_SAFE or pos[0] in VERSION_HELP:
+            if name == "nix-env" and any(x in ("-i", "--install", "-iA", "-u", "--upgrade") for x in t):
+                self.deny_tool(f"{name} {' '.join(t[:2])}")
+            return RO
+        self.deny_tool(f"{name} {pos[0]}")
+        return RW
+
+    def lang_installer(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        pos = [a.text for a in args[1:] if not a.text.startswith("-")]
+        first = pos[0] if pos else ""
+        second = pos[1] if len(pos) > 1 else ""
+        bad = (name == "pip" and first in ("install", "download")) \
+            or (name == "pipx" and first in ("install", "run", "inject", "upgrade", "upgrade-all", "reinstall",
+                                             "reinstall-all", "install-all")) \
+            or (name == "uv" and ((first == "pip" and second in ("install", "sync")) or (
+                first == "tool" and second in ("install", "run", "upgrade")))) \
+            or (name in ("cargo",) and first in ("install", "binstall")) \
+            or (name == "gem" and first in ("install", "update")) \
+            or (name == "go" and (first == "install" or (first == "run" and "@" in second)))
+        if bad:
+            self.deny_tool(f"{name} {first} {second if name in ('uv', 'go') else ''}".strip())
+        return RW
+
+    def node_pm(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        value_opts = {"--prefix", "-C", "--dir", "--cwd", "-w", "--workspace", "--filter", "-F", "--location"}
+        pos = [a.text for a in _opt_split(args[1:], value_opts)]
+        verb = pos[0] if pos else ""
+        glob = any(x in ("-g", "--global", "--location=global", "--global=true") for x in t) or \
+            any(t[i] == "--location" and i + 1 < len(t) and t[i + 1] == "global" for i in range(len(t)))
+        installs = {"install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall",
+                    "add", "update", "up", "upgrade", "udpate", "install-test", "it", "link", "ln"}
+        if (glob and verb in installs) or (name == "yarn" and verb == "global" and len(pos) > 1
+                                           and pos[1] in ("add", "upgrade", "install")):
+            self.deny_tool(f"{name} {verb} globale")
+            return RW
+        script, extra = None, pos[2:]
+        if verb in ("run", "run-script", "rum", "urn"):
+            script = pos[1] if len(pos) > 1 else None
+        elif verb in ("test", "t", "tst", "start", "stop", "restart"):
+            script, extra = {"t": "test", "tst": "test"}.get(verb, verb), pos[1:]
+        elif verb in ("install", "i", "ci", "add") or (name == "yarn" and not verb):
+            self.npm_scripts(t, ctx, None, [], lifecycle=True)
+            return RW
+        elif name in ("pnpm", "yarn") and verb:
+            script, extra = verb, pos[1:]
+        if script:
+            self.npm_scripts(t, ctx, script, extra)
+        return RW
+
+    def npm_scripts(self, t: List[str], ctx: Ctx, script: Optional[str], extra: List[str],
+                    lifecycle: bool = False) -> bool:
+        """Legge gli script di package.json (pre/post compresi) e li analizza; False se non trovati."""
+        names = ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"] \
+            if lifecycle else [f"pre{script}", script, f"post{script}"]
+        prefix = None
+        for i, x in enumerate(t):
+            if x in ("--prefix", "-C", "--dir", "--cwd") and i + 1 < len(t):
+                prefix = t[i + 1]
+            elif x.startswith(("--prefix=", "--dir=", "--cwd=")):
+                prefix = x.split("=", 1)[1]
+        workspaces = any(x.startswith(("-w", "--workspace", "--filter", "-F", "-r", "--recursive", "-ws"))
+                         for x in t)
+        files: List[Path] = []
+        starts = self.resolve_all(prefix, ctx.cwds) if prefix else [c for c in ctx.cwds if c != UNKNOWN_DIR]
+        for start in starts:
+            found = self.find_upward(start, ("package.json",))
+            if found:
+                files.append(found)
+                if workspaces:
+                    files += [p for p in found.parent.glob("*/*/package.json") if "node_modules" not in p.parts]
+                    files += [p for p in found.parent.glob("*/package.json") if "node_modules" not in p.parts]
+        hit = False
+        for f in files:
+            try:
+                scripts = json.loads(_read_text(f) or "{}").get("scripts") or {}
+            except (ValueError, AttributeError):
+                continue
+            if not isinstance(scripts, dict):
+                continue
+            for n in names:
+                body = scripts.get(n)
+                if isinstance(body, str):
+                    hit = True
+                    tail = " " + " ".join(shlex.quote(x) for x in extra if x != "--") if n == script else ""
+                    self.script(body + tail, [f.parent], ctx.depth + 1)
+        return hit
+
+    def find_upward(self, start: Path, names: Tuple[str, ...]) -> Optional[Path]:
+        cur = start
+        for d in (cur, *cur.parents):
+            for n in names:
+                if (d / n).is_file():
+                    return d / n
+            if d == self.proj or not str(d).startswith(str(self.proj)):
+                break
+        return None
+
+    # ------------------------------------------------------------ make / just / task
+
+    def make(self, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        mfile, mdir, goals, overrides = None, None, [], {}
+        i = 1
+        while i < len(t):
+            x = t[i]
+            nxt = t[i + 1] if i + 1 < len(t) else None
+            if x in ("-f", "--file", "--makefile") and nxt is not None:
+                mfile, i = nxt, i + 2
+                continue
+            if x in ("-C", "--directory") and nxt is not None:
+                mdir, i = nxt, i + 2
+                continue
+            if x.startswith(("--file=", "--makefile=")):
+                mfile = x.split("=", 1)[1]
+            elif x.startswith("--directory="):
+                mdir = x.split("=", 1)[1]
+            elif x.startswith("-f") and len(x) > 2:
+                mfile = x[2:]
+            elif x.startswith("-C") and len(x) > 2:
+                mdir = x[2:]
+            elif x in ("-I", "-o", "-W", "-l", "--include-dir", "--old-file", "--what-if") and nxt is not None:
+                i += 2
+                continue
+            elif x == "-j" and nxt is not None and nxt.isdigit():
+                i += 2
+                continue
+            elif x.startswith("-"):
+                pass
+            elif ASSIGN_RE.match(x):
+                m = ASSIGN_RE.match(x)
+                overrides[m.group(1)] = m.group(2)
+            else:
+                goals.append(x)
+            i += 1
+        overrides = {**ctx.env, **overrides}
+        dirs = self.resolve_all(mdir, ctx.cwds) if mdir else [c for c in ctx.cwds if c != UNKNOWN_DIR]
+        for d in dirs:
+            if mfile:
+                cands = self.resolve_all(mfile, [d])
+            else:
+                cands = [d / n for n in ("GNUmakefile", "makefile", "Makefile")]
+            mf = next((c for c in cands if c.is_file()), None)
+            if mf is None:
+                continue
+            text = make_recipes(mf, goals, overrides)
+            if text:
+                self.script(text, [mf.parent], ctx.depth + 1)
+        return RW
+
+    def just(self, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        jfile, jdir, names = None, None, []
+        listing = False
+        i = 1
+        while i < len(t):
+            x = t[i]
+            nxt = t[i + 1] if i + 1 < len(t) else None
+            if x in ("-f", "--justfile") and nxt is not None:
+                jfile, i = nxt, i + 2
+                continue
+            if x in ("-d", "--working-directory", "--set", "--shell", "--shell-arg", "--dotenv-path",
+                     "--dotenv-filename", "--color", "--chooser", "--command-color") and nxt is not None:
+                if x == "-d" or x == "--working-directory":
+                    jdir = nxt
+                i += 2 if x != "--set" else 3
+                continue
+            if x in ("-l", "--list", "--summary", "--dump", "--version", "--help", "-h", "-V", "--variables",
+                     "--show", "-s", "--groups", "--fmt", "--init", "--edit", "-e"):
+                listing = True
+            elif not x.startswith("-") and not ASSIGN_RE.match(x):
+                names.append(x)
+            i += 1
+        if listing and "--show" not in t and "-s" not in t:
+            return RO
+        starts = [c for c in ctx.cwds if c != UNKNOWN_DIR]
+        for start in starts:
+            jf = self.resolve_all(jfile, [start])[0] if jfile else \
+                self.find_upward(start, ("justfile", "Justfile", ".justfile", "JUSTFILE"))
+            if jf is None or not jf.is_file():
+                continue
+            text = just_recipes(jf, names)
+            if text:
+                self.script(text, [Path(jdir).resolve() if jdir else jf.parent], ctx.depth + 1)
+        return RW
+
+    def task(self, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        tfile, names, tvars = None, [], {}
+        i = 1
+        while i < len(t):
+            x = t[i]
+            nxt = t[i + 1] if i + 1 < len(t) else None
+            if x == "--":
+                break
+            if x in ("-t", "--taskfile", "-d", "--dir", "-o", "--output", "-C", "--concurrency") and nxt is not None:
+                if x in ("-t", "--taskfile"):
+                    tfile = nxt
+                i += 2
+                continue
+            if x in ("-l", "--list", "-a", "--list-all", "--summary", "--version", "-h", "--help", "--init"):
+                return RO
+            if not x.startswith("-"):
+                m = ASSIGN_RE.match(x)
+                if m:
+                    tvars[m.group(1)] = m.group(2)
+                else:
+                    names.append(x)
+            i += 1
+        for start in [c for c in ctx.cwds if c != UNKNOWN_DIR]:
+            tf = self.resolve_all(tfile, [start])[0] if tfile else self.find_upward(
+                start, ("Taskfile.yml", "taskfile.yml", "Taskfile.yaml", "taskfile.yaml", "Taskfile.dist.yml",
+                        "taskfile.dist.yml", "Taskfile.dist.yaml", "taskfile.dist.yaml"))
+            if tf is None or not tf.is_file():
+                continue
+            text = task_recipes(tf, names, tvars)
+            if text:
+                self.script(text, [tf.parent], ctx.depth + 1)
+        return RW
+
+    # ------------------------------------------------------------ git, find
+
+    def git(self, args: List[Arg], ctx: Ctx) -> str:
+        i = 1
+        while i < len(args):
+            x = args[i].text
+            if x in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path",
+                     "--super-prefix"):
+                if x == "-c" and i + 1 < len(args):
+                    key, _, val = args[i + 1].text.partition("=")
+                    self.git_key(key, val, ctx)
+                i += 2
+                continue
+            if x.startswith("-"):
+                i += 1
+                continue
+            break
+        if i >= len(args):
+            return RO
+        sub = args[i]
+        if sub.dyn:
+            self.deny("`git`: sottocomando non determinabile")
+            return RW
+        if sub.text in ("apply", "am"):
+            self.deny("git apply/patch scrivono file senza passare dai controlli: applica le modifiche con Write/Edit")
+            return RW
+        if sub.text == "config":
+            self.git_config(args[i + 1:], ctx)
+        return RO if sub.text in READONLY_GIT else RW
+
+    def git_config(self, args: List[Arg], ctx: Ctx) -> None:
+        t = [a.text for a in args]
+        if any(x in ("--get", "--get-all", "--get-regexp", "--list", "-l", "--unset", "--unset-all",
+                     "--remove-section", "--rename-section", "--show-origin", "--name-only") for x in t):
+            return
+        if any(x in ("--edit", "-e") for x in t):
+            return
+        pos = [a for a in _opt_split(args, {"-f", "--file", "--blob", "--type", "--default", "--comment"})]
+        if pos and pos[0].text in ("get", "list", "unset", "rename-section", "remove-section", "edit"):
+            return
+        if pos and pos[0].text == "set":
+            pos = pos[1:]
+        if len(pos) >= 2:
+            self.git_key(pos[0].text, pos[1].text, ctx)
+
+    def git_key(self, key: str, val: str, ctx: Ctx) -> None:
+        k = key.lower()
+        if k.startswith("alias."):
+            if val.startswith("!"):
+                self.script(val[1:], ctx.cwds, ctx.depth + 1)
+            elif val.split()[:1] and val.split()[0] in ("apply", "am"):
+                self.deny("git apply/patch scrivono file senza passare dai controlli: applica le modifiche con "
+                          "Write/Edit")
+            return
+        if k in GIT_EXEC_KEYS or GIT_EXEC_KEY_RE.fullmatch(k):
+            self.deny(f"configurazione git che esegue comandi ({key}): la imposta solo l'utente")
+
+    def find(self, args: List[Arg], ctx: Ctx) -> str:
+        t = [a.text for a in args]
+        names = [args[i + 1] for i, x in enumerate(t[:-1]) if x in ("-name", "-iname", "-path", "-ipath",
+                                                                         "-wholename", "-iwholename")]
+        kind = RO
+        if any(x in ("-delete", "-fprint", "-fprint0", "-fprintf", "-fls") for x in t):
+            kind = RW
+        i = 0
+        while i < len(t):
+            if t[i] in ("-exec", "-execdir", "-ok", "-okdir"):
+                kind = RW
+                j = i + 1
+                while j < len(t) and t[j] not in (";", "+"):
+                    j += 1
+                sub = args[i + 1:j]
+                fills = [Arg(n.text, n.dyn, True) for n in names] or [Arg("{}", dyn=True)]
+                for fill in fills:
+                    self.run([fill if a.text == "{}" else a for a in sub], ctx.nested())
+                i = j
+            i += 1
+        return kind
+
+    # ------------------------------------------------------------ scritture
+
+    def writers(self, name: str, args: List[Arg], ctx: Ctx) -> None:
+        rest = args[1:]
+        t = [a.text for a in rest]
+        cw = ctx.cwds
+
+        def positional(value_opts: Set[str] = frozenset()) -> List[Arg]:
+            return _opt_split(rest, value_opts)
+
+        if name in ("tee", "sponge", "truncate", "touch", "ed", "ex", "vi", "vim", "nvim"):
+            for a in positional({"-s", "--size", "-r", "--reference", "-d", "-t", "-c", "-S"}):
+                self.target(a, cw)
+        elif name in ("sed", "gsed"):
+            inplace = any(x.startswith(("-i", "--in-place")) or x == "-I" or
+                          (x.startswith("-") and not x.startswith("--") and "i" in x[1:]) for x in t)
+            scripts = [t[i + 1] for i, x in enumerate(t[:-1]) if x in ("-e", "--expression")]
+            scripts += [x.split("=", 1)[1] for x in t if x.startswith("--expression=")]
+            skip = {i + 1 for i, x in enumerate(t[:-1]) if x in ("-i", "-I") and re.fullmatch(r"(?:\.[\w.-]*)?",
+                                                                                              t[i + 1])}
+            files = [a for i, a in enumerate(rest) if i not in skip and a in
+                     positional({"-e", "--expression", "-f", "--file", "-l", "--line-length"})]
+            if not scripts and not any(x in ("-f", "--file") or x.startswith("--file=") for x in t) and files:
+                scripts.append(files.pop(0).text)
+            for s in scripts:
+                for m in re.finditer(r"(?:^|[;\n}/])\s*[0-9$,]*\s*[wW]\s+(\S+)", s):
+                    self.target(Arg(m.group(1)), cw)
+                if CLOUD_WORD_RE.search(s) and re.search(r"(?:^|[;\n])\s*[0-9$,]*\s*e\b|/[gpiImMw0-9]*e[gpiImM0-9]*"
+                                                         r"(?:\s|;|$)", s):
+                    self.deny("`sed` con il comando `e` lancia comandi: non verificabile")
+            if inplace:
+                for a in files:
+                    if a.text:
+                        self.target(a, cw)
+        elif name in ("perl",):
+            self.ruby_perl("perl", args, ctx)
+        elif name in ("awk", "gawk", "mawk", "nawk"):
+            self.awk(args, ctx)
+        elif name == "yq":
+            if any(x in ("-i", "--inplace") or x.startswith("--inplace") for x in t):
+                for a in positional({"-o", "--output-format", "-p", "--input-format", "--from-file"}):
+                    self.target(a, cw)
+        elif name in ("cp", "mv", "install", "ln", "rsync", "scp"):
+            if name == "install" and any(x in ("-d", "--directory") for x in t):
+                return
+            tdir = None
+            for i, x in enumerate(t):
+                if x in ("-t", "--target-directory") and i + 1 < len(t):
+                    tdir = rest[i + 1]
+                elif x.startswith("--target-directory="):
+                    tdir = Arg(x.split("=", 1)[1])
+            value_opts = {"-t", "--target-directory", "-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g",
+                          "--group", "-e", "--rsh", "--exclude", "--include", "-f", "--filter", "-P", "-i", "-F",
+                          "-l", "-c"} if name in ("rsync", "scp", "install") else {"-t", "--target-directory", "-S",
+                                                                                   "--suffix"}
+            pos = positional(value_opts)
+            if tdir is not None:
+                dest, sources = tdir, pos
+            elif len(pos) >= 2:
+                dest, sources = pos[-1], pos[:-1]
+            else:
+                return
+            sources = [Arg(s.text, True, s.globby) if ":" in s.text and name in ("rsync", "scp") else s
+                       for s in sources]
+            dir_hint = tdir is not None or any(s.dyn or self.any_dir(s, cw) for s in sources)
+            self.target(dest, cw, sources=sources, dir_hint=dir_hint)
+        elif name == "dd":
+            for x in t:
+                if x.startswith("of="):
+                    self.target(Arg(x[3:]), cw)
+        elif name == "sort":
+            for i, x in enumerate(t):
+                if x in ("-o", "--output") and i + 1 < len(t):
+                    self.target(rest[i + 1], cw)
+                elif x.startswith("--output="):
+                    self.target(Arg(x.split("=", 1)[1]), cw)
+        elif name in ("tar", "bsdtar", "gtar"):
+            extract = any(x in ("--extract", "--get") for x in t) or any(
+                x.startswith("-") and not x.startswith("--") and "x" in x for x in t) or (
+                t and not t[0].startswith("-") and "x" in t[0])
+            if extract:
+                dest = "."
+                for i, x in enumerate(t):
+                    if x in ("-C", "--directory") and i + 1 < len(t):
+                        dest = t[i + 1]
+                    elif x.startswith("--directory="):
+                        dest = x.split("=", 1)[1]
+                self.target(Arg(dest), cw, extract=True)
+        elif name == "unzip":
+            if any(x in ("-l", "-t", "-p", "-Z", "-v") for x in t):
+                return
+            dest = next((t[i + 1] for i, x in enumerate(t[:-1]) if x == "-d"), ".")
+            self.target(Arg(dest), cw, extract=True)
+        elif name in ("7z", "7za", "7zz"):
+            if t and t[0] in ("x", "e"):
+                dest = next((x[2:] for x in t if x.startswith("-o")), ".")
+                self.target(Arg(dest), cw, extract=True)
+        elif name == "cpio":
+            if any(x.startswith("-i") or x == "--extract" for x in t):
+                self.target(Arg("."), cw, extract=True)
+
+    def any_dir(self, a: Arg, cwds: List[Path]) -> bool:
+        for t in self.candidates(a, cwds):
+            for p in self.resolve_all(t, cwds):
+                if p.is_dir():
+                    return True
+        return False
+
+    def target(self, a: Arg, cwds: List[Path], sources: Optional[List[Arg]] = None, dir_hint: bool = False,
+               extract: bool = False) -> None:
+        """Controlla un percorso in cui il comando scrive."""
+        if a.dyn and not a.globby:
+            if not SAFE_DYN_TARGET.match(a.text):
+                self.deny(f"scrittura via shell su un percorso non determinabile ({a.text}): usa Write/Edit")
+            return
+        if a.dyn:
+            self.deny(f"scrittura via shell su un percorso non determinabile ({a.text}): usa Write/Edit")
+            return
+        for t in self.candidates(a, cwds):
+            if t in SAFE_REDIRECT or not t:
+                continue
+            if UNKNOWN_DIR in cwds and not os.path.isabs(os.path.expanduser(t)):
+                base = t.rstrip("/").rsplit("/", 1)[-1]
+                if is_env_name(base) or t.lower().endswith(rules.IAC_EXT) or PROTECTED_RE.search(t):
+                    self.deny(f"scrittura via shell di {t} in una cartella non determinabile: usa Write/Edit")
+            for p in self.resolve_all(t, cwds):
+                self.writes.add(str(p))
+                rel = rules.rel_to_project(str(p), self.proj)
+                if rel is None:
+                    continue
+                is_dir = extract or (sources is not None and (dir_hint or t.endswith("/") or p.is_dir()))
+                self.check_rel(rel, is_dir, sources, cwds)
+
+    def check_rel(self, rel: str, is_dir: bool, sources: Optional[List[Arg]], cwds: List[Path]) -> None:
+        low = rel.lower()
+        shown = rel or "."
+        if self.protect and rules.protected_reason(rel, self.cfg):
+            self.deny(f"scrittura via shell su un file protetto ({shown})")
+            return
+        if low == ".git/config" or low.startswith(".git/hooks/") or low == ".git/hooks":
+            self.deny(f"scrittura via shell di {shown}: gli hook e la configurazione di git possono eseguire comandi")
+            return
+        if is_env_name(low.rsplit("/", 1)[-1]):
+            self.deny(f"scrittura via shell di {shown}: i file .env si scrivono con Write/Edit, così le regole "
+                      "valutano il contenuto")
+            return
+        irel = rules.infra_rel(rel, self.cfg)
+        if irel is not None and not is_dir and rules.is_iac_file(irel):
+            self.deny(f"scrittura via shell di {shown}: i file IaC si scrivono con Write/Edit, così le regole di "
+                      "kynfra valutano il contenuto")
+            return
+        if not is_dir or not self.in_infra_scope(rel):
+            return
+        if sources is None:
+            self.deny(f"estrazione di archivi in {shown}: può creare file IaC senza passare dalle regole")
+            return
+        for s in sources:
+            if s.dyn:
+                self.deny(f"copia via shell in {shown} da una sorgente non determinabile: usa Write/Edit")
+                return
+            for t in self.candidates(s, cwds):
+                base = t.rstrip("/").rsplit("/", 1)[-1]
+                sub = (irel + "/" if irel else "") + base if irel is not None else base
+                if is_env_name(base) or base.lower().endswith(rules.IAC_EXT) or rules.is_iac_file(sub) \
+                        or re.search(r"[*?\[]", t) or self.dir_has_iac(t, cwds):
+                    self.deny(f"copia via shell di {t} in {shown}: i file IaC si scrivono con Write/Edit, così le "
+                              "regole di kynfra valutano il contenuto")
+                    return
+
+    def in_infra_scope(self, rel: str) -> bool:
+        root = self.cfg.get("infra_root", ".")
+        if root in ("", "."):
+            return True
+        return rel in ("", root) or rel.startswith(root + "/") or root.startswith(rel + "/")
+
+    def dir_has_iac(self, t: str, cwds: List[Path]) -> bool:
+        for p in self.resolve_all(t, cwds):
+            if not p.is_dir():
+                continue
+            seen = 0
+            for _dirpath, _dirs, files in os.walk(p):
+                for f in files:
+                    seen += 1
+                    if f.lower().endswith(rules.IAC_EXT) or is_env_name(f) or seen > 5000:
+                        return True
+        return False
+
+
+# ---------------------------------------------------------------- lettori di ricette
+
+def _strip_recipe_prefix(line: str) -> str:
+    return re.sub(r"^[\s@+-]+", "", line)
+
+
+def _balanced(text: str, start: int) -> int:
+    """Indice dopo la parentesi che chiude quella aperta in text[start-1]."""
+    level, j = 1, start
+    while j < len(text) and level:
+        if text[j] == "(":
+            level += 1
+        elif text[j] == ")":
+            level -= 1
+        j += 1
+    return j
+
+
+def _make_lines(mf: Path, seen: Set[Path]) -> List[str]:
+    if mf in seen or len(seen) > 20:
+        return []
+    seen.add(mf)
+    text = _read_text(mf) or ""
+    text = re.sub(r"\\\n[ \t]*", " ", text)
+    out: List[str] = []
+    for line in text.split("\n"):
+        m = re.match(r"^\s*-?s?include\s+(.+)$", line)
+        if m and not line.startswith("\t"):
+            for name in m.group(1).split():
+                for inc in sorted(mf.parent.glob(name)) if re.search(r"[*?\[]", name) else [mf.parent / name]:
+                    if inc.is_file():
+                        out += _make_lines(inc, seen)
+            continue
+        out.append(line)
+    return out
+
+
+def make_recipes(mf: Path, goals: List[str], overrides: Dict[str, str]) -> str:
+    """Testo delle ricette che `make <goals>` eseguirebbe (con dipendenze e variabili), più i `$(shell …)`."""
+    lines = _make_lines(mf.resolve(), set())
+    mvars: Dict[str, str] = {"MAKE": "make", "SHELL": "/bin/sh", "CURDIR": str(mf.parent)}
+    rules_: Dict[str, Tuple[List[str], List[str]]] = {}
+    first: Optional[str] = None
+    cur: Optional[List[str]] = None
+    shell_cmds: List[str] = []
+    define: Optional[str] = None
+    buf: List[str] = []
+    for raw in lines:
+        if define is not None:
+            if raw.strip() == "endef":
+                mvars[define] = "\n".join(buf)
+                define, buf = None, []
+            else:
+                buf.append(raw)
+            continue
+        if raw.startswith("\t"):
+            if cur is not None:
+                for t in cur:
+                    rules_[t][1].append(raw[1:])
+            continue
+        line = re.sub(r"(?<!\\)#.*$", "", raw)
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^(?:override\s+|export\s+)*define\s+(\S+)", s)
+        if m:
+            define = m.group(1)
+            continue
+        m = re.match(r"^(?:override\s+|export\s+|private\s+)*([A-Za-z_.][\w.-]*)\s*(::?=|:::=|\?=|\+=|!=|=)\s*(.*)$", s)
+        if m:
+            name, op, val = m.groups()
+            if op == "!=":
+                shell_cmds.append(val)
+                mvars[name] = "$(__kynfra_shell)"
+            elif op == "+=":
+                mvars[name] = (mvars.get(name, "") + " " + val).strip()
+            elif op == "?=":
+                mvars.setdefault(name, val)
+            else:
+                mvars[name] = val
+            cur = None
+            continue
+        if re.match(r"^(?:ifeq|ifneq|ifdef|ifndef|else|endif|export|unexport|vpath|override)\b", s):
+            continue
+        m = re.match(r"^([^:=]+?)\s*::?(?!=)\s*(.*)$", s)
+        if m:
+            targets = m.group(1).split()
+            rest = m.group(2)
+            inline = None
+            if ";" in rest:
+                rest, inline = rest.split(";", 1)
+            if re.match(r"^\s*[A-Za-z_][\w.-]*\s*(?:[:+?]?=)", rest):
+                cur = None
+                continue
+            cur = targets
+            for t in targets:
+                entry = rules_.setdefault(t, ([], []))
+                entry[0].extend(rest.replace("|", " ").split())
+                if inline and inline.strip():
+                    entry[1].append(inline)
+                if first is None and not t.startswith(".") and "%" not in t:
+                    first = t
+            continue
+        cur = None
+    mvars.update(overrides)
+    whole = "\n".join(lines)
+    for m in re.finditer(r"\$[({]shell\s", whole):
+        end = _balanced(whole, m.start() + 2)
+        shell_cmds.append(whole[m.end():end - 1])
+
+    def expand(text: str, target: str = "", stem: str = "") -> str:
+        text = text.replace("$$", "\0")
+        text = re.sub(r"\$(?:@|\(@\)|\{@\})", lambda _m: target, text)
+        text = re.sub(r"\$(?:\*|\(\*\)|\{\*\})", lambda _m: stem or target, text)
+        text = re.sub(r"\$[<^+?|]", "x", text)
+        for _ in range(10):
+            new = re.sub(r"\$[({]([A-Za-z_.][\w.-]*)[)}]",
+                         lambda mm: mvars[mm.group(1)] if mm.group(1) in mvars else "$__kynfra_mk_" +
+                         re.sub(r"\W", "_", mm.group(1)), text)
+            if new == text:
+                break
+            text = new
+        return text.replace("\0", "$")
+
+    goals = goals or ([mvars[".DEFAULT_GOAL"].strip()] if mvars.get(".DEFAULT_GOAL") else [first] if first else [])
+    out = [expand(c) for c in shell_cmds]
+    seen: Set[str] = set()
+    queue = list(goals)
+    fallback = False
+    while queue:
+        g = queue.pop(0)
+        if g in seen or len(seen) > 500:
+            continue
+        seen.add(g)
+        if g in rules_:
+            prereqs, recipes = rules_[g]
+            out += [_strip_recipe_prefix(expand(r, g)) for r in recipes]
+            queue += expand(" ".join(prereqs), g).split()
+            continue
+        matched = False
+        for pat, (prereqs, recipes) in rules_.items():
+            if "%" not in pat:
+                continue
+            m = re.fullmatch(re.escape(pat).replace("%", "(.+)"), g)
+            if m:
+                matched = True
+                out += [_strip_recipe_prefix(expand(r, g, m.group(1))) for r in recipes]
+                queue += expand(" ".join(prereqs).replace("%", m.group(1)), g).split()
+        if not matched and g in goals:
+            fallback = True
+    if fallback:
+        out += [_strip_recipe_prefix(expand(r, t)) for t, (_, recipes) in rules_.items() for r in recipes]
+    return "\n".join(out)
+
+
+def _unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    return v
+
+
+def just_recipes(jf: Path, names: List[str]) -> str:
+    """Testo delle ricette di un justfile che `just <names>` eseguirebbe (dipendenze comprese)."""
+    lines = (_read_text(jf) or "").split("\n")
+    jvars: Dict[str, str] = {}
+    recipes: Dict[str, Tuple[List[str], List[str]]] = {}
+    aliases: Dict[str, str] = {}
+    order: List[str] = []
+    shell_cmds: List[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        i += 1
+        if not ln.strip() or ln[0] in " \t" or ln.startswith(("#", "[", "set ", "import ", "mod ")):
+            continue
+        m = re.match(r"^alias\s+([\w-]+)\s*:=\s*([\w-]+)", ln)
+        if m:
+            aliases[m.group(1)] = m.group(2)
+            continue
+        m = re.match(r"^(?:export\s+)?([A-Za-z_][\w-]*)\s*:=\s*(.*)$", ln)
+        if m:
+            val = m.group(2).strip()
+            if val.startswith("`"):
+                shell_cmds.append(val.strip("`"))
+            jvars[m.group(1)] = _unquote(val)
+            continue
+        m = re.match(r"^@?([A-Za-z_][\w-]*)([^:]*?):(?!=)(.*)$", ln)
+        if not m:
+            continue
+        name, deps_text = m.group(1), m.group(3)
+        deps = [d for d in re.sub(r"\([^)]*\)|&&", " ", deps_text).split() if re.fullmatch(r"[\w-]+", d)]
+        body: List[str] = []
+        while i < len(lines) and (not lines[i].strip() or lines[i][0] in " \t"):
+            body.append(lines[i].strip())
+            i += 1
+        recipes[name] = (deps, body)
+        order.append(name)
+
+    def sub(text: str) -> str:
+        return re.sub(r"\{\{\s*([^}]*?)\s*\}\}", lambda mm: jvars.get(mm.group(1), "$__kynfra_just_" + re.sub(
+            r"\W", "_", mm.group(1))), text)
+
+    wanted = [aliases.get(n, n) for n in names if aliases.get(n, n) in recipes]
+    if not wanted:
+        wanted = list(order) if names else order[:1]
+    out = [sub(c) for c in shell_cmds]
+    seen: Set[str] = set()
+    queue = list(wanted)
+    while queue:
+        r = queue.pop(0)
+        if r in seen or r not in recipes:
+            continue
+        seen.add(r)
+        deps, body = recipes[r]
+        queue += deps
+        text = "\n".join(sub(_strip_recipe_prefix(b)) for b in body if b)
+        if body and body[0].startswith("#!") and re.search(r"python|node|ruby|perl|php|deno|bun", body[0]):
+            out.append("python3 -c " + shlex.quote(text))
+        else:
+            out.append(text)
+    return "\n".join(out)
+
+
+def task_recipes(tf: Path, names: List[str], overrides: Dict[str, str]) -> str:
+    """Comandi dei task di un Taskfile che `task <names>` eseguirebbe (lettura euristica dello YAML)."""
+    lines = (_read_text(tf) or "").split("\n")
+    tvars: Dict[str, str] = {}
+    blocks: Dict[str, List[str]] = {}
+    section = None
+    child_indent = None
+    cur = None
+    for ln in lines:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        ind = len(ln) - len(ln.lstrip(" "))
+        if ind == 0:
+            section = ln.split(":", 1)[0].strip()
+            child_indent = None
+            continue
+        if section == "vars":
+            m = re.match(r"^\s+([\w-]+)\s*:\s*(.+)$", ln)
+            if m and not m.group(2).strip().startswith(("{", "|")):
+                tvars[m.group(1)] = _unquote(m.group(2))
+        if section != "tasks":
+            continue
+        if child_indent is None:
+            child_indent = ind
+        if ind == child_indent:
+            m = re.match(r"^\s*['\"]?([\w:.*-]+)['\"]?\s*:\s*(.*)$", ln)
+            if m:
+                cur = m.group(1)
+                blocks[cur] = [m.group(2)] if m.group(2).strip() else []
+            continue
+        if cur is not None:
+            blocks[cur].append(ln)
+    tvars.update(overrides)
+    shell_cmds = [_unquote(m.group(1)) for ln in lines for m in [re.match(r"^\s*(?:-\s*)?sh\s*:\s*(.+)$", ln)] if m]
+
+    def sub(text: str) -> str:
+        return re.sub(r"\{\{\s*\.?([^}]*?)\s*\}\}", lambda mm: tvars.get(mm.group(1), "$__kynfra_task_" + re.sub(
+            r"\W", "_", mm.group(1))), text)
+
+    def commands(block: List[str]) -> Tuple[List[str], List[str]]:
+        cmds, deps = [], []
+        in_deps = False
+        for ln in block:
+            s = ln.strip()
+            item = s.startswith("- ")
+            if item:
+                s = s[2:].strip()
+            m = re.match(r"^deps\s*:\s*(.*)$", s)
+            if m:
+                inline = m.group(1).strip()
+                in_deps = not inline
+                deps += [_unquote(d) for d in inline.strip("[]").split(",") if d.strip()]
+                continue
+            m = re.match(r"^task\s*:\s*(\S+)", s)
+            if m:
+                deps.append(_unquote(m.group(1)))
+                continue
+            if in_deps and item:
+                deps.append(_unquote(s))
+                continue
+            m = re.match(r"^(?:cmd|cmds|sh)\s*:\s*(.*)$", s)
+            if m:
+                in_deps = False
+                s = m.group(1).strip()
+                if not s:
+                    continue
+            elif re.match(r"^[\w-]+\s*:(?:\s|$)", s):
+                in_deps = False
+                continue
+            if s in ("|", ">", "|-", ">-", "|+", ">+", ""):
+                continue
+            cmds.append(sub(_unquote(s)))
+        return cmds, deps
+
+    wanted = names or ["default"]
+    fallback = any(n not in blocks for n in wanted)
+    out = [sub(c) for c in shell_cmds]
+    seen: Set[str] = set()
+    queue = list(blocks) if fallback else list(wanted)
+    while queue:
+        n = queue.pop(0)
+        if n in seen or n not in blocks:
+            continue
+        seen.add(n)
+        cmds, deps = commands(blocks[n])
+        out += cmds
+        queue += deps
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- interfaccia
+
+def command_text(event: dict) -> str:
+    ti = event.get("tool_input") or {}
+    if isinstance(ti, str):
+        return ti
+    cmd = ti.get("command") if isinstance(ti, dict) else None
+    if isinstance(cmd, list):
+        cmd = " ".join(shlex.quote(str(c)) for c in cmd)
+    return cmd if isinstance(cmd, str) else ""
+
+
+def analyze(cmd: str, cwd: Path, proj: Path, cfg: dict) -> Analyzer:
+    an = Analyzer(proj, cfg, cwd)
+    try:
+        an.script(cmd, [cwd], 0)
+        an.finish()
+    except RecursionError:
+        an.deny("comando annidato troppo in profondità: non verificabile")
+    except Exception as e:  # una guardia che si rompe non deve lasciar passare il comando
+        an.deny(f"analisi del comando non riuscita ({type(e).__name__}): non verificabile")
+    return an
+
+
+def check(cmd: str, cwd: Path, proj: Path, cfg: dict) -> List[str]:
+    """Motivi di rifiuto del comando (vuoto = consentito)."""
+    return analyze(cmd, cwd, proj, cfg).reasons
+
+
+def main() -> int:
+    event = hc.read_event()
+    hc.debug_dump(event, "bash")
+    cmd = command_text(event)
+    if not cmd.strip():
+        return 0
+    cwd = Path(event.get("cwd") or os.getcwd()).resolve()
+    projects = [rules.find_project_dir(str(cwd))]
+    if rules.load_config(projects[0]) is None:
+        projects = rules.discover_projects(cwd)
+    reasons: List[str] = []
+    tool = False
+    for proj in projects:
+        cfg = rules.load_config(proj)
+        if cfg is None:
+            continue
+        hc.record_baseline(event, proj)
+        an = analyze(cmd, cwd, proj, cfg)
+        tool = tool or an.tool
+        for r in an.reasons:
+            if r not in reasons:
+                reasons.append(r)
+    if not reasons:
+        return 0
+    reason = ("Comando rifiutato dalle regole di infrastruttura del progetto (kynfra):\n"
+              + "\n".join(f"- {r}" for r in reasons)
+              + "\nNon aggirare i controlli: segui la skill kynfra-architecture (il codice IaC si scrive con "
+                "Write/Edit; apply, plan e le CLI cloud mutanti li esegue il DevOps).")
+    if tool:
+        reason += "\nPer gli strumenti esterni usa /kynfra:tools (un'installazione approvata per strumento)."
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
