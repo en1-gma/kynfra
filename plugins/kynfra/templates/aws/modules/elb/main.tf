@@ -14,8 +14,8 @@ data "aws_ec2_managed_prefix_list" "cloudfront" {
   name = "com.amazonaws.global.cloudfront.origin-facing"
 }
 
-# Account del servizio ELB della regione: serve solo nelle regioni aperte prima di ap-southeast-3 (dicembre 2021),
-# dove i log di accesso dell'ALB si concedono all'account; nelle regioni successive basta il service principal.
+# Account del servizio ELB della regione: serve solo nelle regioni disponibili prima di agosto 2022, dove i log di
+# accesso dell'ALB si concedono all'account; nelle regioni successive basta il service principal.
 data "aws_elb_service_account" "this" {
   count = local.legacy_elb_account ? 1 : 0
 }
@@ -32,6 +32,9 @@ locals {
   from_internet   = !var.internal && var.allow_from == "internet"
   from_cloudfront = !var.internal && var.allow_from == "cloudfront"
   vpc_cidr        = data.aws_vpc.this.cidr_block
+
+  # load balancer pubblico: solo Host = domain_name arriva ai target; interno: tutto (es. VPC link di API Gateway)
+  host_routing = !var.internal
 
   legacy_elb_account = contains(var.legacy_elb_regions, local.region)
 
@@ -457,8 +460,9 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# ALB: 443 con TLS 1.3/1.2; le richieste con un Host diverso da domain_name (scanner, accesso per IP o per il nome
-# *.elb.amazonaws.com) ricevono 404, quelle per domain_name vanno al gruppo di default con la regola "app".
+# ALB: 443 con TLS 1.3/1.2. Pubblico: le richieste con un Host diverso da domain_name (scanner, accesso per IP o per
+# il nome *.elb.amazonaws.com) ricevono 404, quelle per domain_name vanno al gruppo di default con la regola "app".
+# Interno: il default action inoltra al gruppo di default (i client della VPC, come un VPC link, usano altri Host).
 resource "aws_lb_listener" "https" {
   count = local.is_alb ? 1 : 0
 
@@ -469,18 +473,23 @@ resource "aws_lb_listener" "https" {
   certificate_arn   = aws_acm_certificate_validation.this.certificate_arn
 
   default_action {
-    type = "fixed-response"
+    type             = local.host_routing ? "fixed-response" : "forward"
+    target_group_arn = local.host_routing ? null : aws_lb_target_group.this.arn
 
-    fixed_response {
-      content_type = "text/plain"
-      message_body = "Not Found"
-      status_code  = "404"
+    dynamic "fixed_response" {
+      for_each = local.host_routing ? toset(["404"]) : toset([])
+
+      content {
+        content_type = "text/plain"
+        message_body = "Not Found"
+        status_code  = fixed_response.value
+      }
     }
   }
 }
 
 resource "aws_lb_listener_rule" "app" {
-  count = local.is_alb ? 1 : 0
+  count = local.is_alb && local.host_routing ? 1 : 0
 
   listener_arn = aws_lb_listener.https[0].arn
   priority     = 100
@@ -497,7 +506,8 @@ resource "aws_lb_listener_rule" "app" {
   }
 }
 
-# NLB: 443 TLS terminato sul load balancer, inoltro TCP ai target.
+# NLB: 443 TLS terminato sul load balancer, inoltro TCP ai target. Nessuna alpn_policy (default None): con
+# HTTP2Preferred i client negozierebbero h2 e un target HTTP/1.1 dietro un gruppo TCP non lo capirebbe.
 resource "aws_lb_listener" "tls" {
   count = local.is_alb ? 0 : 1
 
@@ -506,7 +516,6 @@ resource "aws_lb_listener" "tls" {
   protocol          = "TLS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = aws_acm_certificate_validation.this.certificate_arn
-  alpn_policy       = "HTTP2Preferred"
 
   default_action {
     type             = "forward"
@@ -589,6 +598,38 @@ resource "aws_wafv2_web_acl" "this" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${local.name}-lb-aws-ip-reputation"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Anonymous IP list: VPN, Tor e proxy anonimi bloccati; HostingProviderIPList (indirizzi di cloud e hosting,
+  # da cui arrivano anche client legittimi come integrazioni server-to-server) solo contato.
+  rule {
+    name     = "aws-anonymous-ip"
+    priority = 35
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesAnonymousIpList"
+        vendor_name = "AWS"
+
+        rule_action_override {
+          name = "HostingProviderIPList"
+
+          action_to_use {
+            count {}
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-lb-aws-anonymous-ip"
       sampled_requests_enabled   = true
     }
   }

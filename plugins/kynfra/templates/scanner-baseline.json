@@ -92,12 +92,6 @@
       "reason": "enable_deletion_protection = var.deletion_protection: in prod la variabile è obbligatoriamente true (validazione del modulo, env_defaults e regola prod_toggles di kynfra sui tfvars di prod); in dev e staging resta false per permettere il destroy. Il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
     },
     {
-      "id": "CKV2_AWS_76",
-      "envs": "*",
-      "paths": ["modules/elb/**"],
-      "reason": "Il web ACL regionale è associato all'ALB solo con waf_enabled (aws_wafv2_web_acl_association con count) e include AWSManagedRulesKnownBadInputsRuleSet (regole Log4JRCE) senza override. In prod waf_enabled è obbligatorio per l'ALB (validazione del modulo ed env_defaults); l'NLB non supporta WAF. Il controllo scatta sul file del modulo, dove l'ambiente non è noto."
-    },
-    {
       "id": "CKV_AWS_18",
       "envs": "*",
       "paths": ["modules/elb/**"],

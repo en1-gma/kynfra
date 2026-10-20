@@ -72,11 +72,19 @@ class ElbPatternTest(unittest.TestCase):
         self.assertRegex(https, r'protocol\s*=\s*"HTTPS"')
         self.assertRegex(https, r'ssl_policy\s*=\s*"ELBSecurityPolicy-TLS13-1-2-2021-06"')
         self.assertRegex(https, r"certificate_arn\s*=\s*aws_acm_certificate_validation\.this\.certificate_arn")
-        self.assertRegex(https, r'type\s*=\s*"fixed-response"')
-        self.assertRegex(https, r'status_code\s*=\s*"404"')
+        # pubblico: 404 di default e regola host; interno: forward al target group
+        self.assertRegex(https, r'type\s*=\s*local\.host_routing \? "fixed-response" : "forward"')
+        self.assertRegex(https, r"target_group_arn\s*=\s*local\.host_routing \? null : "
+                                r"aws_lb_target_group\.this\.arn")
+        self.assertRegex(https, r'for_each = local\.host_routing \? toset\(\["404"\]\) : toset\(\[\]\)')
+        self.assertRegex(text, r"host_routing\s*=\s*!var\.internal")
+        self.assertRegex(block(text, 'resource "aws_lb_listener_rule" "app"'),
+                         r"count\s*=\s*local\.is_alb && local\.host_routing \? 1 : 0")
         tls = block(text, 'resource "aws_lb_listener" "tls"')
         self.assertRegex(tls, r'protocol\s*=\s*"TLS"')
         self.assertRegex(tls, r'ssl_policy\s*=\s*"ELBSecurityPolicy-TLS13-1-2-2021-06"')
+        # nessuna ALPN: con un target group TCP h2 romperebbe i target HTTP/1.1
+        self.assertNotIn("alpn_policy =", text)
         lb = block(text, 'resource "aws_lb" "this"')
         for pattern in (r"drop_invalid_header_fields\s*=\s*true", r"enable_deletion_protection\s*=\s*"
                         r"var\.deletion_protection", r"enabled\s*=\s*true"):
@@ -131,6 +139,17 @@ class ElbPatternTest(unittest.TestCase):
         self.assertRegex(assoc, r"count\s*=\s*var\.waf_enabled \? 1 : 0")
         self.assertRegex(block(text, 'resource "aws_wafv2_web_acl" "this"'), r'scope\s*=\s*"REGIONAL"')
         self.assertRegex(self.stack("prod", "main.tf"), r"deletion_protection\s*=\s*var\.deletion_protection")
+        acl = block(text, 'resource "aws_wafv2_web_acl" "this"')
+        for group in ("AWSManagedRulesKnownBadInputsRuleSet", "AWSManagedRulesAnonymousIpList"):
+            self.assertIn(f'"{group}"', acl)
+        override = acl.split('"AWSManagedRulesAnonymousIpList"', 1)[1].split("visibility_config", 1)[0]
+        self.assertRegex(override, r'rule_action_override \{\s*name\s*=\s*"HostingProviderIPList"\s*'
+                                   r'action_to_use \{\s*count \{\}')
+
+    def test_elb_waf_rejected_on_nlb(self):
+        waf = block(self.module("variables.tf"), 'variable "waf_enabled"')
+        self.assertIn('condition     = !(var.waf_enabled && var.type == "nlb")', waf)
+        self.assertIn('condition     = var.environment != "prod" || var.waf_enabled || var.type == "nlb"', waf)
 
     def test_elb_access_log_bucket_policy(self):
         text = self.module("main.tf")
@@ -142,7 +161,10 @@ class ElbPatternTest(unittest.TestCase):
         self.assertRegex(block(text, 'data "aws_elb_service_account" "this"'),
                          r"count\s*=\s*local\.legacy_elb_account \? 1 : 0")
         self.assertRegex(text, r"legacy_elb_account\s*=\s*contains\(var\.legacy_elb_regions, local\.region\)")
-        self.assertIn('"eu-south-1"', block(self.module("variables.tf"), 'variable "legacy_elb_regions"'))
+        legacy = block(self.module("variables.tf"), 'variable "legacy_elb_regions"')
+        for region in ("eu-south-1", "ap-southeast-3"):
+            self.assertIn(f'"{region}"', legacy)
+        self.assertIn("prima di agosto 2022", legacy)
         sse = block(text, 'resource "aws_s3_bucket_server_side_encryption_configuration" "logs"')
         self.assertIn('"AES256"', sse)
 

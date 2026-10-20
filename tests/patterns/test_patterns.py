@@ -63,10 +63,12 @@ def with_requires(provider: str, pattern: str, seen=None) -> list:
 # combinazioni di input in più per pattern: ognuna diventa un test con gli stessi controlli
 VARIANTS = {
     "spa": [{"hosted_zone": "existing:Z0123456789ABCDEFGHIJ", "api_origin": "backend"}],
-    # NLB interno (listener TLS, niente WAF né porta 80) e ALB pubblico raggiungibile solo da CloudFront
+    # NLB interno (listener TLS, niente WAF né porta 80), ALB pubblico raggiungibile solo da CloudFront, NLB pubblico
     "elb": [{"type": "nlb", "internal": "true", "waf_enabled": "false",
              "hosted_zone": "existing:Z0123456789ABCDEFGHIJ", "target_port": "9000"},
-            {"allow_from": "cloudfront", "health_path": "/ready"}],
+            {"allow_from": "cloudfront", "health_path": "/ready"},
+            # NLB pubblico anche in prod: WAF spento (non supportato), deletion protection di prod
+            {"type": "nlb", "waf_enabled": "false"}],
     # replica in un'altra regione e segreti con lettori e Lambda di rotazione (la chiave "_tfvars" sostituisce testo
     # nei terraform.tfvars generati: struttura che il generatore non sa passare)
     "ecr": [{"repositories": "api,worker,jobs-nightly", "keep_last": "50",

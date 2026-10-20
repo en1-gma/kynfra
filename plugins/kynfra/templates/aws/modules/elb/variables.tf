@@ -153,11 +153,11 @@ variable "waf_rate_limit" {
 
 variable "legacy_elb_regions" {
   type        = list(string)
-  description = "Regioni aperte prima di ap-southeast-3 (dicembre 2021), dove gli access log dell'ALB si concedono anche all'account ELB della regione (data aws_elb_service_account); nelle altre basta il service principal logdelivery.elasticloadbalancing.amazonaws.com. Elenco chiuso: le regioni nuove non vanno aggiunte."
+  description = "Regioni disponibili prima di agosto 2022, dove gli access log dell'ALB si concedono anche all'account ELB della regione (data aws_elb_service_account); nelle altre basta il service principal logdelivery.elasticloadbalancing.amazonaws.com. Elenco chiuso: le regioni nuove non vanno aggiunte."
   default = [
     "af-south-1", "ap-east-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1",
-    "ap-southeast-2", "ca-central-1", "cn-north-1", "cn-northwest-1", "eu-central-1", "eu-north-1", "eu-south-1",
-    "eu-west-1", "eu-west-2", "eu-west-3", "me-south-1", "sa-east-1", "us-east-1", "us-east-2", "us-gov-east-1",
-    "us-gov-west-1", "us-west-1", "us-west-2",
+    "ap-southeast-2", "ap-southeast-3", "ca-central-1", "cn-north-1", "cn-northwest-1", "eu-central-1", "eu-north-1",
+    "eu-south-1", "eu-west-1", "eu-west-2", "eu-west-3", "me-south-1", "sa-east-1", "us-east-1", "us-east-2",
+    "us-gov-east-1", "us-gov-west-1", "us-west-1", "us-west-2",
   ]
 }
