@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra review"
+  short_description: "Independent review of infrastructure changes against kynfra"
+  brand_color: "#F59E0B"
+  default_prompt: "Use $kynfra-review to review my infrastructure changes."
+policy:
+  allow_implicit_invocation: true

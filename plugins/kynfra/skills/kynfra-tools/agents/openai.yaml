@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra tools"
+  short_description: "Install external tools one at a time, with approval"
+  brand_color: "#F59E0B"
+  default_prompt: "Use $kynfra-tools to check and install the tools kynfra needs."
+policy:
+  allow_implicit_invocation: false

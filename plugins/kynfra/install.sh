@@ -154,7 +154,7 @@ if [ "$UNINSTALL" = 1 ]; then
   info "Rimuovo kynfra da $TARGET"
   [ -f "$TARGET/CLAUDE.md" ] && write_block "$TARGET/CLAUDE.md" ""
   [ -f "$TARGET/AGENTS.md" ] && write_block "$TARGET/AGENTS.md" ""
-  rm -rf "$TARGET/.claude/rules/kynfra" "$TARGET/.agents/skills/kynfra-"* "$TARGET/.codex/agents/kynfra_"*.toml
+  rm -rf "$TARGET/.claude/rules/kynfra" "$TARGET/.agents/skills/kynfra-"* "$TARGET/.agents/skills/create-"*"-infra-"* "$TARGET/.codex/agents/kynfra_"*.toml
   [ -f "$TARGET/.claude/settings.json" ] && merge_claude_permissions "$TARGET/.claude/settings.json" remove
   [ -f "$TARGET/.codex/hooks.json" ] && merge_codex_hooks "$KIT_DIR/templates/codex-hooks.json" "$TARGET/.codex/hooks.json" remove
   rm -f "$TARGET/.github/workflows/kynfra-check.yml"
@@ -303,6 +303,7 @@ if want_codex; then
   for s in "$KIT_DIR"/skills/*/; do
     [ -d "$s" ] || continue
     name="$(basename "$s")"
+    case "$name" in kynfra-*|create-*-infra-*) ;; *) continue ;; esac
     rm -rf "$TARGET/.agents/skills/$name"
     cp -R "$s" "$TARGET/.agents/skills/$name"
   done
@@ -310,7 +311,7 @@ if want_codex; then
     cp "$a" "$TARGET/.codex/agents/$(basename "$a")"
   done
   merge_codex_hooks "$KIT_DIR/templates/codex-hooks.json" "$TARGET/.codex/hooks.json" add
-  ok "Codex: blocco in AGENTS.md, .agents/skills/kynfra-*, .codex/agents/kynfra_*.toml, .codex/hooks.json"
+  ok "Codex: blocco in AGENTS.md, .agents/skills/{kynfra-*,create-*-infra-*}, .codex/agents/kynfra_*.toml, .codex/hooks.json"
   info "Codex: rendi il progetto trusted e approva gli hook di kynfra alla prima apertura"
 fi
 

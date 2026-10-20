@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra architecture"
+  short_description: "Binding Terraform on AWS rules: layout, state, security"
+  brand_color: "#F59E0B"
+  default_prompt: "Use $kynfra-architecture to check how this infrastructure must be structured."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra init"
+  short_description: "Set up kynfra in this infrastructure project"
+  brand_color: "#F59E0B"
+  default_prompt: "Use $kynfra-init to set up kynfra in this project."
+policy:
+  allow_implicit_invocation: false

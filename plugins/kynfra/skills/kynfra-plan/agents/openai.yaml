@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra plan"
+  short_description: "Plan an AWS infrastructure change with kynfra"
+  brand_color: "#F59E0B"
+  default_prompt: "Use $kynfra-plan to plan this infrastructure change."
+policy:
+  allow_implicit_invocation: true
