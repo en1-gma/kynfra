@@ -137,10 +137,11 @@ class InstallerTest(InstallerCase):
 
     def test_codex_skills_copied_and_uninstalled(self):
         self.run_install()
-        for n in ("kynfra-architecture", "kynfra-init", "kynfra-plan", "kynfra-review", "kynfra-tools"):
+        for n in ("kynfra-architecture", "kynfra-init", "kynfra-plan", "kynfra-review", "kynfra-tools",
+                  "create-network-infra-aws", "create-spa-infra-aws"):
             self.assertTrue((self.d / f".agents/skills/{n}/SKILL.md").is_file(), n)
-        # comandi dei pattern (Task successivi) e skill estranee: l'uninstall toglie i primi, non le seconde
-        for n in ("create-spa-infra-aws", "create-eks-infra-aws", "altra-skill"):
+        # comandi dei pattern (anche di Task successivi) e skill estranee: l'uninstall toglie i primi, non le seconde
+        for n in ("create-eks-infra-aws", "altra-skill"):
             (self.d / f".agents/skills/{n}").mkdir()
             (self.d / f".agents/skills/{n}/SKILL.md").write_text("x")
         self.run_install("--uninstall")

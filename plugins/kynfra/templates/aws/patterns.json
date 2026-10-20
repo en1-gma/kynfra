@@ -1,5 +1,5 @@
 {
-  "_comment": "Registro dei pattern AWS per generate.py. Per pattern: description; requires (pattern da generare prima); inputs {nome: {type: string|bool|number, required, default, help, example (valore usato dalla CI del kit per gli input richiesti senza default)}}; env_defaults {ambiente: {input: valore}} (valori prod-restrittivi, prevalgono sul default ma non su --var); stacks (cartelle di stacks/ copiate in envs/<env>/<stack>/, o envs/shared/<stack>/ se shared); dir (cartella copiata una volta sola sotto infra_root, es. bootstrap); next_steps (passi per il DevOps, con segnaposto). Il modulo, se esiste, sta in modules/<pattern>/.",
+  "_comment": "Registro dei pattern AWS per generate.py. Per pattern: description; requires (pattern da generare prima); inputs {nome: {type: string|bool|number, required, default, help, example (valore usato dalla CI del kit per gli input richiesti senza default)}}; env_defaults {ambiente: {input: valore}} (valori prod-restrittivi, prevalgono sul default ma non su --var); stacks (cartelle di stacks/ copiate in envs/<env>/<stack>/, o envs/shared/<stack>/ se shared); shared_stacks [{stack, when {input: valore}}] (stack copiati una sola volta in envs/shared/<stack>/ se ogni input di when ha quel valore); dir (cartella copiata una volta sola sotto infra_root, es. bootstrap); next_steps (passi per il DevOps, con segnaposto). Il modulo, se esiste, sta in modules/<pattern>/.",
   "bootstrap": {
     "description": "Stato remoto dell'account: bucket S3 <progetto>-tfstate-<account_id> con versioning, SSE-KMS (chiave con rotazione), public access block, policy TLS only e prevent_destroy. Unico root module con backend locale.",
     "requires": [],
@@ -53,6 +53,58 @@
       "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/network && {{ iac_cli }} init && {{ iac_cli }} plan -out=network.tfplan && {{ iac_cli }} apply network.tfplan",
       "Costi fissi: NAT gateway (uno per zona in prod) ed endpoint VPC interface (cinque per ogni zona): in dev e staging un solo NAT",
       "Gli stack elb ed eks leggono vpc_id e le subnet con terraform_remote_state (chiave {{ project }}/<env>/network.tfstate)"
+    ]
+  },
+  "spa": {
+    "description": "Hosting di una SPA: bucket S3 privato servito solo da CloudFront con OAC, certificato ACM in us-east-1 con validazione DNS, record Route53 alias A/AAAA, HTTPS obbligatorio con TLS >= 1.2, routing client-side con CloudFront Function (niente risposte d'errore 403/404 riscritte), headers di sicurezza (HSTS, CSP, nosniff, frame DENY), cache rispettosa del Cache-Control con index.html mai in cache, log di accesso v2 su un bucket dedicato, WAF con managed rule set e rate limit (obbligatorio in prod), /api/* opzionale verso l'API Gateway dello stack backend.",
+    "requires": [],
+    "inputs": {
+      "domain_name": {
+        "type": "string",
+        "required": true,
+        "example": "app.example.com",
+        "help": "Dominio pubblico della SPA (es. app.example.com)"
+      },
+      "hosted_zone": {
+        "type": "string",
+        "required": true,
+        "example": "create",
+        "help": "Zona Route53: create (zona nuova in envs/shared/dns, nome = domain_name) oppure existing:<zone_id>"
+      },
+      "api_origin": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "backend per servire /api/* dall'API Gateway dello stack backend; vuoto = nessuna API"
+      },
+      "waf_enabled": {
+        "type": "bool",
+        "default": false,
+        "help": "WAF con managed rule set e rate limit davanti a CloudFront (sempre attivo in prod)"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "waf_enabled": true
+      }
+    },
+    "stacks": [
+      "spa"
+    ],
+    "shared": false,
+    "shared_stacks": [
+      {
+        "stack": "dns",
+        "when": {
+          "hosted_zone": "create"
+        }
+      }
+    ],
+    "next_steps": [
+      "Con hosted_zone=create, prima la zona: cd {{ infra_root }}/envs/shared/dns && {{ iac_cli }} init && {{ iac_cli }} plan -out=dns.tfplan && {{ iac_cli }} apply dns.tfplan; poi delega i name_servers dal registrar (o dalla zona padre) prima degli stack spa, altrimenti la validazione ACM non termina",
+      "Il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/spa && {{ iac_cli }} init && {{ iac_cli }} plan -out=spa.tfplan && {{ iac_cli }} apply spa.tfplan",
+      "Con api_origin=backend applica prima lo stack backend dello stesso ambiente (output api_domain_name e api_origin_path, chiave {{ project }}/<env>/backend.tfstate)",
+      "Deploy del frontend: carica la build nel bucket bucket_name con Cache-Control \"public, max-age=31536000, immutable\" sugli asset con hash e \"no-cache\" su index.html, poi invalida /index.html sulla distribuzione distribution_id; il ruolo di deploy ha bisogno solo di s3:PutObject/s3:DeleteObject/s3:ListBucket sul bucket e cloudfront:CreateInvalidation sulla distribuzione"
     ]
   }
 }

@@ -30,6 +30,54 @@
       "envs": "*",
       "paths": ["modules/network/**"],
       "reason": "Flow log della VPC: 90 giorni in dev e staging per contenere i costi. In prod il modulo impone almeno 365 giorni con una validazione di flow_log_retention_days (environment = prod), quindi la voce non nasconde regressioni di prod; il default di prod è 365 da env_defaults. Il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
+    },
+    {
+      "id": "CKV_AWS_86",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "La distribuzione usa i log di accesso standard v2 (aws_cloudwatch_log_delivery_source/destination/delivery verso il bucket dei log del modulo), verificati dalla regola cloudfront-https di kynfra; il controllo di Checkov riconosce solo il logging_config legacy, che richiede ACL sul bucket e non consegna nei bucket di regioni opt-in come eu-south-1."
+    },
+    {
+      "id": "CKV_AWS_310",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Origin unico: il bucket S3 regionale, durevole per costruzione. Il failover richiederebbe un secondo bucket replicato in un'altra regione con un origin group: è una scelta di disponibilità del DevOps, non un default del kit."
+    },
+    {
+      "id": "CKV_AWS_374",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Una SPA pubblica non ha un elenco di paesi noto al kit: la geo restriction si attiva nel modulo (restrictions.geo_restriction) quando il progetto ha vincoli legali o di mercato; il WAF di prod blocca già IP con cattiva reputazione e client oltre il rate limit."
+    },
+    {
+      "id": "CKV2_AWS_47",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Il web ACL è collegato solo con waf_enabled (web_acl_id = var.waf_enabled ? aws_wafv2_web_acl.this[0].arn : null) e quando c'è include AWSManagedRulesKnownBadInputsRuleSet (regole Log4JRCE) senza override. In prod waf_enabled è obbligatorio (validazione del modulo, env_defaults e regola prod_toggles di kynfra); il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
+    },
+    {
+      "id": "CKV2_AWS_62",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Bucket della SPA e dei log: scritti solo dal deploy del frontend e dai servizi di log; le notifiche di eventi non hanno un destinatario e non aggiungono protezione."
+    },
+    {
+      "id": "CKV_AWS_144",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Bucket della SPA (ricostruibile dalla pipeline del frontend) e dei log (scadenza a 365 giorni), entrambi con versioning: la replica in un'altra regione richiede un secondo bucket e un ruolo IAM ed è una scelta del DevOps, non un default del kit."
+    },
+    {
+      "id": "CKV_AWS_145",
+      "envs": "*",
+      "paths": ["modules/spa/**"],
+      "reason": "Cifratura SSE-S3 (AES256) scelta: i file della SPA sono pubblici tramite CloudFront, una chiave KMS non aggiungerebbe riservatezza e richiederebbe kms:Decrypt per CloudFront a ogni miss; il bucket dei log riceve i log di accesso S3, la cui destinazione ammette solo SSE-S3 come cifratura di default."
+    },
+    {
+      "id": "CKV2_AWS_38",
+      "envs": "*",
+      "paths": ["envs/shared/dns/**"],
+      "reason": "La firma DNSSEC richiede una chiave KMS asimmetrica ECC_NIST_P256, che non ammette la rotazione automatica (in contrasto con kms-rotation) e il record DS dal registrar: si attiva come passo manuale del DevOps (aws_route53_key_signing_key e aws_route53_hosted_zone_dnssec) quando il dominio lo richiede. I log delle query della zona sono attivi."
     }
   ],
   "trivy": []

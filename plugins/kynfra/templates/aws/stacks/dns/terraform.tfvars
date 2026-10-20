@@ -1,0 +1,7 @@
+project     = "{{ project }}"
+environment = "{{ environment }}"
+region      = "{{ region }}"
+account_id  = "{{ account_id }}"
+owner       = "{{ owner }}"
+cost_center = "{{ cost_center }}"
+domain_name = "{{ domain_name }}"

@@ -259,6 +259,46 @@ class FakeTemplatesTest(FakeTemplatesBase):
                               {"domain": "a.com", "deletion_protection": "yes"})
 
 
+class SharedStacksTest(FakeTemplatesBase):
+    """shared_stacks: stack condivisi (envs/shared/<stack>/) generati una sola volta se gli input combaciano."""
+
+    def setUp(self):
+        super().setUp()
+        data = json.loads((self.tpl / "aws/patterns.json").read_text())
+        data["site"] = {"requires": [], "stacks": ["site"], "shared": False,
+                        "inputs": {"zone": {"type": "string", "required": True, "help": "zona"}},
+                        "shared_stacks": [{"stack": "dns", "when": {"zone": "create"}}]}
+        (self.tpl / "aws/patterns.json").write_text(json.dumps(data))
+        for stack in ("site", "dns"):
+            (self.tpl / "aws/stacks" / stack).mkdir(parents=True)
+            (self.tpl / "aws/stacks" / stack / "terraform.tfvars").write_text(
+                'environment = "{{ environment }}"\nkey = "{{ state_key }}"\nzone = "{{ zone }}"\n')
+
+    def test_shared_stack_generated_once_when_condition_matches(self):
+        res = generate.generate(self.d, self.cfg, "aws", "site", ["dev", "prod"], {"zone": "create"})
+        self.assertEqual(res["created"], ["infra/envs/dev/site/terraform.tfvars", "infra/envs/prod/site/terraform.tfvars",
+                                          "infra/envs/shared/dns/terraform.tfvars"])
+        shared = (self.d / "infra/envs/shared/dns/terraform.tfvars").read_text()
+        self.assertIn('environment = "shared"', shared)
+        self.assertIn('key = "acme/shared/dns.tfstate"', shared)
+
+    def test_shared_stack_skipped_when_condition_differs(self):
+        res = generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "existing:Z123"})
+        self.assertEqual(res["created"], ["infra/envs/dev/site/terraform.tfvars"])
+        self.assertFalse((self.d / "infra/envs/shared").exists())
+
+    def test_shared_stack_accepts_account_var(self):
+        res = generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "create", "account": "main"})
+        self.assertIn("infra/envs/shared/dns/terraform.tfvars", res["created"])
+
+    def test_shared_stack_bad_spec_rejected(self):
+        data = json.loads((self.tpl / "aws/patterns.json").read_text())
+        data["site"]["shared_stacks"] = [{"when": {"zone": "create"}}]
+        (self.tpl / "aws/patterns.json").write_text(json.dumps(data))
+        with self.assertRaises(generate.GenerateError):
+            generate.generate(self.d, self.cfg, "aws", "site", ["dev"], {"zone": "create"})
+
+
 def clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PROJECT_DIR", "KYNFRA_PROJECT_DIR")}
 

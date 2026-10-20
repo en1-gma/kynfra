@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra SPA (AWS)"
+  short_description: "Generate AWS hosting for a single-page app with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-spa-infra-aws to generate the SPA hosting stack (S3, CloudFront with OAC, ACM, Route53, WAF)."
+policy:
+  allow_implicit_invocation: false

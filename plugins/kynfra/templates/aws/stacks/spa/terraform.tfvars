@@ -1,0 +1,11 @@
+project      = "{{ project }}"
+environment  = "{{ environment }}"
+region       = "{{ region }}"
+account_id   = "{{ account_id }}"
+owner        = "{{ owner }}"
+cost_center  = "{{ cost_center }}"
+state_bucket = "{{ state_bucket }}"
+domain_name  = "{{ domain_name }}"
+hosted_zone  = "{{ hosted_zone }}"
+api_origin   = "{{ api_origin }}"
+waf_enabled  = {{ waf_enabled }}
