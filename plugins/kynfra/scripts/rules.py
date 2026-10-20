@@ -11,7 +11,7 @@ import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 CONFIG_REL = ".kynfra/config.json"
 
@@ -305,6 +305,64 @@ def check_layout(rel: str, cfg: dict) -> List[Finding]:
         return []
     return bad("sotto infra_root sono ammessi solo bootstrap/, modules/<pattern>/, envs/<ambiente>/<stack>/, "
                "native/<pattern>/")
+
+
+# ---------------------------------------------------------------- contenuto dei file
+
+# Regole dei provider (Task 6+): provider in cfg["providers"] → funzioni (irel, blocks, text, cfg) -> List[Finding].
+PROVIDER_RULES: Dict[str, List[Callable]] = {}
+
+
+def _rule_name(fn: Callable) -> str:
+    return getattr(fn, "__name__", "hcl-syntax").replace("_", "-")
+
+
+def _post_process(findings: List[Finding], cfg: dict) -> List[Finding]:
+    """Severità da cfg["rules"] ("off" elimina il finding); le eccezioni si aggiungono qui (Task 7)."""
+    out: List[Finding] = []
+    for f in findings:
+        sev = cfg["rules"].get(f.rule, f.severity)
+        if sev == "off":
+            continue
+        f.severity = sev
+        out.append(f)
+    return out
+
+
+def check_content(rel: str, text: str, cfg: dict) -> List[Finding]:
+    """Regole sul contenuto di un file IaC (percorso relativo al progetto): sintassi (fail closed), regole comuni,
+    regole dei provider in config; [] per file fuori da infra_root o non IaC. I file in native/ (YAML/JSON/Bicep)
+    non si leggono come HCL: solo segreti, soppressioni dello scanner e parametri."""
+    irel = infra_rel(rel, cfg)
+    if irel is None or not is_iac_file(irel):
+        return []
+    import hcl
+    import rules_common
+
+    filename = posixpath.basename(irel).lower()
+    findings: List[Finding] = []
+    if rules_common._native(irel):
+        blocks: list = []
+        fns: List[Callable] = list(rules_common.NATIVE_RULES)
+    else:
+        for line, msg in hcl.parse_problems(text, filename):
+            findings.append(Finding("hcl-syntax", "block", irel, line,
+                                    f"file non leggibile per intero ({msg}): correggi la sintassi, i guardrail non "
+                                    "possono verificare ciò che non leggono"))
+        blocks = hcl.parse(text, filename)
+        fns = list(rules_common.COMMON_RULES)
+        for prov in cfg.get("providers") or []:
+            fns.extend(PROVIDER_RULES.get(prov, []))
+    for fn in fns:
+        try:
+            findings.extend(fn(irel, blocks, text, cfg))
+        except Exception as e:  # fail closed: una regola che si rompe blocca invece di tacere
+            findings.append(Finding(_rule_name(fn), "block", irel, 0,
+                                    f"errore interno della regola ({type(e).__name__}): segnala il problema e "
+                                    "verifica il file a mano"))
+    for f in findings:
+        f.path = rel
+    return _post_process(findings, cfg)
 
 
 # ---------------------------------------------------------------- scansione progetto
