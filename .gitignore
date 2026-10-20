@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+.tmp/
+.claude/scheduled_tasks.lock
+.terraform/
+.kynfra/bin/
+.kynfra/venv/

@@ -1,0 +1,12 @@
+{
+  "name": "kynfra",
+  "version": "0.1.0",
+  "description": "Know Your Infrastructure: guarded, predictable Terraform for AWS (then Azure, Vercel) — remote state, pinned versions, mandatory tags, no secrets, no apply from the agent.",
+  "author": {
+    "name": "Vincenzo Chiavetta"
+  },
+  "license": "MIT",
+  "keywords": ["terraform", "opentofu", "aws", "iac", "devops", "security", "guardrails", "hooks"],
+  "homepage": "https://github.com/en1-gma/kynfra",
+  "repository": "https://github.com/en1-gma/kynfra"
+}

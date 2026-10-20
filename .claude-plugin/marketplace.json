@@ -1,0 +1,14 @@
+{
+  "name": "kynfra",
+  "owner": {
+    "name": "Vincenzo Chiavetta"
+  },
+  "description": "Know Your Infrastructure: guarded, predictable Terraform for AWS (then Azure, Vercel) — remote state, pinned versions, mandatory tags, no secrets, no apply from the agent.",
+  "plugins": [
+    {
+      "name": "kynfra",
+      "source": "./plugins/kynfra",
+      "description": "Know Your Infrastructure: guarded, predictable Terraform for AWS (then Azure, Vercel) — remote state, pinned versions, mandatory tags, no secrets, no apply from the agent."
+    }
+  ]
+}
