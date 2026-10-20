@@ -132,6 +132,9 @@ class PreWriteTests(unittest.TestCase):
     def test_apply_patch_update_codex_allowed_and_denied(self):
         proj = project()
         put(proj, "envs/dev/web/backend.tf", BACKEND_OK)
+        ok = codex_patch(proj, "*** Update File: envs/dev/web/backend.tf\n@@\n-    key          = \"dev/web.tfstate\"\n"
+                               "+    key          = \"dev/app.tfstate\"\n")
+        self.assertEqual(ok, {})
         out = codex_patch(proj, "*** Update File: envs/dev/web/backend.tf\n@@\n-    encrypt      = true\n")
         self.assertTrue(denied(out), out)
 
@@ -197,6 +200,7 @@ class PostEditTests(unittest.TestCase):
         put(proj, "envs/dev/web/variables.tf", 'variable "n" {\n}\n' * 20)
         ctx = self.post(proj, "envs/dev/web/variables.tf")["hookSpecificOutput"]["additionalContext"]
         self.assertLessEqual(len(ctx.splitlines()), 17)
+        self.assertIn("e altri", ctx.splitlines()[-1])
 
     def test_post_edit_no_config_noop(self):
         d = Path(tempfile.mkdtemp(prefix="kynfra-noconf-"))
