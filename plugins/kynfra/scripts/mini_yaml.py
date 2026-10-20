@@ -2,7 +2,8 @@
 
 Sottoinsieme supportato: un solo documento (con `---` iniziale facoltativo e `...` finale), mappe e liste a blocchi,
 collezioni flow `{}` e `[]` (anche su più righe), scalari plain/quotati (`'...'` e `"..."` con escape), scalari plain
-su più righe, blocchi `|` e `>` (con chomping `-`/`+` e indentazione esplicita), commenti `#`. Accetta anche JSON.
+su più righe, blocchi `|` e `>` (con chomping `-`/`+` e indentazione esplicita), commenti `#`. Accetta anche JSON
+(chiavi duplicate rifiutate anche lì).
 Le chiavi delle mappe sono sempre stringhe (`200:` diventa "200").
 
 Fuori dal sottoinsieme (anchor `&`, alias `*`, tag `!`, direttive `%`, chiavi complesse `?`, più documenti, tab
@@ -43,11 +44,22 @@ def load_with_lines(text: str) -> Tuple[Any, Dict[Path_, int]]:
     text = text.lstrip("\ufeff")
     if text.lstrip().startswith(("{", "[")):
         try:
-            return json.loads(text), {}
+            return json.loads(text, object_pairs_hook=_json_object), {}
+        except MiniYamlError:
+            raise
         except ValueError:
             pass  # YAML flow, non JSON
     p = _Parser(text)
     return p.document(), p.lines
+
+
+def _json_object(pairs: List[Tuple[str, Any]]) -> dict:
+    out: dict = {}
+    for k, v in pairs:
+        if k in out:
+            raise MiniYamlError(f"chiave duplicata {k!r} nel JSON")
+        out[k] = v
+    return out
 
 
 def _scalar(s: str, line: int) -> Any:

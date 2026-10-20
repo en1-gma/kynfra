@@ -180,6 +180,43 @@ class StopGateTest(Base):
         self.assertEqual(out.get("decision"), "block")
 
 
+class StopGateFailClosedTest(Base):
+    """Un errore inatteso nei controlli non deve far passare lo stop gate (fail closed, con l'anti-loop)."""
+
+    def run_main(self, active=False):
+        import contextlib
+        import io
+        ev = {"cwd": str(self.proj), "hook_event_name": "Stop", "session_id": f"fc-{self.tmp.name}",
+              "stop_hook_active": active}
+        self.addCleanup(stop_gate.counter_path(ev, self.proj).unlink, True)
+        self.addCleanup(stop_gate.error_counter_path(ev).unlink, True)
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(ev))), contextlib.redirect_stdout(buf):
+            self.assertEqual(stop_gate.main(), 0)
+        return json.loads(buf.getvalue()) if buf.getvalue().strip() else {}
+
+    def assert_fail_closed(self):
+        out = self.run_main()
+        self.assertEqual(out.get("decision"), "block", out)
+        self.assertIn("errore interno", out["reason"])
+        self.assertIn("RuntimeError", out["reason"])
+        for _ in range(2):
+            self.assertEqual(self.run_main(active=True).get("decision"), "block")
+        out = self.run_main(active=True)  # oltre max_blocks (3): chiusura consentita con avviso
+        self.assertNotIn("decision", out)
+        self.assertIn("NON è conforme", out["systemMessage"])
+
+    def test_error_in_checks_blocks(self):
+        self.config()
+        with unittest.mock.patch.object(stop_gate, "run_checks", side_effect=RuntimeError("boom")):
+            self.assert_fail_closed()
+
+    def test_unexpected_error_in_main_blocks(self):
+        self.config()
+        with unittest.mock.patch.object(stop_gate, "gate", side_effect=RuntimeError("boom")):
+            self.assert_fail_closed()
+
+
 class ArchCheckTest(Base):
     def test_exit_codes_and_ratio_line(self):
         self.config()

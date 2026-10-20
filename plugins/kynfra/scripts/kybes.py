@@ -2,7 +2,9 @@
 
 Contratto di kybes (sola lettura):
 - `schemas/openapi.yaml` (o `.json`): le operazioni. L'handler di un'operazione è l'estensione
-  `x-kybes-handler: <contesto>/functions/<nome>` (o `<contesto>/ms/<nome>`); `security: []` la rende pubblica.
+  `x-kybes-handler: <contesto>/functions/<nome>` (o `<contesto>/ms/<nome>`), che se presente deve essere una stringa
+  non vuota. `Operation.public` è vero solo per un `security: []` letterale sull'operazione (non per la sicurezza
+  globale vuota o assente). Path item con `$ref` e `x-amazon-apigateway-any-method` non sono supportati: errore.
 - `services/<contesto>/functions/<nome>` (Lambda) e `services/<contesto>/ms/<nome>` (microservizi su EKS).
 - `jobs/<nome>` (Job KEDA / cron); `schemas/db/<Tabella>.yaml` (modello dati → RDS Proxy).
 
@@ -27,9 +29,11 @@ File generati dal comando backend in `envs/<env>/backend/` (non scritti a mano; 
     }
 
 `api-coverage` (block, solo con `kybes` in config e lo schema OpenAPI presente) confronta il progetto con ogni stack
-`envs/<env>/backend/` esistente: ogni operazione ha una voce in `routes` verso un handler che esiste in `services/`,
-ogni function/microservizio ha la sua voce in `handlers`, ogni job in `jobs`. Senza stack backend non c'è niente da
-confrontare. Schema o tfvars illeggibili producono un finding (fail closed).
+`envs/<env>/backend/` esistente: ogni operazione ha una voce in `routes` verso un handler che esiste in `services/`
+(e uguale a `x-kybes-handler`, se c'è), ogni function/microservizio ha la sua voce in `handlers`, ogni job in `jobs`;
+voci di `routes` senza operazione e di `handlers` senza cartella in `services/` sono residui da rigenerare. Senza stack
+backend non c'è niente da confrontare. Schema, manifest o tfvars illeggibili (anche non UTF-8) producono un finding o
+un valore non dedotto, mai un'eccezione (fail closed).
 """
 from __future__ import annotations
 
@@ -57,8 +61,16 @@ MESSAGES = {
                         "/kynfra:create-backend-infra-aws",
     "job-no-infra": "job '{job}' senza infrastruttura (coda o schedule) in {stack}: rigenera con "
                     "/kynfra:create-backend-infra-aws",
+    "route-mismatch": "operazione {route} mappata su '{target}' ma x-kybes-handler indica '{ref}': rigenera con "
+                      "/kynfra:create-backend-infra-aws",
+    "stale-route": "route '{route}' senza operazione in {openapi}: residuo, rigenera con "
+                   "/kynfra:create-backend-infra-aws",
+    "stale-handler": "handler '{handler}' in handlers senza cartella in services/: residuo, rigenera con "
+                     "/kynfra:create-backend-infra-aws",
     "openapi": "schema OpenAPI non leggibile ({error}): api-coverage non può verificare la copertura",
     "tfvars-missing": "{file} mancante nello stack backend: rigenera con /kynfra:create-backend-infra-aws",
+    "tfvars-unreadable": "{file} non leggibile ({error}): file generato, rigeneralo con "
+                         "/kynfra:create-backend-infra-aws",
     "tfvars-bad": "{file} non leggibile: '{name}' deve essere un oggetto letterale (file generato, non modificarlo "
                   "a mano)",
 }
@@ -122,12 +134,21 @@ def _operations(doc, lines) -> List[Operation]:
     for path, item in paths.items():
         if not isinstance(item, dict):
             continue
+        for unsupported in ("$ref", "x-amazon-apigateway-any-method"):
+            if unsupported in item:
+                raise KybesError(f"{path}: '{unsupported}' nel path item non supportato (le operazioni vanno "
+                                 "scritte una per metodo nello schema)")
         for method in METHODS:
             op = item.get(method)
             if not isinstance(op, dict):
                 continue
-            ref = op.get("x-kybes-handler")
-            ref = ref.strip().strip("/") if isinstance(ref, str) and ref.strip() else None
+            ref = None
+            if "x-kybes-handler" in op:
+                raw = op["x-kybes-handler"]
+                if not isinstance(raw, str) or not raw.strip().strip("/"):
+                    raise KybesError(f"{method.upper()} {path}: x-kybes-handler deve essere "
+                                     "'<contesto>/functions/<nome>' o '<contesto>/ms/<nome>'")
+                ref = raw.strip().strip("/")
             oid = op.get("operationId")
             out.append(Operation(method.upper(), str(path), oid if isinstance(oid, str) else None, ref,
                                  op.get("security") == [], lines.get(("paths", path, method), 0)))
@@ -138,13 +159,12 @@ def read_openapi(path: Path) -> List[Operation]:
     """Operazioni dello schema OpenAPI; KybesError se il file manca o non è nel sottoinsieme letto."""
     try:
         text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise KybesError(f"{path.name}: non è testo UTF-8") from None
     except OSError as e:
         raise KybesError(f"{path.name}: {e.strerror or e}") from None
     try:
-        if path.suffix.lower() == ".json":
-            doc, lines = json.loads(text), {}
-        else:
-            doc, lines = mini_yaml.load_with_lines(text)
+        doc, lines = mini_yaml.load_with_lines(text)  # anche JSON, con le chiavi duplicate rifiutate
     except (ValueError, RecursionError) as e:
         raise KybesError(str(e)) from None
     return _operations(doc, lines)
@@ -168,7 +188,8 @@ def read_project(root: Path, openapi_rel: str = "schemas/openapi.yaml") -> Kybes
 def runtime_of(h: Handler) -> Tuple[Optional[str], Optional[str]]:
     """(runtime Lambda, handler) dal manifest della cartella: package.json (`engines.node` → `nodejs<major>.x`,
     `main` → `<file senza estensione>.handler`), pyproject.toml (`requires-python` → `python3.<minor>`, handler
-    `handler.handler` o `app.handler` secondo il file presente). None per ciò che non si deduce."""
+    `handler.handler` o `app.handler` secondo il file presente). None per ciò che non si deduce o non si legge.
+    Con un intervallo (`>=20 <23`, `^3.11`) vale la prima versione scritta, cioè la più bassa ammessa."""
     d = Path(h.path)
     pkg = d / "package.json"
     if pkg.is_file():
@@ -192,7 +213,7 @@ def runtime_of(h: Handler) -> Tuple[Optional[str], Optional[str]]:
     if pyproject.is_file():
         try:
             text = pyproject.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, ValueError):
             text = ""
         m = re.search(r"""^\s*requires-python\s*=\s*["']([^"']*)["']""", text, re.M)
         v = re.search(r"3\.([0-9]+)", m.group(1)) if m else None
@@ -256,6 +277,15 @@ def coverage_findings(p: KybesProject, mapping_tfvars: Dict[str, str], infra_han
             if ref not in p.handlers:
                 out.append(Finding(RULE, sev, openapi_path, op.line,
                                    MESSAGES["missing-handler"].format(route=op.route, handler=ref), op.route))
+        if op.handler_ref and target != op.handler_ref:
+            out.append(Finding(RULE, sev, openapi_path, op.line, MESSAGES["route-mismatch"].format(
+                route=op.route, target=target, ref=op.handler_ref), op.route))
+    routes = {op.route for op in p.operations}
+    for route in sorted(set(mapping_tfvars) - routes):
+        out.append(Finding(RULE, sev, handlers_path, 0,
+                           MESSAGES["stale-route"].format(route=route, openapi=openapi_path), route))
+    for key in sorted(set(infra_handlers) - set(p.handlers)):
+        out.append(Finding(RULE, sev, handlers_path, 0, MESSAGES["stale-handler"].format(handler=key), key))
     for key, h in sorted(p.handlers.items()):
         if key not in infra_handlers:
             kind = "function" if h.kind == "function" else "microservizio"
@@ -272,8 +302,14 @@ def _tfvars_object(path: Path, name: str, rel: str) -> Tuple[Optional[dict], Opt
     sev = DEFAULT_RULES[RULE]
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return None, Finding(RULE, sev, rel, 0, MESSAGES["tfvars-missing"].format(file=path.name))
+    except UnicodeDecodeError:
+        return None, Finding(RULE, sev, rel, 0, MESSAGES["tfvars-unreadable"].format(file=path.name,
+                                                                                 error="non è testo UTF-8"))
+    except OSError as e:
+        return None, Finding(RULE, sev, rel, 0, MESSAGES["tfvars-unreadable"].format(file=path.name,
+                                                                                 error=e.strerror or e))
     attr = hcl.parse_tfvars(text, path.name).get(name)
     value = attr.literal() if attr is not None else None
     if not isinstance(value, dict) or hcl.parse_problems(text, path.name):

@@ -8,11 +8,16 @@ import json
 import subprocess
 import sys
 import tempfile
+import shutil
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "plugins" / "kynfra" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import pre_write  # noqa: E402
 
 BACKEND_OK = 'terraform {\n  backend "s3" {\n    bucket       = "acme-tfstate"\n    key          = "dev/web.tfstate"\n' \
              '    encrypt      = true\n    use_lockfile = true\n  }\n}\n'
@@ -166,6 +171,31 @@ class PreWriteTests(unittest.TestCase):
         out = claude_write(proj, "infra/envs/dev/web/main.tf", PUBLIC_BUCKET)
         self.assertTrue(denied(out), out)
         self.assertIn("infra/envs/dev/web/main.tf", reason(out))
+
+    def run_pre_inprocess(self, proj: Path, rel: str) -> dict:
+        import contextlib
+        import io
+        ev = {"cwd": str(proj), "hook_event_name": "PreToolUse", "tool_name": "Write",
+              "tool_input": {"file_path": str(proj / rel), "content": "# x\n"}}
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(ev))), contextlib.redirect_stdout(buf):
+            self.assertEqual(pre_write.main(), 0)
+        return json.loads(buf.getvalue()) if buf.getvalue().strip() else {}
+
+    def test_internal_error_denies_inside_project(self):
+        proj = project(infra_root=".")
+        self.addCleanup(shutil.rmtree, proj, True)
+        with unittest.mock.patch.object(pre_write, "new_findings", side_effect=RuntimeError("boom")):
+            out = self.run_pre_inprocess(proj, "envs/dev/spa/main.tf")
+        self.assertTrue(denied(out), out)
+        self.assertIn("errore interno", reason(out))
+        self.assertIn("RuntimeError", reason(out))
+
+    def test_internal_error_outside_project_noop(self):
+        d = Path(tempfile.mkdtemp(prefix="kynfra-noproj-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        with unittest.mock.patch.object(pre_write, "new_findings", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_pre_inprocess(d, "main.tf"), {})
 
     def test_no_config_noop(self):
         d = Path(tempfile.mkdtemp(prefix="kynfra-noconf-"))

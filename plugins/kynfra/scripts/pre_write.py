@@ -43,6 +43,17 @@ def new_findings(rel: str, op: hc.FileOp, cfg: dict) -> List[rules.Finding]:
     return out
 
 
+def _check_op(event: dict, op: hc.FileOp, proj, cfg: dict) -> List[rules.Finding]:
+    hc.record_baseline(event, proj)
+    rel = rules.rel_to_project(str(hc._abs(op.path, event.get("cwd"))), proj)
+    if rel is None:
+        return []
+    out = rules.check_protected(rel, cfg)
+    if op.kind != "write":
+        return out
+    return out + rules.check_layout(rel, cfg) + new_findings(rel, op, cfg)
+
+
 def main() -> int:
     event = hc.read_event()
     hc.debug_dump(event, "pre")
@@ -52,15 +63,12 @@ def main() -> int:
         cfg = rules.load_config(proj)
         if cfg is None:
             continue  # file fuori da un progetto kynfra: nessun controllo
-        hc.record_baseline(event, proj)
-        rel = rules.rel_to_project(str(hc._abs(op.path, event.get("cwd"))), proj)
-        if rel is None:
-            continue
-        findings += rules.check_protected(rel, cfg)
-        if op.kind != "write":
-            continue
-        findings += rules.check_layout(rel, cfg)
-        findings += new_findings(rel, op, cfg)
+        try:
+            findings += _check_op(event, op, proj, cfg)
+        except Exception as e:  # una guardia che si rompe non deve lasciar passare la scrittura (come bash_guard)
+            findings.append(rules.Finding("internal-error", "block", op.path, 0,
+                                          f"errore interno dei controlli ({type(e).__name__}): scrittura non "
+                                          "verificabile, segnala il problema"))
     blocking = [f for f in findings if f.severity == "block"]
     if not blocking:
         return 0

@@ -3,6 +3,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -169,9 +170,9 @@ class CoverageTest(unittest.TestCase):
                             for f in out), [f.format() for f in out])
 
     def test_coverage_handler_and_job_without_infra(self):
-        handlers = COMPLETE_HANDLERS.replace(
-            '  "magazzino/ms/giacenze"         = { kind = "ms", runtime = "nodejs22.x", handler = "src/server.handler" }\n',
-            "")
+        ms_line = ('  "magazzino/ms/giacenze"         = { kind = "ms", runtime = "nodejs22.x", '
+                   'handler = "src/server.handler" }\n')
+        handlers = COMPLETE_HANDLERS.replace(ms_line, "")
         self.write_backend(handlers=handlers, jobs='jobs = {}\n')
         out = self.coverage()
         paths = sorted((f.path, f.resource) for f in out)
@@ -194,6 +195,77 @@ class CoverageTest(unittest.TestCase):
         off = rules.normalize_config({"infra_root": "infra", "project": "acme", "kybes": {"root": "."},
                                       "rules": {"api-coverage": "off"}})
         self.assertEqual(self.coverage(off), [])
+
+    # --- fix round 1
+
+    def openapi(self, text):
+        (self.d / "schemas" / "openapi.yaml").write_text(text, encoding="utf-8")
+
+    def assert_single_openapi_block(self, needle):
+        out = self.coverage()
+        self.assertEqual([(f.path, f.severity) for f in out], [("schemas/openapi.yaml", "block")],
+                         [f.format() for f in out])
+        self.assertIn(needle, out[0].message)
+
+    def test_non_utf8_files_fail_closed(self):
+        self.write_backend()
+        (self.d / "services" / "ordini" / "functions" / "crea-ordine" / "pyproject.toml").write_bytes(
+            b'requires-python = "\xff\xfe"\n')
+        self.assertEqual(self.coverage(), [])  # manifest illeggibile: runtime non dedotto, nessun crash
+        (self.d / "infra" / "envs" / "dev" / "backend" / "handlers.auto.tfvars").write_bytes(b"handlers = {\xff}\n")
+        out = self.coverage()
+        self.assertEqual([f.path for f in out], ["infra/envs/dev/backend/handlers.auto.tfvars"])
+        (self.d / "schemas" / "openapi.yaml").write_bytes(b"paths:\n  /x: \xff\n")
+        self.assert_single_openapi_block("UTF-8")
+
+    def test_internal_error_blocks(self):
+        self.write_backend()
+        with unittest.mock.patch.object(kybes, "project_findings", side_effect=RuntimeError("boom")):
+            out = self.coverage()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].severity, "block")
+        self.assertIn("errore interno della regola", out[0].message)
+
+    def test_path_item_ref_and_any_method_rejected(self):
+        self.write_backend()
+        self.openapi("paths:\n  /v1/ordini:\n    $ref: './ordini.yaml'\n")
+        self.assert_single_openapi_block("$ref")
+        self.openapi("paths:\n  /v1/ordini:\n    x-amazon-apigateway-any-method: {}\n")
+        self.assert_single_openapi_block("x-amazon-apigateway-any-method")
+
+    def test_malformed_handler_extension_rejected(self):
+        self.write_backend()
+        for bad in ('""', "~", "5", "[a]"):
+            self.openapi(f"paths:\n  /v1/magazzino/giacenze:\n    get:\n      x-kybes-handler: {bad}\n")
+            self.assert_single_openapi_block("x-kybes-handler")
+
+    def test_json_duplicate_keys_rejected(self):
+        with self.assertRaises(mini_yaml.MiniYamlError):
+            mini_yaml.load('{"paths": {}, "paths": {}}')
+        self.write_backend()
+        (self.d / "schemas" / "openapi.yaml").unlink()
+        (self.d / "schemas" / "openapi.json").write_text('{"paths": {"/a": {}, "/a": {}}}', encoding="utf-8")
+        cfg = rules.normalize_config({"infra_root": "infra", "project": "acme",
+                                      "kybes": {"root": ".", "openapi": "schemas/openapi.json"}})
+        out = self.coverage(cfg)
+        self.assertEqual([(f.path, f.severity) for f in out], [("schemas/openapi.json", "block")])
+
+    def test_route_target_differs_from_extension(self):
+        self.write_backend(handlers=COMPLETE_HANDLERS.replace(
+            '"POST /v1/ordini"                  = "ordini/functions/crea-ordine"',
+            '"POST /v1/ordini"                  = "ordini/functions/lista-ordini"'))
+        out = self.coverage()
+        self.assertEqual(len(out), 1, [f.format() for f in out])
+        self.assertEqual((out[0].path, out[0].resource), ("schemas/openapi.yaml", "POST /v1/ordini"))
+        self.assertIn("ordini/functions/crea-ordine", out[0].message)
+
+    def test_leftover_routes_and_stale_handlers(self):
+        handlers = COMPLETE_HANDLERS.replace("routes = {\n", 'routes = {\n  "GET /v1/vecchia" = "ordini/functions/x"\n')
+        handlers = handlers.replace("handlers = {\n", 'handlers = {\n  "ordini/functions/x" = { kind = "function" }\n')
+        self.write_backend(handlers=handlers)
+        out = sorted((f.path, f.resource) for f in self.coverage())
+        tfvars = "infra/envs/dev/backend/handlers.auto.tfvars"
+        self.assertEqual(out, [(tfvars, "GET /v1/vecchia"), (tfvars, "ordini/functions/x")])
 
 
 if __name__ == "__main__":
