@@ -645,16 +645,10 @@ def _domain_value(key: str, value, project: str) -> Optional[str]:
     return None
 
 
-def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = False) -> List[Finding]:
-    """Letterali di dominio ripetuti in più file di modules/ ed envs/ (`files` = [(percorso, blocchi)]).
-
-    Warn per ogni file che ripete un valore già visto in un file precedente; con `stop_gate=True` aggiunge un block se
-    la quota di occorrenze duplicate supera la soglia. I valori nei *.tfvars sono definizioni e non si contano."""
+def _literal_occurrences(files: List[Tuple[str, list]], cfg: dict) -> Dict[str, List[Tuple[str, int]]]:
+    """Letterali di dominio -> posizioni (percorso, riga) in modules/ ed envs/, esclusi i *.tfvars."""
     import rules_common
 
-    sev = cfg["rules"].get("literal-reuse", "warn")
-    if sev == "off":
-        return []
     project = cfg.get("project") or ""
     occ: Dict[str, List[Tuple[str, int]]] = {}
     for path, blocks in files:
@@ -669,13 +663,43 @@ def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = Fa
                         dv = _domain_value(key, value, project)
                         if dv is not None:
                             occ.setdefault(dv, []).append((path, attr.line))
+    return occ
+
+
+def _reuse_numbers(occ: Dict[str, List[Tuple[str, int]]]):
+    dup_values = {v: locs for v, locs in occ.items() if len({p for p, _ in locs}) >= 2}
+    total = sum(len(v) for v in occ.values())
+    dup = sum(len(v) - 1 for v in dup_values.values())
+    top = sorted(((v, len(locs)) for v, locs in dup_values.items()), key=lambda kv: (-kv[1], kv[0]))[:15]
+    return total, dup, top, dup_values
+
+
+def literal_reuse_stats(files: List[Tuple[str, list]], cfg: dict) -> Tuple[int, int, List[Tuple[str, int]]]:
+    """(occorrenze di letterali di dominio, occorrenze duplicate, valori più ripetuti come (valore, volte))."""
+    total, dup, top, _ = _reuse_numbers(_literal_occurrences(files, cfg))
+    return total, dup, top
+
+
+def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = False,
+                  stats: Optional[dict] = None) -> List[Finding]:
+    """Letterali di dominio ripetuti in più file di modules/ ed envs/ (`files` = [(percorso, blocchi)]).
+
+    Warn per ogni file che ripete un valore già visto in un file precedente; con `stop_gate=True` aggiunge un block se
+    la quota di occorrenze duplicate supera la soglia. I valori nei *.tfvars sono definizioni e non si contano.
+    Se `stats` è un dict lo riempie con off, total, duplicated, min_values, max_ratio."""
+    sev = cfg["rules"].get("literal-reuse", "warn")
+    cr = cfg["literal_reuse"]
+    if stats is not None:
+        stats.update(off=sev == "off", total=0, duplicated=0, min_values=int(cr.get("min_values", 20)),
+                     max_ratio=float(cr.get("max_duplicate_ratio", 0.10)))
+    if sev == "off":
+        return []
+    occ = _literal_occurrences(files, cfg)
+    total, dup, _, dup_values = _reuse_numbers(occ)
+    if stats is not None:
+        stats.update(total=total, duplicated=dup)
     out: List[Finding] = []
-    dup_values: Dict[str, List[Tuple[str, int]]] = {}
-    for val, locs in occ.items():
-        paths = {p for p, _ in locs}
-        if len(paths) < 2:
-            continue
-        dup_values[val] = locs
+    for val, locs in dup_values.items():
         first = locs[0][0]
         seen = {first}
         for p, line in locs:
@@ -686,10 +710,7 @@ def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = Fa
                                f"'{val}' è già scritto in {first}: definiscilo una volta in locals o in una variabile "
                                "(tfvars per i valori di ambiente) e referenzialo"))
     if stop_gate:
-        cr = cfg["literal_reuse"]
-        total = sum(len(v) for v in occ.values())
         if total >= int(cr.get("min_values", 20)) and total:
-            dup = sum(len(v) - 1 for v in dup_values.values())
             ratio = dup / total
             limit = float(cr.get("max_duplicate_ratio", 0.10))
             if ratio > limit:
@@ -740,17 +761,17 @@ def _provider_project_findings(parsed, cfg: dict) -> List[Finding]:
     return out
 
 
-def check_project(proj: Path, cfg: dict, stop_gate: bool = False) -> List[Finding]:
+def check_project(proj: Path, cfg: dict, stop_gate: bool = False, stats: Optional[dict] = None) -> List[Finding]:
     """Controlli sull'intero progetto: check_content su ogni file IaC, regole d'insieme per stack e bootstrap,
     regole d'insieme dei provider (es. rules_aws.AWS_PROJECT_RULES), literal-reuse (con la soglia bloccante solo se
-    `stop_gate`). Percorsi relativi al progetto."""
+    `stop_gate`). Percorsi relativi al progetto. Se `stats` è un dict lo riempie con i numeri di literal-reuse."""
     parsed = _parse_project(proj, cfg)
     per_file: List[Finding] = []
     for rel, _, text, _ in parsed:
         per_file.extend(check_content(rel, text, cfg))
     extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
     extra.extend(_provider_project_findings(parsed, cfg))
-    reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate)
+    reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate, stats)
     out = per_file + _post_process(extra, cfg)  # unico punto che segnala le eccezioni malformate
     for f in _post_process(reuse, cfg, report_config=False):
         if f.resource == "ratio":  # la quota oltre soglia blocca sempre (se la regola non è off)

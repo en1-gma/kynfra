@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +15,8 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "tests" / "hooks"))
 
 import external  # noqa: E402
+import hook_common  # noqa: E402
+import stop_gate  # noqa: E402
 import rules  # noqa: E402
 from test_rules_common import GOOD_BACKEND, GOOD_PROVIDER  # noqa: E402
 
@@ -78,6 +81,8 @@ class Base(unittest.TestCase):
     def stop(self, active=False, sid="s", cwd=None, **env):
         ev = {"cwd": str(cwd or self.proj), "hook_event_name": "Stop", "session_id": f"{sid}-{self.tmp.name}",
               "stop_hook_active": active}
+        for p in (Path(ev["cwd"]).resolve(), *rules.discover_projects(Path(ev["cwd"]).resolve())):
+            self.addCleanup(stop_gate.counter_path(ev, p).unlink, True)
         r = subprocess.run([sys.executable, "-B", str(SCRIPTS / "stop_gate.py")], input=json.dumps(ev),
                            capture_output=True, text=True, timeout=60, env=self.env(**env))
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -155,8 +160,6 @@ class StopGateTest(Base):
         self.git("commit", "-qm", "base")
         git_dir = os.path.dirname(shutil.which("git"))
         path = f"{self.bin}{os.pathsep}{git_dir}"
-        sys.path.insert(0, str(SCRIPTS))
-        import hook_common
         ev = {"cwd": str(self.proj), "session_id": f"c-{self.tmp.name}"}
         hook_common.record_baseline(ev, self.proj.resolve())
         self.addCleanup(hook_common.baseline_path(ev, self.proj.resolve()).unlink, True)
@@ -295,6 +298,68 @@ class ExternalStepsTest(Base):
             os.environ.update(old)
         self.assertEqual(len(errors), 1)
         self.assertTrue(errors[0].startswith("init"))
+
+    def test_tflint_config_missing(self):
+        self.config()
+        (self.proj / ".tflint.hcl").unlink()
+        make_bin(self.bin)
+        write(self.proj, stack())
+        cfg = rules.load_config(self.proj)
+        steps = external.external_steps(self.proj, cfg)
+        self.assertNotIn("tflint", [s.name for s in steps])
+        with unittest.mock.patch.dict(os.environ, self.env()):
+            errors, warnings = external.run_external(steps, False, self.proj, cfg)
+            self.assertEqual(errors, [])
+            self.assertTrue(any(".tflint.hcl" in w for w in warnings))
+            errors, _ = external.run_external(steps, True, self.proj, cfg)
+        self.assertTrue(any(".tflint.hcl" in e for e in errors))
+
+    def test_tflint_has_no_chdir(self):
+        self.config()
+        write(self.proj, stack())
+        steps = external.external_steps(self.proj, rules.load_config(self.proj))
+        argv = [s for s in steps if s.name == "tflint"][0].argv
+        self.assertNotIn("--chdir", argv)
+
+    def test_checkov_without_skips(self):
+        self.config()
+        write(self.proj, stack())
+        steps = external.external_steps(self.proj, rules.load_config(self.proj))
+        self.assertNotIn("--skip-check", steps[-1].argv)
+
+    def test_trivy_runs(self):
+        self.config(scanner="trivy")
+        make_bin(self.bin)
+        write(self.proj, stack())
+        cfg = rules.load_config(self.proj)
+        with unittest.mock.patch.dict(os.environ, self.env(FAKE_FAIL="trivy")):
+            errors, _ = external.run_external(external.external_steps(self.proj, cfg), False, self.proj, cfg)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("boom da trivy", errors[0])
+        self.assertEqual([c["tool"] for c in self.calls()][-1], "trivy")
+
+    def test_timeout_and_oserror(self):
+        self.config()
+        make_bin(self.bin)
+        step = external.Step("lento", ["terraform", "x"], self.proj, True)
+        with unittest.mock.patch.dict(os.environ, self.env()):
+            with unittest.mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("t", 1)):
+                errors, _ = external.run_external([step], False, self.proj)
+            self.assertIn("oltre", errors[0])
+            with unittest.mock.patch("subprocess.run", side_effect=OSError("nope")):
+                errors, _ = external.run_external([step], False, self.proj)
+            self.assertIn("impossibile eseguire", errors[0])
+
+
+class LiteralReuseStatsTest(Base):
+    def test_stats_line(self):
+        self.config()
+        write(self.proj, stack())
+        r = self.arch()
+        self.assertIn("0 duplicati su", r.stdout)
+        self.assertIn("nessuna soglia applicata", r.stdout)
+        self.config(rules={"literal-reuse": "off"})
+        self.assertIn("disattivata", self.arch().stdout)
 
 
 if __name__ == "__main__":

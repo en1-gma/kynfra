@@ -75,8 +75,7 @@ def external_steps(proj: Path, cfg: dict) -> List[Step]:
         steps.append(Step(f"validate {label}", [tf, "validate", "-no-color"], stack, True))
     tflint_cfg = root / ".tflint.hcl"
     if tflint_cfg.is_file():
-        steps.append(Step("tflint", ["tflint", "--recursive", "--config", str(tflint_cfg.resolve()),
-                                     "--chdir", str(root.resolve())], root, True))
+        steps.append(Step("tflint", ["tflint", "--recursive", "--config", str(tflint_cfg.resolve())], root, True))
     # se manca .tflint.hcl lo segnala run_external (avviso: rilancia l'installer)
     if cfg.get("scanner") == "trivy":
         # nessuna esclusione per Trivy: il flag per ID di controllo non è stabile tra le versioni
@@ -94,24 +93,24 @@ def _install_hint(tool: str) -> str:
     return f"installa con /kynfra:tools (tools.py install {tool})"
 
 
-def run_external(steps: List[Step], strict: bool, proj: Optional[Path] = None,
+def run_external(steps: List[Step], strict: bool, proj: Path,
                  cfg: Optional[dict] = None) -> Tuple[List[str], List[str]]:
-    """Esegue i passi; restituisce (errori, avvisi). `proj` serve a risolvere i binari in .kynfra/bin e venv."""
+    """Esegue i passi; restituisce (errori, avvisi). `proj` serve a risolvere i binari in .kynfra/bin e venv; con `cfg`
+    controlla anche .tflint.hcl (errore in strict, avviso altrimenti)."""
     errors: List[str] = []
     warnings: List[str] = []
     missing: set = set()
     failed_init: set = set()
-    if cfg is not None and proj is not None and not (_infra_root(proj, cfg) / ".tflint.hcl").is_file() \
-            and _has_tf(_infra_root(proj, cfg)):
-        warnings.append("tflint: .tflint.hcl non trovato in infra_root: rilancia l'installer per generarlo")
+    if cfg is not None and not (_infra_root(proj, cfg) / ".tflint.hcl").is_file() and _has_tf(_infra_root(proj, cfg)):
+        (errors if strict else warnings).append(
+            "tflint: .tflint.hcl non trovato in infra_root: rilancia l'installer per generarlo")
     with tempfile.TemporaryDirectory(prefix="kynfra-tfdata-") as tmp:
         data_dirs: Dict[Path, str] = {}
         for step in steps:
             tool = step.argv[0]
             if tool in missing:
                 continue
-            base = proj if proj is not None else step.cwd
-            exe = _resolve(base, tool)
+            exe = _resolve(proj, tool)
             if exe is None:
                 missing.add(tool)
                 msg = f"{tool} non installato: {_install_hint(tool)}"
