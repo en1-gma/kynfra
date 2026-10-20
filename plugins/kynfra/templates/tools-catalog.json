@@ -1,0 +1,51 @@
+{
+  "_comment": "Catalogo degli strumenti scaricabili con tools.py: solo sorgenti ufficiali. Le versioni stanno in versions.json. Segnaposto: {version}, {os}, {arch}, {tos}, {tarch} (nomi di piattaforma di Trivy). Le firme GPG non sono verificate nella v1: vale il checksum SHA256.",
+  "terraform": {
+    "kind": "binary",
+    "url_template": "https://releases.hashicorp.com/terraform/{version}/terraform_{version}_{os}_{arch}.zip",
+    "checksums_url": "https://releases.hashicorp.com/terraform/{version}/terraform_{version}_SHA256SUMS",
+    "signature": "gpg-non-verificata",
+    "archive": "zip",
+    "binary": "terraform"
+  },
+  "opentofu": {
+    "kind": "binary",
+    "url_template": "https://github.com/opentofu/opentofu/releases/download/v{version}/tofu_{version}_{os}_{arch}.zip",
+    "checksums_url": "https://github.com/opentofu/opentofu/releases/download/v{version}/tofu_{version}_SHA256SUMS",
+    "signature": "gpg-non-verificata",
+    "archive": "zip",
+    "binary": "tofu"
+  },
+  "tflint": {
+    "kind": "binary",
+    "url_template": "https://github.com/terraform-linters/tflint/releases/download/v{version}/tflint_{os}_{arch}.zip",
+    "checksums_url": "https://github.com/terraform-linters/tflint/releases/download/v{version}/checksums.txt",
+    "signature": "gpg-non-verificata",
+    "archive": "zip",
+    "binary": "tflint"
+  },
+  "tflint_ruleset_aws": {
+    "kind": "binary",
+    "url_template": "https://github.com/terraform-linters/tflint-ruleset-aws/releases/download/v{version}/tflint-ruleset-aws_{os}_{arch}.zip",
+    "checksums_url": "https://github.com/terraform-linters/tflint-ruleset-aws/releases/download/v{version}/checksums.txt",
+    "signature": "gpg-non-verificata",
+    "archive": "zip",
+    "binary": "tflint-ruleset-aws"
+  },
+  "trivy": {
+    "kind": "binary",
+    "url_template": "https://github.com/aquasecurity/trivy/releases/download/v{version}/trivy_{version}_{tos}-{tarch}.tar.gz",
+    "checksums_url": "https://github.com/aquasecurity/trivy/releases/download/v{version}/trivy_{version}_checksums.txt",
+    "signature": "gpg-non-verificata",
+    "archive": "tar.gz",
+    "binary": "trivy"
+  },
+  "checkov": {
+    "kind": "pypi",
+    "url_template": "https://pypi.org/project/checkov/{version}/",
+    "checksums_url": null,
+    "signature": "nessuna",
+    "archive": "wheel",
+    "binary": "checkov"
+  }
+}

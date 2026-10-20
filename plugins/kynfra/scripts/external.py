@@ -6,7 +6,6 @@ Solo libreria standard.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import rules
+import tools
 
 TIMEOUT_S = 600
 
@@ -27,12 +27,8 @@ class Step:
 
 
 def _resolve(proj: Path, name: str) -> Optional[str]:
-    """Percorso dell'eseguibile: .kynfra/bin, poi .kynfra/venv/bin, poi PATH. (Task 11: tools.resolve_binary.)"""
-    for sub in (".kynfra/bin", ".kynfra/venv/bin"):
-        cand = proj / sub / name
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-    return shutil.which(name)
+    """Percorso dell'eseguibile: .kynfra/bin, poi .kynfra/venv/bin, poi PATH (vedi tools.resolve_binary)."""
+    return tools.resolve_binary(proj, name)
 
 
 def _infra_root(proj: Path, cfg: dict) -> Path:
