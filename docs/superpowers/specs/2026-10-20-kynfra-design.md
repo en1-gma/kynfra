@@ -1,6 +1,6 @@
 # kynfra — Know Your Infrastructure: design
 
-Data: 2026-10-20 · Stato: bozza da approvare
+Data: 2026-10-20 · Stato: approvato
 
 ## 1. Intento
 
@@ -281,6 +281,27 @@ l'insieme.
 Se uno strumento esterno non è installato in locale, lo stop gate lo segnala con il comando per installarlo ma non
 blocca su di esso (le regole interne bloccano comunque); in CI invece tutti gli strumenti sono obbligatori e
 installati dal workflow. I comandi sono configurabili in `stop_gate.commands`.
+
+### 7.3.1 Strumenti esterni: download tracciato e approvato strumento per strumento
+kynfra può scaricare gli strumenti che gli servono (Terraform o OpenTofu, TFLint e il suo ruleset AWS, Checkov o
+Trivy), ma **solo con l'approvazione esplicita dell'utente, uno strumento alla volta**, e con traccia di ogni
+installazione.
+
+- Comando `/kynfra:tools` (skill `kynfra-tools`) e script `tools.py` (`status`, `install <tool>`): per ogni strumento
+  mancante o in versione non conforme mostra nome, versione, sorgente ufficiale, checksum atteso e cartella di
+  destinazione, e chiede conferma **per quel solo strumento**. Una risposta vale per uno strumento e una versione: non
+  esistono approvazioni cumulative o "sì a tutto".
+- Download solo da sorgenti ufficiali elencate nel kit (releases.hashicorp.com, GitHub releases di OpenTofu, TFLint e
+  Trivy, PyPI per Checkov in un virtualenv dedicato), con **verifica del checksum** (SHA256SUMS firmati dove
+  disponibili); se la verifica fallisce l'installazione si annulla.
+- Installazione locale al progetto (`.kynfra/bin/`, ignorata da git), mai globale e mai con `sudo`; lo stop gate usa
+  prima quei binari, poi quelli nel `PATH`.
+- **Registro** `.kynfra/tools.lock.json` (versionato): per ogni strumento versione, sorgente, checksum, data e chi ha
+  approvato (utente git). Lo stop gate e la CI verificano che i binari usati corrispondano al registro.
+- Nell'agente: `bash_guard` rifiuta ogni download o installazione di strumenti fuori da `tools.py` (`curl … | sh`,
+  `brew install`, `pip install`, `npm i -g`, …). `tools.py install` passa dalla richiesta di permesso del comando
+  shell, quindi l'utente lo autorizza ogni volta; la skill esegue un'installazione per comando, mai più strumenti
+  insieme. In CI il workflow installa le versioni del registro, senza approvazioni interattive.
 
 ### 7.4 Eccezioni
 **Baseline del kit**: per lo scanner il kit fornisce un elenco versionato di controlli esclusi, ciascuno motivato e
