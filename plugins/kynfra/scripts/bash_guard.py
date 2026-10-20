@@ -107,11 +107,11 @@ NO_SCAN = READONLY_CMDS | WRITERS | {"mkdir", "rm", "rmdir", "chmod", "chown", "
 # comandi che producono file (decompressione, decodifica, copia di alberi): i percorsi di output sono scritture
 DECOMPRESSORS = {"gunzip", "gzip", "bunzip2", "bzip2", "unxz", "xz", "unzstd", "zstd", "uncompress", "unlzma",
                  "lzma"}
-PRODUCERS = DECOMPRESSORS | {"base64", "xxd", "openssl", "pax", "split"}
+PRODUCERS = DECOMPRESSORS | {"base64", "xxd", "openssl", "pax", "split", "csplit"}
 DECOMP_SUFFIXES = {".gz": "", ".tgz": ".tar", ".z": "", ".bz2": "", ".tbz2": ".tar", ".xz": "", ".txz": ".tar",
                    ".zst": "", ".lzma": ""}
 # git che riscrive (tutto o in parte) il working tree; checkout/switch/restore/stash/reset/mv/update-index a parte
-GIT_TREE_WRITERS = {"merge", "cherry-pick", "pull", "rebase", "revert", "read-tree"}
+GIT_TREE_WRITERS = {"merge", "cherry-pick", "pull", "rebase", "revert", "read-tree", "update-ref", "fast-import"}
 # comandi che ricevono file IaC come argomento senza scriverli (o con controlli propri)
 IAC_ARG_EXEMPT = {"terraform", "tofu", "terragrunt", "git", "aws", "kubectl", "helm", "bat", "tfsec", "terrascan"}
 
@@ -2126,7 +2126,7 @@ class Analyzer:
             if after is not None:
                 paths, whole = after, not after
             elif not before:
-                whole = any(x.startswith("--pathspec-from-file") for x in t)
+                whole = any(x.startswith("--pathspec-from-file") or x == "--force" for x in t) or short("f")
             elif creates:
                 whole = True
             elif len(before) == 1:
@@ -2152,6 +2152,15 @@ class Analyzer:
             whole = any(x in ("--hard", "--merge", "--keep") for x in t)
         elif sub in GIT_TREE_WRITERS:
             whole = True
+        elif sub == "bisect":
+            pos = _opt_split(rest, {"--term-new", "--term-bad", "--term-old", "--term-good"})
+            whole = len(pos) > 1 and pos[0].text == "start" and "--no-checkout" not in t
+        elif sub == "sparse-checkout":
+            pos = _opt_split(rest, set())
+            whole = bool(pos) and pos[0].text in ("set", "add", "reapply", "disable")
+        elif sub == "submodule":
+            pos = _opt_split(rest, set())
+            whole = bool(pos) and pos[0].text == "update"
         elif sub == "worktree":
             pos = _opt_split(rest, set())
             whole = bool(pos) and pos[0].text in ("add", "move")
@@ -2187,9 +2196,13 @@ class Analyzer:
                 continue
             rel = "" if rel == "." else rel
             low = rel.lower()
-            if rel == "" or self.in_infra_scope(rel) or rules.protected_reason(rel, self.cfg) \
-                    or is_env_name(low.rsplit("/", 1)[-1]) or low == ".git" or low.startswith(".git/") \
-                    or any(pre.startswith(low + "/") for pre, _ in rules.PROTECTED_PATHS):
+            base = low.rsplit("/", 1)[-1]
+            # cartella (esistente, con / finale o senza estensione se assente): può contenere IaC
+            folder = p.is_dir() or a.text.endswith("/") or (not p.exists() and "." not in base)
+            irel = rules.infra_rel(rel, self.cfg)
+            if rel == "" or (folder and self.in_infra_scope(rel)) or (irel is not None and rules.is_iac_file(irel)) \
+                    or rules.protected_reason(rel, self.cfg) or is_env_name(base) or low == ".git" \
+                    or low.startswith(".git/") or any(pre.startswith(low + "/") for pre, _ in rules.PROTECTED_PATHS):
                 return True
         return False
 
@@ -2293,6 +2306,11 @@ class Analyzer:
         elif name in ("cp", "mv", "install", "ln", "rsync", "scp", "ditto"):
             if name == "install" and any(x in ("-d", "--directory") for x in t):
                 return
+            if name == "ditto" and any(x.startswith("-") and not x.startswith("--") and "x" in x[1:] for x in t):
+                pos = positional()
+                if pos:
+                    self.target(pos[-1], cw, extract=True)
+                return
             tdir = None
             for i, x in enumerate(t):
                 if x in ("-t", "--target-directory") and i + 1 < len(t):
@@ -2380,11 +2398,27 @@ class Analyzer:
             if any(x in ("--stdout", "--to-stdout", "--list", "--test") for x in t) or short("c") or short("l") \
                     or short("t"):
                 return
+            suffix = None
+            for i, x in enumerate(t):
+                if x in ("-S", "--suffix") and i + 1 < len(t):
+                    suffix = t[i + 1]
+                elif x.startswith("--suffix="):
+                    suffix = x.split("=", 1)[1]
+            restore_name = "--name" in t or short("N")
             for a in _opt_split(rest, {"-o", "-S", "--suffix", "-T", "--threads"}):
+                if restore_name:
+                    # -N: il nome di output viene dall'intestazione dell'archivio, non dalla riga di comando
+                    self.unknown_names(Arg(os.path.dirname(a.text) or ".", a.dyn, a.globby), cw, name + " -N")
+                    continue
                 low = a.text.lower()
-                ext = next((e for e in DECOMP_SUFFIXES if low.endswith(e)), None)
-                if ext is not None:
-                    self.target(Arg(a.text[:-len(ext)] + DECOMP_SUFFIXES[ext], a.dyn, a.globby), cw)
+                if suffix:
+                    ext = suffix.lower() if low.endswith(suffix.lower()) else ""
+                    out = a.text[:-len(ext)] if ext else a.text
+                else:
+                    ext = next((e for e in DECOMP_SUFFIXES if low.endswith(e)), "")
+                    out = a.text[:-len(ext)] + DECOMP_SUFFIXES[ext] if ext else a.text
+                # senza suffisso noto il decompressore cerca <nome><suffisso> e scrive <nome>
+                self.target(Arg(out, a.dyn, a.globby), cw)
         elif name == "base64":
             self.output_opts(rest, cw, short_o=True)
         elif name == "xxd":
@@ -2412,6 +2446,38 @@ class Analyzer:
                     suffix = x.split("=", 1)[1]
             prefix = pos[1] if len(pos) > 1 else Arg("x")
             self.target(Arg(prefix.text + "aa" + suffix, prefix.dyn, prefix.globby), cw)
+            self.unknown_names(Arg(os.path.dirname(prefix.text) or ".", prefix.dyn, prefix.globby), cw, name)
+        elif name == "csplit":
+            prefix = Arg("xx")
+            for i, x in enumerate(t):
+                if x in ("-f", "--prefix") and i + 1 < len(t):
+                    prefix = rest[i + 1]
+                elif x.startswith("--prefix="):
+                    prefix = Arg(x.split("=", 1)[1], rest[i].dyn)
+                elif x.startswith("-f") and len(x) > 2:
+                    prefix = Arg(x[2:], rest[i].dyn)
+            self.target(Arg(prefix.text + "00", prefix.dyn, prefix.globby), cw)
+            self.unknown_names(Arg(os.path.dirname(prefix.text) or ".", prefix.dyn, prefix.globby), cw, name)
+
+    def unknown_names(self, d: Arg, cwds: List[Path], label: str) -> None:
+        """Comandi che creano in `d` file con nomi non determinabili dalla riga di comando (gunzip -N,
+        split/csplit con suffissi generati): si rifiutano se `d` è sotto infra_root, dove possono nascere file IaC."""
+        if d.dyn:
+            self.deny(f"`{label}` scrive in una cartella non determinabile ({d.text}): usa Write/Edit")
+            return
+        for t in self.candidates(d, cwds):
+            if UNKNOWN_DIR in cwds and not os.path.isabs(os.path.expanduser(t)):
+                self.deny(f"`{label}` scrive in una cartella non determinabile: usa Write/Edit")
+                return
+            for p in self.resolve_all(t, cwds):
+                rel = rules.rel_to_project(str(p), self.proj)
+                if rel is None:
+                    continue
+                rel = "" if rel == "." else rel
+                if self.in_infra_scope(rel):
+                    self.deny(f"`{label}` crea in {rel or '.'} file con nomi generati che possono essere IaC: usa "
+                              "una cartella fuori da infra_root, o Write/Edit")
+                    return
 
     def any_dir(self, a: Arg, cwds: List[Path]) -> bool:
         for t in self.candidates(a, cwds):

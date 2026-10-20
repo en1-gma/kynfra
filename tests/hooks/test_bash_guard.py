@@ -520,7 +520,7 @@ class FixRound1Tests(GuardCase):
 
 
 class FixRound2Tests(GuardCase):
-    """Residui della re-review di 6059ff1..1931eaa (gruppo A)."""
+    """Residui della re-review di 6059ff1..1931eaa (gruppi A e B)."""
 
     def test_a1_command_words_case_insensitive(self):
         self.assert_denied([
@@ -579,6 +579,42 @@ class FixRound2Tests(GuardCase):
             "git bisect start", "git bisect good", "git bisect run pytest", "git submodule status",
             "git submodule foreach 'git status'", "git difftool --extcmd=diff HEAD~1", "git difftool HEAD~1",
         ])
+
+
+    def test_b1_git_whole_tree_rewrites(self):
+        self.assert_denied([
+            "git checkout -f", "git checkout --force", "git checkout -fq", "git bisect start HEAD HEAD~5",
+            "git bisect start --first-parent bad good", "git update-ref refs/heads/main abc123",
+            "git fast-import < /tmp/stream", "git sparse-checkout set envs", "git sparse-checkout add native",
+            "git sparse-checkout reapply", "git sparse-checkout disable", "git submodule update --init",
+            "git submodule update", "git submodule --quiet update --remote",
+        ])
+        self.assert_allowed(["git bisect start", "git bisect start --no-checkout HEAD HEAD~5",
+                             "git sparse-checkout list", "git submodule status", "git checkout -b feat/x",
+                             "git -C /tmp/elsewhere checkout -f"])
+
+    def test_b2_archive_and_split_outputs_into_infra(self):
+        put(self.proj, "envs/dev/spa/main.tf", "")
+        self.assert_denied([
+            "gunzip -N x.gz", "gunzip -N envs/dev/spa/x.gz", "gzip -dN x.gz", "gunzip --name x.gz",
+            "gunzip -S .bak main.tf.bak", "gunzip --suffix=.bak main.tf.bak", "gunzip -S .bak envs/dev/spa/main.tf", "gunzip main.tf",
+            "split -a 1 -l 1 /tmp/in main.t", "split -l 1 /tmp/in envs/dev/spa/part",
+            "csplit -f main /tmp/in /x/", "csplit -f envs/dev/spa/p -b '%02d.tf' /tmp/in /x/",
+            "csplit /tmp/in /x/", "ditto -x -k /tmp/a.zip envs/dev/spa", "ditto -xk /tmp/a.zip .",
+            "ditto -x /tmp/a.cpio infra",
+        ])
+        self.assert_allowed(["gunzip -N /tmp/x.gz", "gunzip -c -N x.gz", "gunzip -S .bak /tmp/x.bak",
+                             "split -l 1 /tmp/in /tmp/part", "csplit -f /tmp/p /tmp/in /x/",
+                             "ditto -x -k /tmp/a.zip /tmp/out", "ditto -c -k envs /tmp/a.zip"])
+
+    def test_b3_git_pathspecs_only_iac_or_protected(self):
+        put(self.proj, "notes.txt", "x")
+        put(self.proj, "envs/dev/spa/main.tf", "")
+        self.assert_allowed(["git restore notes.txt", "git checkout HEAD~1 -- notes.txt",
+                             "git restore --source=HEAD~2 docs/readme.md", "git checkout HEAD~1 notes.txt"])
+        self.assert_denied(["git restore main.tf", "git restore envs", "git checkout HEAD~1 -- envs/",
+                            "git restore .env.local", "git restore .kynfra/config.json", "git restore .",
+                            "git restore native/spa/app.yaml", "git checkout HEAD~1 -- missingdir"])
 
 
 if __name__ == "__main__":
