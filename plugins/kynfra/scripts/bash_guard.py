@@ -34,7 +34,7 @@ import os
 import re
 import shlex
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -58,6 +58,8 @@ TF_CLI_RE = re.compile(r"\bTF_CLI_ARGS\w*=")
 ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)\+?=(.*)$", re.S)
 SAFE_REDIRECT = {"/dev/null", "/dev/stderr", "/dev/stdout", "/dev/tty", "-"}
 SAFE_OUT = {"-", "/dev/null", "/dev/stdout", "/dev/stderr"}
+# percorsi che fanno leggere lo script dallo stdin o da un altro descrittore aperto dalla shell
+STDIN_PATH_RE = re.compile(r"/dev/stdin|/dev/fd/\d+|/proc/[^/]+/fd/\d+")
 SAFE_DYN_TARGET = re.compile(r"^(?:\$\(\s*mktemp\b|\$\{?TMPDIR\b|/tmp/|/private/tmp/|/var/folders/|/dev/)")
 
 RESERVED = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "in", "esac", "function", "!",
@@ -174,6 +176,7 @@ class Ctx:
     cwds: List[Path]
     depth: int
     stdin: List[str] = field(default_factory=list)
+    stdin_files: List[Arg] = field(default_factory=list)  # destinazioni di `<`
     piped: bool = False
     cmd: Optional[Cmd] = None
     redir_targets: List[Arg] = field(default_factory=list)
@@ -391,6 +394,9 @@ class Analyzer:
             args += self.expand(w)
         ctx = Ctx(cwds, depth, piped=cmd.pos > 0, cmd=cmd)
         for op, w in cmd.redirs:
+            if op == "<":
+                ctx.stdin_files += self.expand(w)
+                continue
             if op not in (">", ">>", ">|", "&>", "&>>", "<>", ">&"):
                 continue
             for a in self.expand(w):
@@ -465,7 +471,8 @@ class Analyzer:
         if ctx.cmd is not None and not ctx.cmd.name:
             ctx.cmd.name = name
         if ctx.xargs and (name in SHELLS or name in INTERPRETERS or name in WRITERS
-                          or name in ("eval", "source", ".", "make", "npm", "pnpm", "yarn", "just", "task")):
+                          or name in ("eval", "source", ".", "make", "npm", "pnpm", "yarn", "just", "task", "at",
+                                      "batch", "crontab")):
             self.deny(f"`xargs {name}`: argomenti letti da stdin, comando non verificabile")
             return
         kind = self.dispatch(name, args, ctx)
@@ -726,6 +733,15 @@ class Analyzer:
             return self.node_pm(name, args, ctx)
         if name == "make":
             return self.make(args, ctx)
+        if name in ("at", "batch"):
+            return self.at(name, args, ctx)
+        if name == "crontab":
+            if all(a.text in ("-l", "-u") or a.text.startswith("-u") for a in args[1:]) \
+                    and any(a.text == "-l" for a in args[1:]):
+                return RO
+            self.deny("`crontab`: installa o cambia job pianificati il cui contenuto non è verificabile "
+                      "(consentito solo `crontab -l`)")
+            return RW
         if name == "just":
             return self.just(args, ctx)
         if name == "task":
@@ -974,8 +990,11 @@ class Analyzer:
             return self.exec_file(rest[0], rest[1:], ctx, lang="sh")
         return self.stdin_code(name, ctx, lang="sh")
 
-    def stdin_code(self, name: str, ctx: Ctx, lang: str) -> str:
-        """Interprete senza script: legge il codice da heredoc/herestring o dalla pipe."""
+    def stdin_code(self, name: str, ctx: Ctx, lang: str, required: bool = False) -> str:
+        """Interprete senza script: legge il codice da heredoc/herestring, da `< file` o dalla pipe.
+
+        `required`: lo script deve arrivare dallo stdin (`/dev/stdin`, `/dev/fd/N`, `at`): se non si sa da dove
+        arriva il testo, il comando si rifiuta."""
         if ctx.stdin:
             for body in ctx.stdin:
                 if lang == "sh":
@@ -983,8 +1002,19 @@ class Analyzer:
                 else:
                     self.check_code(body, f"codice passato a {name}", lang)
             return DELEGATED
+        if ctx.stdin_files:
+            files, ctx = ctx.stdin_files, replace(ctx, stdin_files=[])
+            for f in files:
+                if f.dyn:
+                    self.deny(f"`{name} < {f.text}`: file non determinabile, il contenuto non è verificabile")
+                    continue
+                self.run_file(f.text, ctx, lang)
+            return DELEGATED
         if ctx.piped and ctx.cmd is not None:
             ctx.cmd.stdin_exec = True
+        elif required:
+            self.deny(f"`{name}`: script letto dallo stdin o da un descrittore di cui non si conosce il contenuto, "
+                      "non verificabile")
         return DELEGATED
 
     def exec_file(self, path: Arg, rest: List[Arg], ctx: Ctx, lang: Optional[str] = None) -> str:
@@ -999,10 +1029,13 @@ class Analyzer:
             if re.search(r"\b(?:curl|wget)\b", path.text):
                 self.deny_tool("script scaricato ed eseguito")
             return RW
-        if path.text.startswith(("/dev/", "/proc/")):
-            if ctx.piped and ctx.cmd is not None:
-                ctx.cmd.stdin_exec = True
+        if STDIN_PATH_RE.fullmatch(path.text):
+            return self.stdin_code(path.text, ctx, lang or "sh", required=True)
+        if path.text == "/dev/null":
             return DELEGATED
+        if path.text.startswith(("/dev/", "/proc/")):
+            self.deny(f"script letto da {path.text}: contenuto non verificabile")
+            return RW
         resolved = self.resolve_all(path.text, ctx.cwds)
         for p in resolved:
             sp = str(p)
@@ -1013,6 +1046,9 @@ class Analyzer:
         return RW
 
     def run_file(self, path_text: str, ctx: Ctx, lang: Optional[str] = None) -> None:
+        if STDIN_PATH_RE.fullmatch(path_text):
+            self.stdin_code(path_text, ctx, lang or "sh", required=True)
+            return
         for p in self.resolve_all(path_text, ctx.cwds):
             self.executed.add(str(p))
         for p in self.resolve_all(path_text, ctx.cwds):
@@ -1421,11 +1457,23 @@ class Analyzer:
 
     def make(self, args: List[Arg], ctx: Ctx) -> str:
         t = [a.text for a in args]
-        mfile, mdir, goals, overrides = None, None, [], {}
+        mfile, mdir, goals, overrides, evals = None, None, [], {}, []
         i = 1
         while i < len(t):
             x = t[i]
             nxt = t[i + 1] if i + 1 < len(t) else None
+            if x in ("-E", "--eval") and nxt is not None:
+                evals.append(nxt)
+                i += 2
+                continue
+            if x.startswith("--eval="):
+                evals.append(x.split("=", 1)[1])
+                i += 1
+                continue
+            if x.startswith("-E") and len(x) > 2:
+                evals.append(x[2:])
+                i += 1
+                continue
             if x in ("-f", "--file", "--makefile") and nxt is not None:
                 mfile, i = nxt, i + 2
                 continue
@@ -1455,18 +1503,68 @@ class Analyzer:
                 goals.append(x)
             i += 1
         overrides = {**ctx.env, **overrides}
+        eval_text = "\n".join(evals)
+        stdin_text: Optional[str] = None
+        if mfile is not None and (mfile == "-" or STDIN_PATH_RE.fullmatch(mfile)):
+            # Makefile letto dallo stdin: heredoc/herestring o `< file`; da una pipe o altrove non è verificabile
+            bodies = list(ctx.stdin)
+            for f in ctx.stdin_files:
+                body = None if f.dyn else next(
+                    (b for b in (_read_text(p) for p in self.resolve_all(f.text, ctx.cwds)) if b is not None), None)
+                if body is not None:
+                    bodies.append(body)
+            if not bodies:
+                self.deny(f"`make -f {mfile}`: Makefile letto dallo stdin, il contenuto non è verificabile")
+                return RW
+            stdin_text = "\n".join(bodies)
         dirs = self.resolve_all(mdir, ctx.cwds) if mdir else [c for c in ctx.cwds if c != UNKNOWN_DIR]
+        if not dirs and (evals or stdin_text is not None):
+            self.deny("`make` con Makefile inline in una directory non determinabile: non verificabile")
+            return RW
         for d in dirs:
-            if mfile:
-                cands = self.resolve_all(mfile, [d])
+            text: Optional[str] = None
+            if stdin_text is not None:
+                mf, text = d / "<stdin>", stdin_text
             else:
-                cands = [d / n for n in ("GNUmakefile", "makefile", "Makefile")]
-            mf = next((c for c in cands if c.is_file()), None)
-            if mf is None:
+                if mfile:
+                    cands = self.resolve_all(mfile, [d])
+                else:
+                    cands = [d / n for n in ("GNUmakefile", "makefile", "Makefile")]
+                mf = next((c for c in cands if c.is_file()), None)
+                if mf is None:
+                    if not evals:
+                        continue
+                    mf, text = d / "<eval>", ""
+                elif evals:
+                    text = _read_text(mf) or ""
+            if evals:
+                # `--eval`/`-E` si valutano prima dei Makefile
+                text = eval_text + "\n" + (text or "")
+            recipes = make_recipes(mf, goals, overrides, text=text)
+            if recipes:
+                self.script(recipes, [mf.parent], ctx.depth + 1)
+        return RW
+
+    def at(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        """`at`/`batch`: lo script del job arriva da `-f file` o dallo stdin, e si analizza come uno script sh."""
+        i = 1
+        while i < len(args):
+            x = args[i].text
+            if x[:2] in ("-l", "-r", "-d", "-c"):
+                return RO
+            if x.startswith("-f"):
+                f = Arg(x[2:], args[i].dyn) if len(x) > 2 else (args[i + 1] if i + 1 < len(args) else None)
+                paths = [] if f is None or f.dyn else self.resolve_all(f.text, ctx.cwds)
+                if not paths or not all(p.is_file() for p in paths):
+                    self.deny(f"`{name} -f`: file del job non determinabile o non leggibile, non verificabile")
+                    return RW
+                self.run_file(f.text, ctx, "sh")
+                return RW
+            if x in ("-q", "-t") and i + 1 < len(args):
+                i += 2
                 continue
-            text = make_recipes(mf, goals, overrides)
-            if text:
-                self.script(text, [mf.parent], ctx.depth + 1)
+            i += 1
+        self.stdin_code(name, ctx, "sh", required=True)
         return RW
 
     def just(self, args: List[Arg], ctx: Ctx) -> str:
