@@ -693,5 +693,40 @@ class FixRound2Tests(GuardCase):
                             "yarn --silent dlx y", "pnpm dlx y", "gem exec rubocop", "gem exec -g x y"])
         self.assert_allowed(["pnpm exec tsc", "yarn tsc", "pnpm run dlx", "gem list", "gem env"])
 
+
+class FixRound3Tests(GuardCase):
+    """Residui della re-review del fix round 2: `hash -p` attaccato, stdin delle sostituzioni, hook dei sottomoduli."""
+
+    def test_c1_hash_p_any_form(self):
+        self.assert_denied(["hash -p/tmp/x terraform", "hash -p/tmp/evil git; git status", "hash -rp /tmp/x git",
+                            "hash -tp/tmp/x git", "hash -p /tmp/x terraform"])
+        self.assert_allowed(["hash -r", "hash", "hash -t git"])
+
+    def test_c3_substitutions_and_functions_get_redirected_stdin(self):
+        put(self.proj, "evil.sh", "terraform apply\n")
+        put(self.proj, "ok.sh", "echo ok\n")
+        cmds = ["exec < {f}; x=$(bash)", "exec < {f}; echo `sh`", 'exec < {f}; echo "$(bash)"',
+                "{{ x=$(bash); }} < {f}", "{{ echo $(bash); }} < {f}", "(echo $(sh)) < {f}",
+                "f() {{ bash; }}; f < {f}", "function f {{ sh; }}; f < {f}"]
+        self.assert_denied([c.format(f="evil.sh") for c in cmds])
+        self.assert_allowed([c.format(f="ok.sh") for c in cmds]
+                            + ["f() { while read l; do echo $l; done; }; f < list.txt", "x=$(bash ok.sh)"])
+
+    def test_d3_submodule_hooks_dir_and_worktree_config(self):
+        self.assert_denied([
+            "cp /tmp/a .git/modules/sub/hooks/", "cp /tmp/a .git/modules/sub/hooks", "mv /tmp/h .git/modules/new/hooks",
+            "cp -r /tmp/h .git/modules/new/hooks", "ln -s /tmp/h .git/modules/new/hooks",
+            "rm -rf .git/modules/sub/hooks", "cp /tmp/c .git/worktrees/w/config",
+            "echo x > .git/worktrees/w/config.worktree",
+        ])
+        self.assert_allowed(["cat .git/modules/sub/HEAD", "ls .git/modules/sub/hooks"])
+
+    def test_minor_dlx_runners_use_tools_hint(self):
+        for cmd in ("pnpm dlx x", "yarn dlx x", "gem exec x", "pnpm -s dlx x"):
+            with self.subTest(cmd=cmd):
+                reasons = self.check(cmd)
+                self.assertTrue(any("/kynfra:tools" in r for r in reasons), reasons)
+
+
 if __name__ == "__main__":
     unittest.main()

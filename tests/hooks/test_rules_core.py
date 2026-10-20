@@ -104,9 +104,10 @@ class RulesCoreTest(unittest.TestCase):
     def test_git_worktree_and_module_config_protected(self):
         cfg = cfg_for("infra")
         for rel in (".git/config.worktree", ".git/modules/sub/hooks/pre-commit", ".git/modules/a/b/hooks/x",
-                    ".git/modules/sub/config", ".GIT/Modules/Sub/Config"):
+                    ".git/modules/sub/config", ".GIT/Modules/Sub/Config", ".git/modules/sub/hooks",
+                    ".git/worktrees/w/config", ".git/worktrees/w/config.worktree"):
             self.assertEqual([x.rule for x in rules.check_protected(rel, cfg)], ["protected-files"], rel)
-        for rel in (".git/modules/sub/HEAD", ".git/modules/sub/objects/ab/cd"):
+        for rel in (".git/modules/sub/HEAD", ".git/modules/sub/objects/ab/cd", ".git/worktrees/w/HEAD"):
             self.assertEqual(rules.check_protected(rel, cfg), [], rel)
 
     def test_stack_of(self):

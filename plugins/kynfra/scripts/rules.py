@@ -242,7 +242,9 @@ def stack_of(irel: str) -> Optional[Tuple[str, str]]:
 # ---------------------------------------------------------------- file protetti
 
 # (prefisso o file, motivo): confrontati senza distinzione di maiuscole, sui path canonici.
-GIT_MODULE_RE = re.compile(r"\.git/modules/.+/(?:hooks/.*|config(?:\.worktree)?)$")
+# hook e config dei sottomoduli (anche la cartella hooks stessa) e config dei worktree collegati
+GIT_MODULE_RE = re.compile(r"\.git/(?:modules/.+/(?:hooks(?:/.*)?|config(?:\.worktree)?)"
+                           r"|worktrees/[^/]+/config(?:\.worktree)?)$")
 PROTECTED_PATHS: List[Tuple[str, str]] = [
     (".kynfra/", "la configurazione, il lock e gli strumenti di kynfra li modifica solo l'utente"),
     ("tools/kynfra/", "il kit versionato di kynfra si aggiorna solo con install.sh"),
@@ -262,7 +264,7 @@ PROTECTED_PATHS: List[Tuple[str, str]] = [
 def protected_reason(rel: str, cfg: Optional[dict] = None) -> Optional[str]:
     low = rel.lower()
     if GIT_MODULE_RE.fullmatch(low):
-        return "hook e configurazione dei sottomoduli git eseguono comandi: li modifica solo l'utente"
+        return "hook e configurazione dei sottomoduli e dei worktree git eseguono comandi: li modifica solo l'utente"
     for prefix, why in PROTECTED_PATHS:
         if low == prefix.rstrip("/") or low.startswith(prefix):
             return why

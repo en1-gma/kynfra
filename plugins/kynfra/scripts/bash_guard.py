@@ -219,6 +219,9 @@ OBFUSCATED_RE = re.compile(r"\b(?:exec|eval)\s*\([^\n]*(?:b64decode|b85decode|a8
                            r"|codecs\.decode|rot13|\bchr\s*\(|atob|Buffer\.from)")
 IAC_MENTION_RE = re.compile(r"\.tf\b|\.tfvars\b|\.tf\.json\b|(?:^|[/'\"`\s])\.env|native/|\.git/hooks|\.git/config")
 
+# definizione di funzione: `f() …`, `function f …`
+FUNC_DEF_RE = re.compile(r"(?<![\w.:$-])([A-Za-z_][\w.:-]*)\s*\(\s*\)|\bfunction\s+([A-Za-z_][\w.:-]*)")
+
 KIT, DELEGATED, RO, RW = "kit", "delegated", "ro", "rw"
 
 
@@ -336,6 +339,7 @@ class Analyzer:
         self.env_tampered = False
         # stdin dato a un gruppo (`{ …; } < f`, `( … ) < f`) o alla shell (`exec < f`): vale per tutto lo script
         self.group_stdin: List[Arg] = []
+        self.funcs: Set[str] = set()  # nomi delle funzioni definite nel comando
         self.group_bodies: List[str] = []  # heredoc/herestring dati a un gruppo
         self.protect = cfg.get("rules", {}).get("protected-files", "block") != "off"
         self.vars: Dict[str, Optional[str]] = {
@@ -457,8 +461,7 @@ class Analyzer:
             return
         cwds = list(cwds)
         self.scan_tamper(text)
-        for sub in lx.subs:
-            self.script(sub, cwds, depth + 1)
+        self.funcs.update(a or b for a, b in FUNC_DEF_RE.findall(text))
         pipelines: Dict[int, List[Cmd]] = {}
         for cmd in cmds:
             pipelines.setdefault(cmd.pipeline, []).append(cmd)
@@ -466,6 +469,9 @@ class Analyzer:
         files, bodies = self.shared_stdin(cmds)
         self.group_stdin, self.group_bodies = outer + files, outer_bodies + bodies
         try:
+            # le sostituzioni di comando ereditano lo stdin della shell (`exec < f; x=$(bash)`, `{ …$(sh)…; } < f`)
+            for sub in lx.subs:
+                self.script(sub, cwds, depth + 1)
             for cmd in cmds:
                 self.command(cmd, cwds, depth)
         finally:
@@ -475,12 +481,13 @@ class Analyzer:
 
     def shared_stdin(self, cmds: List[Cmd]) -> Tuple[List[Arg], List[str]]:
         """File dati come stdin a un gruppo (`{ …; } < f`, `( … ) < f`, `done < f`) o alla shell stessa
-        (`exec < f`, `exec 3< f`): non si sa a quali comandi arrivano, quindi valgono per tutto lo script."""
+        (`exec < f`, `exec 3< f`) o a una funzione definita nel comando (`f < f`): non si sa a quali comandi
+        arrivano, quindi valgono per tutto lo script."""
         out: List[Arg] = []
         bodies: List[str] = []
         for cmd in cmds:
             head = [w.parts[0][1] if len(w.parts) == 1 and w.parts[0][0] == "lit" else None for w in cmd.words]
-            if head and head not in (["}"], ["done"], ["fi"], ["esac"], ["exec"]):
+            if head and head not in (["}"], ["done"], ["fi"], ["esac"], ["exec"]) and head[0] not in self.funcs:
                 continue
             for op, w in cmd.redirs:
                 if op in ("<", "<>"):
@@ -635,7 +642,8 @@ class Analyzer:
         args = list(args)
         while True:
             while args and args[0].text in RESERVED and not args[0].dyn:
-                args = args[1:]
+                # `function f { …`: il nome della funzione non è un comando
+                args = args[2:] if args[0].text == "function" else args[1:]
             if args and args[0].text in ("for", "select", "case") and not args[0].dyn:
                 if args[0].text != "case" and len(args) > 1:
                     self.vars[args[1].text] = None
@@ -740,7 +748,7 @@ class Analyzer:
     def mentions_protected(self, args: List[Arg], cwds: List[Path]) -> bool:
         for a in args:
             for t in self.candidates(a, cwds):
-                if PROTECTED_RE.search(t):
+                if PROTECTED_RE.search(t) or rules.GIT_MODULE_RE.search(t.lower().rstrip("/")):
                     return True
         return False
 
@@ -840,10 +848,10 @@ class Analyzer:
             return None
         raw = args[0].text.rstrip("/").rsplit("/", 1)[-1].lower()
         if n in ("pnpm", "yarn") and self.has_dlx(t):
-            self.deny(f"{n} dlx: scarica ed esegue un pacchetto")
+            self.deny_tool(f"{n} dlx: scarica ed esegue un pacchetto")
             return None
         if n == "gem" and L > 1 and "exec" in t[1:3]:
-            self.deny("gem exec: scarica ed esegue un pacchetto")
+            self.deny_tool("gem exec: scarica ed esegue un pacchetto")
             return None
         if raw in ("bunx", "pnpx") or (n in ("pnpm", "yarn") and L > 1 and t[1] == "dlx") \
                 or (n == "bun" and L > 1 and t[1] == "x"):
@@ -926,7 +934,7 @@ class Analyzer:
 
     def dispatch(self, name: str, args: List[Arg], ctx: Ctx) -> str:
         if name == "hash":
-            if any(re.fullmatch(r"-\w*p\w*", a.text) or a.dyn for a in args[1:]):
+            if any(re.match(r"-[^-]*p", a.text) or a.dyn for a in args[1:]):
                 self.env_tampered = True
                 self.deny("`hash -p`: cambia il programma eseguito per un nome di comando, non verificabile")
             return RO
@@ -2633,7 +2641,8 @@ class Analyzer:
         if self.protect and rules.protected_reason(rel, self.cfg):
             self.deny(f"scrittura via shell su un file protetto ({shown})")
             return
-        if low == ".git/config" or low.startswith(".git/hooks/") or low == ".git/hooks":
+        if low == ".git/config" or low.startswith(".git/hooks/") or low == ".git/hooks" \
+                or rules.GIT_MODULE_RE.fullmatch(low):
             self.deny(f"scrittura via shell di {shown}: gli hook e la configurazione di git possono eseguire comandi")
             return
         if is_env_name(low.rsplit("/", 1)[-1]):
