@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hook_common as hc  # noqa: E402
 import rules  # noqa: E402
 from shell_lex import Cmd, Lexer, Word  # noqa: E402
-from shell_recipes import just_recipes, make_recipes, read_text as _read_text, task_recipes  # noqa: E402
+from shell_recipes import just_recipes, make_lines, make_recipes, read_text as _read_text, task_recipes  # noqa: E402
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 KIT_REL = "tools/kynfra/plugins/kynfra"
@@ -56,6 +56,27 @@ PROTECTED_RE = re.compile(
     r"|disableallhooks|claude_project_dir|kynfra_project_dir|\.terraform\.lock\.hcl", re.I)
 TF_CLI_RE = re.compile(r"\bTF_CLI_ARGS\w*=")
 ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)\+?=(.*)$", re.S)
+# Variabili d'ambiente che fanno eseguire codice o caricare file in più a git, shell, interpreti, loader e make.
+# "cmd": il valore è un comando e si analizza come script; "deny": rifiutata; "file": rifiutata se il valore
+# può essere un file (`ENV=prod` resta consentito); "path": PATH, consentito solo se le nuove cartelle vanno
+# dopo `$PATH`.
+EXEC_ENV = {
+    **dict.fromkeys(("GIT_SSH_COMMAND", "GIT_SSH", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "PAGER",
+                     "MANPAGER", "EDITOR", "VISUAL", "GIT_ASKPASS", "SSH_ASKPASS"), "cmd"),
+    **dict.fromkeys(("GIT_EXTERNAL_DIFF", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG",
+                     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_DIR",
+                     "BASH_ENV", "PROMPT_COMMAND", "PS0", "PS1", "PS4", "SHELLOPTS", "BASHOPTS", "ZDOTDIR",
+                     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+                     "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "NODE_OPTIONS", "NODE_PATH",
+                     "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE", "PERL5OPT", "PERL5LIB",
+                     "PERLLIB", "RUBYOPT", "RUBYLIB", "MAKEFILES", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"), "deny"),
+    "ENV": "file",
+    "PATH": "path",
+}
+EXEC_ENV_RE = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_\d+")
+MAKE_SHELL_RE = re.compile(r"^\s*(?:(?:override|export)\s+)*(SHELL|MAKESHELL|\.SHELLFLAGS)\s*(?::::?=|[:+?!]?=)\s*(.*)$")
+SAFE_SHELL_RE = re.compile(r"(?:(?:/usr|/usr/local|/opt/homebrew)?/bin/)?(?:env\s+)?(?:bash|sh|zsh|dash|ksh)")
+SAFE_SHELLFLAG_RE = re.compile(r"-[a-zA-Z]+|pipefail|errexit|nounset|xtrace|posix")
 SAFE_REDIRECT = {"/dev/null", "/dev/stderr", "/dev/stdout", "/dev/tty", "-"}
 SAFE_OUT = {"-", "/dev/null", "/dev/stdout", "/dev/stderr"}
 # percorsi che fanno leggere lo script dallo stdin o da un altro descrittore aperto dalla shell
@@ -411,12 +432,75 @@ class Analyzer:
         ctx.stdin = [self.expand_join(w) for w in cmd.stdin]
         self.run(args, ctx)
 
-    def check_assigns(self, assigns: List[Tuple[str, str]]) -> None:
+    def check_assigns(self, assigns: List[Tuple[str, str]], ctx: Ctx) -> None:
         for name, value in assigns:
             if name.upper().startswith("TF_CLI_ARGS"):
                 self.deny(f"variabile {name}: inietta opzioni nei comandi terraform/tofu e non è consentita")
+            self.exec_env(name, value, ctx)
             if self.protect and PROTECTED_RE.search(f"{name}={value}"):
                 self.deny(f"variabile {name}: tocca la configurazione o i file protetti di kynfra")
+
+    def exec_env(self, name: str, value: Optional[str], ctx: Ctx) -> None:
+        """Variabile che fa eseguire codice (EXEC_ENV); `value` None = valore non determinabile (`read`, …)."""
+        kind = EXEC_ENV.get(name) or ("deny" if EXEC_ENV_RE.fullmatch(name) else None)
+        if kind is None:
+            return
+        if value is not None:
+            if kind == "cmd":
+                self.script(value, ctx.cwds, ctx.depth + 1)
+                return
+            if kind == "path" and value.startswith("${PATH}"):
+                return
+            if kind == "file" and not re.search(r"[/.$~]", value):
+                return
+        what = "valore non determinabile" if value is None else "fa eseguire codice o caricare file non verificati"
+        self.deny(f"variabile {name}: {what} (git, shell, interpreti, loader o make)")
+
+    @staticmethod
+    def exec_env_set(ctx: Ctx) -> bool:
+        """Il comando riceve una variabile di EXEC_ENV: niente esenzione del kit."""
+        return any(n in EXEC_ENV or EXEC_ENV_RE.fullmatch(n) for n in ctx.env)
+
+    def builtin_names(self, name: str, args: List[Arg], ctx: Ctx) -> None:
+        """Builtin che assegnano variabili senza `NOME=valore`: `read`, `printf -v`, `mapfile`/`readarray` (valore
+        non determinabile) ed `export`/`declare` di un nome senza valore."""
+        t = [a.text for a in args]
+        names: List[str] = []
+        if name == "read":
+            i = 1
+            while i < len(t) and t[i].startswith("-") and t[i] != "--":
+                if t[i] in ("-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u"):
+                    if t[i] == "-a" and i + 1 < len(t):
+                        names.append(t[i + 1])
+                    i += 2
+                    continue
+                if t[i].startswith("-a") and len(t[i]) > 2:
+                    names.append(t[i][2:])
+                i += 1
+            names += t[i + (1 if i < len(t) and t[i] == "--" else 0):]
+        elif name == "printf":
+            for i, x in enumerate(t[1:], 1):
+                if x == "-v" and i + 1 < len(t):
+                    names.append(t[i + 1])
+                elif x.startswith("-v") and len(x) > 2:
+                    names.append(x[2:])
+                if not x.startswith("-"):
+                    break
+        elif name in ("mapfile", "readarray"):
+            names += [a.text for a in _opt_split(args[1:], {"-d", "-n", "-O", "-s", "-u", "-C", "-c"})][:1]
+        elif name in ("export", "declare", "typeset", "local", "readonly"):
+            for x in t[1:]:
+                if x.startswith(("-", "+")) or "=" in x:
+                    continue
+                if x.upper().startswith("TF_CLI_ARGS"):
+                    self.deny(f"variabile {x}: inietta opzioni nei comandi terraform/tofu e non è consentita")
+                elif EXEC_ENV.get(x) == "deny" or EXEC_ENV_RE.fullmatch(x):
+                    self.exec_env(x, None, ctx)
+            return
+        for n in names:
+            if n.upper().startswith("TF_CLI_ARGS"):
+                self.deny(f"variabile {n}: inietta opzioni nei comandi terraform/tofu e non è consentita")
+            self.exec_env(n, None, ctx)
 
     def set_var(self, name: str, value: str, dyn: bool) -> None:
         self.vars[name] = None if dyn else value
@@ -439,11 +523,11 @@ class Analyzer:
                 args = args[1:]
                 if not args:
                     # assegnazioni da sole: valgono per i comandi successivi della stessa riga
-                    self.check_assigns(assigns)
+                    self.check_assigns(assigns, ctx)
                     for (name, value), dyn in zip(assigns, dyns):
                         self.set_var(name, value, dyn)
                     return
-            self.check_assigns(assigns)
+            self.check_assigns(assigns, ctx)
             ctx.env.update(dict(assigns))
             if not args:
                 return
@@ -660,6 +744,8 @@ class Analyzer:
     # ------------------------------------------------------------ smistamento
 
     def dispatch(self, name: str, args: List[Arg], ctx: Ctx) -> str:
+        if name in ("read", "printf", "mapfile", "readarray", "export", "declare", "typeset", "local", "readonly"):
+            self.builtin_names(name, args, ctx)
         if name in ("cd", "pushd"):
             self.cd(args, ctx)
             return RO
@@ -696,7 +782,7 @@ class Analyzer:
                 if m:
                     assigns.append((m.group(1), m.group(2)))
                     self.set_var(m.group(1), m.group(2), a.dyn)
-            self.check_assigns(assigns)
+            self.check_assigns(assigns, ctx)
             return DELEGATED
         if name == "alias":
             for a in args[1:]:
@@ -1036,7 +1122,7 @@ class Analyzer:
         if path.text.startswith(("/dev/", "/proc/")):
             self.deny(f"script letto da {path.text}: contenuto non verificabile")
             return RW
-        resolved = self.resolve_all(path.text, ctx.cwds)
+        resolved = [] if self.exec_env_set(ctx) else self.resolve_all(path.text, ctx.cwds)
         for p in resolved:
             sp = str(p)
             if sp in self.kit_install or (sp in self.kit_setup and len(flags) <= 1
@@ -1129,7 +1215,7 @@ class Analyzer:
         if script.dyn:
             self.deny(f"script python non determinabile ({script.text}): non verificabile")
             return RW
-        if all(re.fullmatch(r"-[BIuEsSOq]+", o) for o in opts):
+        if all(re.fullmatch(r"-[BIuEsSOq]+", o) for o in opts) and not self.exec_env_set(ctx):
             paths = self.resolve_all(script.text, ctx.cwds)
             kit = [p for p in paths if str(p) in self.kit_scripts]
             other = [p for p in paths if str(p) not in self.kit_scripts and p.is_file()]
@@ -1496,13 +1582,20 @@ class Analyzer:
                 continue
             elif x.startswith("-"):
                 pass
+            elif MAKE_SHELL_RE.match(x):
+                m = MAKE_SHELL_RE.match(x)
+                overrides[m.group(1)] = m.group(2)
             elif ASSIGN_RE.match(x):
                 m = ASSIGN_RE.match(x)
                 overrides[m.group(1)] = m.group(2)
             else:
                 goals.append(x)
             i += 1
+        self.check_assigns([(k, v) for k, v in overrides.items() if k != "SHELL"], ctx)
         overrides = {**ctx.env, **overrides}
+        for k in ("SHELL", "MAKESHELL", ".SHELLFLAGS"):
+            if k in overrides:
+                self.make_shell(k, overrides[k], "riga di comando")
         eval_text = "\n".join(evals)
         stdin_text: Optional[str] = None
         if mfile is not None and (mfile == "-" or STDIN_PATH_RE.fullmatch(mfile)):
@@ -1540,10 +1633,25 @@ class Analyzer:
             if evals:
                 # `--eval`/`-E` si valutano prima dei Makefile
                 text = eval_text + "\n" + (text or "")
+            for line in make_lines(mf, text):
+                m = None if line.startswith("\t") else MAKE_SHELL_RE.match(line)
+                if m:
+                    self.make_shell(m.group(1), m.group(2), mf.name)
             recipes = make_recipes(mf, goals, overrides, text=text)
             if recipes:
                 self.script(recipes, [mf.parent], ctx.depth + 1)
         return RW
+
+    def make_shell(self, name: str, value: str, origin: str) -> None:
+        """`SHELL`/`.SHELLFLAGS` di make: consentite solo le shell standard e le opzioni di `set`."""
+        value = value.strip()
+        if name == ".SHELLFLAGS":
+            toks = value.split()
+            ok = all(SAFE_SHELLFLAG_RE.fullmatch(x) for x in toks) and any(re.fullmatch(r"-\w*c\w*", x) for x in toks)
+        else:
+            ok = bool(SAFE_SHELL_RE.fullmatch(value))
+        if not ok:
+            self.deny(f"`make`: {name} = {value} ({origin}) fa eseguire le ricette da un programma non verificato")
 
     def at(self, name: str, args: List[Arg], ctx: Ctx) -> str:
         """`at`/`batch`: lo script del job arriva da `-f file` o dallo stdin, e si analizza come uno script sh."""
@@ -1649,11 +1757,15 @@ class Analyzer:
                 if x == "-c" and i + 1 < len(args):
                     key, _, val = args[i + 1].text.partition("=")
                     self.git_key(key, val, ctx)
+                if x == "--config-env" and i + 1 < len(args):
+                    self.git_config_env(args[i + 1].text.partition("=")[0])
                 if x in ("-C", "--work-tree") and i + 1 < len(args):
                     d = args[i + 1]
                     cwds = [UNKNOWN_DIR] if d.dyn else self.resolve_all(d.text, cwds)
                 i += 2
                 continue
+            if x.startswith("--config-env="):
+                self.git_config_env(x.split("=", 2)[1])
             if x.startswith("-"):
                 i += 1
                 continue
@@ -1778,6 +1890,12 @@ class Analyzer:
             pos = pos[1:]
         if len(pos) >= 2:
             self.git_key(pos[0].text, pos[1].text, ctx)
+
+    def git_config_env(self, key: str) -> None:
+        """`git --config-env=<chiave>=<VARIABILE>`: il valore arriva da una variabile e non si può verificare."""
+        k = key.lower()
+        if k.startswith("alias.") or k in GIT_EXEC_KEYS or GIT_EXEC_KEY_RE.fullmatch(k):
+            self.deny(f"configurazione git che esegue comandi ({key}) presa da una variabile: non verificabile")
 
     def git_key(self, key: str, val: str, ctx: Ctx) -> None:
         k = key.lower()
