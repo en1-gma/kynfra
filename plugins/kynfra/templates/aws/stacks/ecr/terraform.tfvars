@@ -1,0 +1,10 @@
+project              = "{{ project }}"
+environment          = "{{ environment }}"
+region               = "{{ region }}"
+account_id           = "{{ account_id }}"
+owner                = "{{ owner }}"
+cost_center          = "{{ cost_center }}"
+repositories         = "{{ repositories }}"
+pull_principals      = "{{ pull_principals }}"
+untagged_expiry_days = {{ untagged_expiry_days }}
+keep_last            = {{ keep_last }}

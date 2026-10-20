@@ -65,6 +65,8 @@ VARIANTS = {
     "spa": [{"hosted_zone": "existing:Z0123456789ABCDEFGHIJ", "api_origin": "backend"}],
     # replica in un'altra regione e segreti con lettori e Lambda di rotazione (la chiave "_tfvars" sostituisce testo
     # nei terraform.tfvars generati: struttura che il generatore non sa passare)
+    "ecr": [{"repositories": "api,worker,jobs-nightly", "keep_last": "50",
+             "pull_principals": "arn:aws:iam::123456789012:role/acme-eks-node,arn:aws:iam::123456789012:role/acme-app"}],
     "secrets": [{"replica_region": "eu-west-1", "_tfvars": [
         ('    description = "Credenziali del database dell\'applicazione"\n    readers     = []\n    # rotation_lambda_arn',
          '    description         = "Credenziali del database dell\'applicazione"\n'

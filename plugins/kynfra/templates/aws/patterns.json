@@ -149,5 +149,43 @@
       "readers è facoltativo: aggiungilo più tardi con gli ARN di ruoli già esistenti se vuoi una concessione anche nella resource policy; lo stack secrets non legge mai lo stato degli altri stack",
       "Con rotation_lambda_arn la Lambda (di un altro stack) richiede un ruolo con Describe/Get/PutSecretValue e UpdateSecretVersionStage sul segreto, kms:Decrypt e kms:GenerateDataKey sulla chiave, e un aws_lambda_permission per secretsmanager.amazonaws.com"
     ]
+  },
+  "ecr": {
+    "description": "Registry privato di container condiviso tra gli ambienti (envs/shared/ecr): repository con tag immutabili, scansione al push, cifratura con chiave KMS dedicata (rotazione attiva), lifecycle policy (scadenza delle immagini non taggate e conservazione delle ultime N taggate) e repository policy con pull solo per i ruoli indicati e deny fuori dall'account.",
+    "requires": [],
+    "inputs": {
+      "repositories": {
+        "type": "string",
+        "required": true,
+        "example": "api,worker",
+        "help": "Nomi dei repository separati da virgola, in kebab-case (es. api,worker); in un repository kybes uno per services/*/ms/* e jobs/*"
+      },
+      "pull_principals": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "ARN di ruoli IAM dell'account autorizzati al pull, separati da virgola; vuoto = nessuna concessione nella resource policy"
+      },
+      "untagged_expiry_days": {
+        "type": "number",
+        "default": 7,
+        "help": "Giorni dopo i quali scadono le immagini non taggate"
+      },
+      "keep_last": {
+        "type": "number",
+        "default": 30,
+        "help": "Immagini taggate più recenti da conservare per repository"
+      }
+    },
+    "stacks": [
+      "ecr"
+    ],
+    "shared": true,
+    "next_steps": [
+      "Lo stack è condiviso e si genera una sola volta (nessun --env): il DevOps, con le credenziali dell'account {{ account_id }}: cd {{ infra_root }}/envs/shared/ecr && {{ iac_cli }} init && {{ iac_cli }} plan -out=ecr.tfplan && {{ iac_cli }} apply ecr.tfplan",
+      "I workload (EKS, Lambda) leggono repository_urls e repository_arns con terraform_remote_state (chiave {{ project }}/shared/ecr.tfstate); lo stack ecr non legge mai lo stato degli altri stack",
+      "Il push non è concesso dalla repository policy: i ruoli di CI hanno una policy identity con ecr:GetAuthorizationToken e, sull'ARN del repository, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:BatchCheckLayerAvailability; i tag sono immutabili (usa tag unici, es. lo SHA del commit)",
+      "pull_principals è facoltativo: aggiungi più tardi gli ARN dei ruoli dei nodi EKS o delle Lambda se vuoi una concessione anche nella resource policy"
+    ]
   }
 }

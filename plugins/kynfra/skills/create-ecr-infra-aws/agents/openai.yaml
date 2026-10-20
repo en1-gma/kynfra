@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra ECR (AWS)"
+  short_description: "Generate a shared AWS ECR registry with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-ecr-infra-aws to generate the shared ECR stack (private repositories with immutable tags, scanning, KMS and lifecycle policies)."
+policy:
+  allow_implicit_invocation: false
