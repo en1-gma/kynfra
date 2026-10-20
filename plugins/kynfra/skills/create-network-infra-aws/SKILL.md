@@ -11,17 +11,23 @@ Genera il modulo `modules/network` e lo stack `envs/<env>/network` per ogni ambi
 2. **Un solo giro di domande**, solo su ciò che manca:
    - ambienti da generare (default: tutti quelli in config);
    - `vpc_cidr` (default `10.0.0.0/16`, da /16 a /20; se nello stesso account esistono già altre VPC o c'è peering, scegli CIDR che non si sovrappongono);
-   - `az_count` (2 o 3; default 3 in prod, 2 altrove);
+   - `az_count` (2 o 3; default 3 in prod, 2 altrove; per fissare i nomi delle zone usa `availability_zones` nei `tfvars`);
    - `nat_per_az` (default `true` in prod, `false` altrove: un NAT per zona costa di più ma regge il guasto di una zona);
    - `flow_log_retention_days` (default 365 in prod, 90 altrove).
    Gli ambienti già generati non vengono sovrascritti.
 3. **Genera**:
 
    ```bash
-   python3 -B <kit>/scripts/generate.py --pattern network --provider aws --env dev,staging,prod [--var vpc_cidr=10.0.0.0/16] [--var az_count=2] [--var nat_per_az=false] [--var flow_log_retention_days=90]
+   python3 -B <kit>/scripts/generate.py --pattern network --provider aws --env dev,staging,prod [--var vpc_cidr=10.0.0.0/16]
    ```
 
-   I default di prod (3 zone, NAT per zona, retention 365) prevalgono sui default generali ma non su `--var`. Il generatore non sovrascrive file esistenti salvo `--force`, che chiede l'utente. Per vedere le differenze con una versione più recente del kit: `--upgrade`.
+   Per cambiare zone, NAT o retention in dev e staging genera quegli ambienti a parte, senza prod (le `--var` valgono per tutti gli ambienti del comando e non devono indebolire i default di prod):
+
+   ```bash
+   python3 -B <kit>/scripts/generate.py --pattern network --provider aws --env dev,staging [--var az_count=3] [--var nat_per_az=true] [--var flow_log_retention_days=180]
+   ```
+
+   I default di prod (3 zone, NAT per zona, retention 365) prevalgono sui default generali ma non su `--var`; in prod la retention dei flow log non può scendere sotto 365 giorni (validazione del modulo). Il generatore non sovrascrive file esistenti salvo `--force`, che chiede l'utente. Per vedere le differenze con una versione più recente del kit: `--upgrade`.
 4. **Personalizzazioni** (altri endpoint, CIDR per ambiente diversi nei `tfvars`) solo con gli strumenti di modifica dei file, mai con redirect o `sed -i` da shell: ogni scrittura passa dalle regole. Mantieni letterali gli attributi di sicurezza, `enable_key_rotation = true`, la retention dei log e il security group di default senza regole.
 5. **Controlla**: `python3 -B <kit>/scripts/arch_check.py . --external` e correggi la causa di ogni finding (mai soppressioni inline). Se mancano strumenti esterni proponi `/kynfra:tools`.
 6. **Riepiloga** in poche righe:

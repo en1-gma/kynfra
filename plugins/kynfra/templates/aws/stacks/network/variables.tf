@@ -43,6 +43,12 @@ variable "az_count" {
   description = "Numero di zone di disponibilità (2 o 3)."
 }
 
+variable "availability_zones" {
+  type        = list(string)
+  description = "Nomi delle zone da usare (vuoto = le prime az_count zone disponibili)."
+  default     = []
+}
+
 variable "nat_per_az" {
   type        = bool
   description = "true crea un NAT gateway per zona (produzione), false ne crea uno solo."

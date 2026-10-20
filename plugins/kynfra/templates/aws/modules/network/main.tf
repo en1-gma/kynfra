@@ -1,6 +1,4 @@
 data "aws_availability_zones" "available" {
-  state = "available"
-
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]
@@ -13,11 +11,11 @@ data "aws_region" "current" {}
 
 locals {
   name          = "${var.project}-${var.environment}"
-  azs           = slice(data.aws_availability_zones.available.names, 0, var.az_count)
+  azs           = length(var.availability_zones) > 0 ? var.availability_zones : slice(data.aws_availability_zones.available.names, 0, var.az_count)
   az_index      = { for i, az in local.azs : tostring(i) => az }
   internet      = "0.0.0.0/0"
   https_port    = 443
-  subnet_bits   = 4 # /16 -> /20
+  subnet_bits   = 4 # prefisso della subnet = prefisso della VPC + 4 (da /20 a /24)
   public_base   = 0
   private_base  = 4
   isolated_base = 8
@@ -206,6 +204,36 @@ resource "aws_vpc_endpoint" "s3" {
   vpc_endpoint_type = "Gateway"
   route_table_ids   = concat([for k in sort(keys(aws_route_table.private)) : aws_route_table.private[k].id], [aws_route_table.isolated.id])
 
+  # Solo i bucket dell'account (più il bucket AWS dei layer ECR, necessario al pull delle immagini).
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "BucketsOfThisAccount"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = "*"
+        Condition = {
+          StringEquals = {
+            "aws:ResourceAccount"  = data.aws_caller_identity.current.account_id
+            "aws:PrincipalAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      {
+        Sid       = "EcrLayers"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "arn:${data.aws_partition.current.partition}:s3:::prod-${data.aws_region.current.region}-starport-layer-bucket/*"
+        Condition = {
+          StringEquals = { "aws:PrincipalAccount" = data.aws_caller_identity.current.account_id }
+        }
+      }
+    ]
+  })
+
   tags = {
     Name = "${local.name}-s3"
   }
@@ -307,6 +335,7 @@ resource "aws_iam_role" "flow_logs" {
         Action    = "sts:AssumeRole"
         Condition = {
           StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+          ArnLike      = { "aws:SourceArn" = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:vpc-flow-log/*" }
         }
       }
     ]

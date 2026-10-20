@@ -40,9 +40,9 @@
     },
     "env_defaults": {
       "prod": {
-        "az_count": "3",
-        "nat_per_az": "true",
-        "flow_log_retention_days": "365"
+        "az_count": 3,
+        "nat_per_az": true,
+        "flow_log_retention_days": 365
       }
     },
     "stacks": [

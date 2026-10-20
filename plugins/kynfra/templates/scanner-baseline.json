@@ -23,13 +23,13 @@
       "id": "CKV_AWS_394",
       "envs": "*",
       "paths": ["modules/network/**"],
-      "reason": "Le zone si ottengono con data aws_availability_zones e slice dei primi az_count nomi, così il modulo funziona in ogni regione: i nomi delle zone cambiano da regione a regione e da account a account e non si possono scrivere nel template. Chi vuole fissarle può filtrare per zone-name nel modulo del proprio progetto."
+      "reason": "Le zone si ottengono con data aws_availability_zones (opt-in non richiesto) e slice dei primi az_count nomi, così il modulo funziona in ogni regione: i nomi delle zone cambiano da regione a regione e da account a account e non si possono scrivere nel template. Chi vuole fissarle passa l'input availability_zones del modulo (lista di az_count nomi, validata)."
     },
     {
       "id": "CKV_AWS_338",
       "envs": "*",
       "paths": ["modules/network/**"],
-      "reason": "Flow log della VPC: un anno di retention in prod (365 giorni da env_defaults del pattern, verificati dai test) e 90 giorni in dev e staging per contenere i costi. Il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
+      "reason": "Flow log della VPC: 90 giorni in dev e staging per contenere i costi. In prod il modulo impone almeno 365 giorni con una validazione di flow_log_retention_days (environment = prod), quindi la voce non nasconde regressioni di prod; il default di prod è 365 da env_defaults. Il controllo scatta sul file del modulo, dove l'ambiente non è noto, quindi la voce vale per il percorso del modulo."
     }
   ],
   "trivy": []
