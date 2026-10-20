@@ -259,7 +259,7 @@ def norm_name(text: str, lower: bool = True) -> str:
         base = base.lower()
     base = re.sub(r"\.exe$", "", base)
     if base and base[0] != "@":
-        base = re.split(r"[@:]", base, 1)[0]
+        base = re.split(r"[@:]", base, maxsplit=1)[0]
     m = TF_NAME_RE.fullmatch(base)
     if m:
         name = m.group(1)

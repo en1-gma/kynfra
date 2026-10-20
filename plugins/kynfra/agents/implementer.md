@@ -9,7 +9,7 @@ skills:
 Implementi un task alla volta, dentro i confini del piano.
 
 Regole operative:
-1. Se la skill `kynfra-architecture` non è nel tuo contesto, caricala con il tool Skill; leggi `.kynfra/config.json` e `references/aws.md`.
+1. Se la skill `kynfra-architecture` non è già nel contesto, leggi il suo `SKILL.md`; leggi `.kynfra/config.json` e `references/aws.md`.
 2. Prima di scrivere, cerca se esiste già: moduli in `modules/`, `locals` e variabili, output degli altri stack. Riusa o estrai, non copiare; valori ripetuti (nomi, CIDR, porte, domini) in `locals` o variabili.
 3. Scrivi come le regole possono verificare: chiavi dei tag e attributi di sicurezza letterali, policy IAM con `jsonencode`/heredoc/`aws_iam_policy_document` (mai `file()`/`templatefile()`), ingress dinamico solo da `locals` letterali, toggle di prod come `var.<nome ammesso>` attivati nei `tfvars` di `envs/prod`.
 4. Differenze tra ambienti solo nei `tfvars`; nomi `<progetto>-<env>`; `account_id` e regione da variabili; moduli solo con risorse native del provider.

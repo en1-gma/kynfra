@@ -1,4 +1,5 @@
 """Test delle skill e degli agenti di base di kynfra."""
+import json
 import re
 import sys
 import unittest
@@ -70,19 +71,38 @@ class SkillsTest(unittest.TestCase):
         for pattern in ("network", "spa", "backend", "elb", "eks", "ecr", "secrets"):
             self.assertRegex(ref, rf"(?m)^## .*\b{pattern}\b")
 
+    def test_brand_color_matches_plugin(self):
+        brand = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        color = next(v for k, v in _walk(brand) if k == "brandColor")
+        for name in CORE:
+            with self.subTest(skill=name):
+                y = (SKILLS / name / "agents" / "openai.yaml").read_text(encoding="utf-8")
+                self.assertIn(f'brand_color: "{color}"', y)
+
     def test_tools_skill_one_at_a_time(self):
         text = (SKILLS / "kynfra-tools" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("uno strumento alla volta", text)
-        for needle in ("tools.py status", "tools.py plan", "--approved-by", "tools.lock.json"):
+        for needle in ("tools.py status", "tools.py plan", "--approved-by", "tools.lock.json", "richiesto", "opzionale"):
             self.assertIn(needle, text)
+        found = False
         for line in text.splitlines():
             m = re.search(r"tools\.py install\s+(.*)", line)
             if m:
-                words = [w for w in m.group(1).split() if not w.startswith("-")]
-                # primo argomento: lo strumento; il valore di --approved-by è tra virgolette
-                self.assertLessEqual(len(re.findall(r"<tool>|<strumento>|\b(?:terraform|tofu|opentofu|tflint|checkov|trivy)\b",
-                                                    m.group(1).split("--approved-by")[0])), 1, line)
-                self.assertTrue(words)
+                found = True
+                before = m.group(1).split("--approved-by")[0]
+                args = [w for w in before.split() if not w.startswith("-")]
+                self.assertEqual(len(args), 1, line)
+        self.assertTrue(found)
+
+
+def _walk(d):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            yield k, v
+            yield from _walk(v)
+    elif isinstance(d, list):
+        for v in d:
+            yield from _walk(v)
 
 
 if __name__ == "__main__":

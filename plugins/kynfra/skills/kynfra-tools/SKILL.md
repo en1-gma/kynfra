@@ -10,7 +10,7 @@ Gli strumenti (Terraform o OpenTofu, TFLint, ruleset AWS di TFLint, Checkov o Tr
 Il kit si trova in `tools/kynfra/plugins/kynfra/` (nel repository del plugin: `plugins/kynfra/`); di seguito `<kit>`.
 
 1. Stato: `python3 -B <kit>/scripts/tools.py status`. Elenca per ogni strumento se è installato, la versione e se corrisponde al registro. Se tutto è a posto, fermati e dillo.
-2. Per **ogni strumento mancante o in versione non conforme**, in sequenza e uno strumento alla volta:
+2. Considera solo gli strumenti marcati `richiesto` da `status` che risultano `MANCA` o `NON CONFORME`; quelli `opzionale` (OpenTofu se si usa Terraform e viceversa, Trivy se lo scanner è Checkov e viceversa) si saltano, salvo richiesta esplicita dell'utente. Nomi accettati da `plan`/`install`: `terraform`, `opentofu` (o `tofu`), `tflint`, `tflint_ruleset_aws` (o `tflint-ruleset-aws`), `checkov`, `trivy`. Per ognuno, in sequenza e uno strumento alla volta:
    1. esegui `python3 -B <kit>/scripts/tools.py plan <strumento>` e mostra all'utente l'output (nome, versione, sorgente, checksum atteso, cartella di destinazione);
    2. fai all'utente **una sola domanda, per quello strumento**: "Installo `<strumento>` <versione> da <sorgente>?";
    3. solo se la risposta è un sì esplicito per quello strumento, esegui un solo comando:
