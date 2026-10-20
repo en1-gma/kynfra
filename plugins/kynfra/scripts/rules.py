@@ -384,3 +384,226 @@ def iter_project_files(proj: Path, cfg: dict) -> Iterable[Tuple[str, Path]]:
             if irel is None or glob_match(rel, cfg["exclude"]) or not is_iac_file(irel):
                 continue
             yield rel, Path(dirpath) / fn
+
+
+# ---------------------------------------------------------------- regole a livello di progetto
+
+STACK_MESSAGES = {
+    "remote-state-none": "stack senza backend remoto: aggiungi backend \"s3\" con encrypt = true e use_lockfile = true "
+                         "(chiave <progetto>/<env>/<stack>.tfstate)",
+    "remote-state-many": "stack con {n} backend: ne serve esattamente uno (backend \"s3\" cifrato, con lock)",
+    "version-required": "stack senza required_version: aggiungi terraform {{ required_version = \"~> X.Y\" }}",
+    "required-tags": "stack senza provider \"aws\" con default_tags: aggiungi il provider con i tag obbligatori "
+                     "(Project, Environment, Owner, CostCenter, ManagedBy = \"kynfra\")",
+    "account-guard": "stack senza provider \"aws\" con allowed_account_ids: aggiungi allowed_account_ids = "
+                     "[var.account_id] così un apply sull'account sbagliato fallisce",
+}
+
+PORT_ATTRS = {"port", "from_port", "to_port", "container_port", "target_port"}
+CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+FQDN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$", re.I)
+NOT_DOMAIN_SUFFIXES = (".tf", ".tfvars", ".json", ".yaml", ".yml", ".py", ".js", ".mjs", ".zip", ".txt", ".sh",
+                       ".html", ".css", ".md", ".pem", ".crt", ".tpl", ".bicep", ".jar", ".sql", ".xml")
+IGNORED_CIDRS = {"0.0.0.0/0"}
+TF_EXT = (".tf", ".tf.json")
+
+
+def _is_tf(irel: str) -> bool:
+    return irel.lower().endswith(TF_EXT)
+
+
+def _parse_project(proj: Path, cfg: dict) -> List[Tuple[str, str, str, list]]:
+    """[(rel, irel, testo, blocchi)] dei file IaC del progetto; i template native/ non hanno blocchi HCL."""
+    import hcl
+    import rules_common
+
+    out = []
+    for rel, path in iter_project_files(proj, cfg):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        irel = infra_rel(rel, cfg) or rel
+        blocks = [] if rules_common._native(irel) else hcl.parse(text, posixpath.basename(irel).lower())
+        out.append((rel, irel, text, blocks))
+    return out
+
+
+def _group_stacks(parsed) -> Dict[Tuple[str, str], List[Tuple[str, list]]]:
+    stacks: Dict[Tuple[str, str], List[Tuple[str, list]]] = {}
+    for _, irel, _, blocks in parsed:
+        key = stack_of(irel)
+        if key is None:
+            continue
+        entry = stacks.setdefault(key, [])
+        if len(irel.split("/")) == 4 and _is_tf(irel):  # solo i file del root module, non le sottocartelle
+            entry.append((irel, blocks))
+    return stacks
+
+
+def load_stacks(proj: Path, cfg: dict) -> Dict[Tuple[str, str], List[Tuple[str, list]]]:
+    """(ambiente, stack) -> [(percorso relativo a infra_root, blocchi)] dei file .tf di envs/<env>/<stack>/."""
+    return _group_stacks(_parse_project(proj, cfg))
+
+
+def _all_blocks(files: List[Tuple[str, list]]):
+    import rules_common
+    for _, blocks in files:
+        yield from rules_common._walk_blocks(blocks)
+
+
+def _unit_findings(dir_rel: str, files: List[Tuple[str, list]], cfg: dict, backend: bool) -> List[Finding]:
+    """Regole d'insieme su un root module (stack o bootstrap)."""
+    out: List[Finding] = []
+    top = [b for _, blocks in files for b in blocks]
+    terraform = [b for b in top if b.type == "terraform"]
+    if backend:
+        n = sum(len(t.children("backend")) for t in terraform)
+        if n == 0:
+            out.append(Finding("remote-state", "block", dir_rel, 0, STACK_MESSAGES["remote-state-none"]))
+        elif n > 1:
+            out.append(Finding("remote-state", "block", dir_rel, 0, STACK_MESSAGES["remote-state-many"].format(n=n)))
+    if not any(t.get("required_version") is not None for t in terraform):
+        out.append(Finding("version-pinning", "block", dir_rel, 0, STACK_MESSAGES["version-required"]))
+    if "aws" in (cfg.get("providers") or []):
+        aws = [b for b in top if b.type == "provider" and b.labels[:1] == ["aws"]]
+        if not aws:
+            out.append(Finding("required-tags", "block", dir_rel, 0, STACK_MESSAGES["required-tags"]))
+            out.append(Finding("account-guard", "block", dir_rel, 0, STACK_MESSAGES["account-guard"]))
+    return out
+
+
+def _stack_findings(parsed, stacks, per_file: List[Finding], cfg: dict) -> List[Finding]:
+    root = cfg.get("infra_root", ".")
+    prefix = "" if root in ("", ".") else root + "/"
+    units: List[Tuple[str, List[Tuple[str, list]], bool]] = []
+    for (env, stack), files in sorted(stacks.items()):
+        units.append((f"{prefix}envs/{env}/{stack}/", files, True))
+    boot = [(irel, blocks) for _, irel, _, blocks in parsed if irel.startswith("bootstrap/") and _is_tf(irel)]
+    if boot:
+        units.append((f"{prefix}bootstrap/", boot, False))
+    out: List[Finding] = []
+    for dir_rel, files, backend in units:
+        for f in _unit_findings(dir_rel, files, cfg, backend):
+            # niente doppioni: se un file dello stack ha già un finding della stessa regola, basta quello
+            if any(g.rule == f.rule and g.path.startswith(dir_rel) for g in per_file):
+                continue
+            out.append(f)
+    return out
+
+
+def _domain_literals(attr, key: str = "", depth: int = 0):
+    """(chiave, valore) delle stringhe e interi letterali di un attributo, anche dentro liste e oggetti."""
+    if depth > 6:
+        return
+    entries = attr.entries()
+    if entries is not None:
+        for k, sub in entries.items():
+            yield from _domain_literals(sub, k, depth + 1)
+        return
+    yield from _flatten(attr.literal(), attr.name if not key else key)
+
+
+def _flatten(value, key: str):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield from _flatten(v, str(k))
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _flatten(v, key)
+    elif isinstance(value, (str, int)) and not isinstance(value, bool):
+        yield key, value
+
+
+def _domain_value(key: str, value, project: str) -> Optional[str]:
+    """Chiave di confronto se il letterale è di dominio (CIDR, FQDN, porta, nome con prefisso progetto)."""
+    if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+        port = int(value)
+        return f"porta {port}" if key in PORT_ATTRS and 0 < port <= 65535 and port not in (80, 443) else None
+    if not isinstance(value, str) or "${" in value or not value:
+        return None
+    low = value.lower()
+    if CIDR_RE.match(value):
+        return None if value in IGNORED_CIDRS else value
+    if project and low.startswith(project.lower() + "-") and len(value) > len(project) + 1:
+        return value
+    if FQDN_RE.match(value) and not low.endswith(NOT_DOMAIN_SUFFIXES) and not low.endswith(".amazonaws.com"):
+        return value
+    return None
+
+
+def literal_reuse(files: List[Tuple[str, list]], cfg: dict, stop_gate: bool = False) -> List[Finding]:
+    """Letterali di dominio ripetuti in più file di modules/ ed envs/ (`files` = [(percorso, blocchi)]).
+
+    Warn per ogni file che ripete un valore già visto in un file precedente; con `stop_gate=True` aggiunge un block se
+    la quota di occorrenze duplicate supera la soglia. I valori nei *.tfvars sono definizioni e non si contano."""
+    import rules_common
+
+    sev = cfg["rules"].get("literal-reuse", "warn")
+    if sev == "off":
+        return []
+    project = cfg.get("project") or ""
+    occ: Dict[str, List[Tuple[str, int]]] = {}
+    for path, blocks in files:
+        irel = infra_rel(path, cfg)
+        if irel is None or irel.lower().endswith(rules_common.TFVARS_EXT) or \
+                irel.split("/")[0] not in ("modules", "envs"):
+            continue
+        for block in blocks:
+            for b in rules_common._walk_blocks([block]):
+                for attr in b.attrs.values():
+                    for key, value in _domain_literals(attr):
+                        dv = _domain_value(key, value, project)
+                        if dv is not None:
+                            occ.setdefault(dv, []).append((path, attr.line))
+    out: List[Finding] = []
+    dup_values: Dict[str, List[Tuple[str, int]]] = {}
+    for val, locs in occ.items():
+        paths = {p for p, _ in locs}
+        if len(paths) < 2:
+            continue
+        dup_values[val] = locs
+        first = locs[0][0]
+        seen = {first}
+        for p, line in locs:
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(Finding("literal-reuse", sev, p, line,
+                               f"'{val}' è già scritto in {first}: definiscilo una volta in locals o in una variabile "
+                               "(tfvars per i valori di ambiente) e referenzialo"))
+    if stop_gate:
+        cr = cfg["literal_reuse"]
+        total = sum(len(v) for v in occ.values())
+        if total >= int(cr.get("min_values", 20)) and total:
+            dup = sum(len(v) - 1 for v in dup_values.values())
+            ratio = dup / total
+            limit = float(cr.get("max_duplicate_ratio", 0.10))
+            if ratio > limit:
+                worst = sorted(dup_values.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:15]
+                detail = "\n".join(
+                    f"    '{v}' ×{len(locs)}: {', '.join(f'{p}:{ln}' for p, ln in locs[:4])}"
+                    f"{' …' if len(locs) > 4 else ''}" for v, locs in worst)
+                root = cfg.get("infra_root", ".")
+                out.append(Finding("literal-reuse", "block", root if root else ".", 0,
+                                   f"{ratio:.1%} delle occorrenze di letterali di dominio è duplicato ({dup} su "
+                                   f"{total}), soglia {limit:.0%}: definisci ogni valore una volta (locals o "
+                                   f"variabili) e referenzialo. Più ripetuti:\n{detail}", "ratio"))
+    return out
+
+
+def check_project(proj: Path, cfg: dict, stop_gate: bool = False) -> List[Finding]:
+    """Controlli sull'intero progetto: check_content su ogni file IaC, regole d'insieme per stack e bootstrap,
+    literal-reuse (con la soglia bloccante solo se `stop_gate`). Percorsi relativi al progetto."""
+    parsed = _parse_project(proj, cfg)
+    per_file: List[Finding] = []
+    for rel, _, text, _ in parsed:
+        per_file.extend(check_content(rel, text, cfg))
+    extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
+    reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate)
+    out = per_file + _post_process(extra, cfg)
+    for f in _post_process(reuse, cfg):
+        if f.resource == "ratio":  # la quota oltre soglia blocca sempre (se la regola non è off)
+            f.severity = "block"
+        out.append(f)
+    return out
