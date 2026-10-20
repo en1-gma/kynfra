@@ -36,8 +36,8 @@ class RulesCoreTest(unittest.TestCase):
 
     def test_default_rules_keys(self):
         warn = {k for k, v in rules.DEFAULT_RULES.items() if v == "warn"}
-        self.assertEqual(warn, {"variables-typed", "region-pinning", "literal-reuse"})
-        self.assertEqual(len(rules.DEFAULT_RULES), 27)
+        self.assertEqual(warn, {"variables-typed", "region-pinning", "literal-reuse", "config"})
+        self.assertEqual(len(rules.DEFAULT_RULES), 28)
 
     def test_load_config_and_discovery(self):
         with tempfile.TemporaryDirectory() as d:

@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ CONFIG_REL = ".kynfra/config.json"
 # Le regole oltre la base sono implementate nei task successivi; i nomi sono fissi.
 DEFAULT_RULES: Dict[str, str] = {
     "protected-files": "block",
+    "config": "warn",
     "folder-layout": "block",
     "hcl-syntax": "block",
     "remote-state": "block",
@@ -330,8 +332,98 @@ def _rule_name(fn: Callable) -> str:
     return getattr(fn, "__name__", "hcl-syntax").replace("_", "-")
 
 
-def _post_process(findings: List[Finding], cfg: dict) -> List[Finding]:
-    """Severità da cfg["rules"] ("off" elimina il finding); le eccezioni si aggiungono qui (Task 7)."""
+def _parse_exception(e: object) -> Optional[Tuple[dict, date]]:
+    """(eccezione, scadenza) se la voce è ben formata (rule, path, reason, expires YYYY-MM-DD), altrimenti None."""
+    if not isinstance(e, dict):
+        return None
+    for key in ("rule", "path", "reason", "expires"):
+        if not isinstance(e.get(key), str) or not e[key].strip():
+            return None
+    try:
+        return e, date.fromisoformat(e["expires"].strip())
+    except ValueError:
+        return None
+
+
+# Regole di integrità e fail-closed: nessuna eccezione può spegnerle.
+NEVER_EXCEPTED = ("hcl-syntax", "protected-files", "config")
+
+
+def apply_exceptions(findings: List[Finding], cfg: dict, today: Optional[date] = None,
+                     report_config: bool = True) -> List[Finding]:
+    """Applica le eccezioni di `.kynfra/config.json`. Un'eccezione valida (non scaduta) elimina i finding di `rule`
+    il cui percorso (relativo a infra_root) combacia con il glob `path` e, se indicato, con `resource`. Scaduta: il
+    finding resta e il messaggio riporta data e motivo. Malformata: ignorata, più un finding `config` (warn) per
+    voce, se `report_config`."""
+    today = today or date.today()
+    valid: List[Tuple[dict, date]] = []
+    out: List[Finding] = []
+    bad: List[int] = []
+    for i, e in enumerate(cfg.get("exceptions") or []):
+        parsed = _parse_exception(e)
+        if parsed is None:
+            bad.append(i)
+        else:
+            valid.append(parsed)
+    for f in findings:
+        irel = infra_rel(f.path, cfg)
+        expired: Optional[Tuple[dict, date]] = None
+        suppressed = False
+        if f.rule not in NEVER_EXCEPTED and irel is not None:
+            for e, exp in valid:
+                if e["rule"] != f.rule or not _glob_match(irel, e["path"].strip()):
+                    continue
+                if e.get("resource") and e["resource"] != f.resource:
+                    continue
+                if exp < today:
+                    expired = expired or (e, exp)
+                else:
+                    suppressed = True
+                    break
+        if suppressed:
+            continue
+        if expired:
+            e, exp = expired
+            f.message += f" (eccezione scaduta il {exp.isoformat()}: {e['reason'].strip()})"
+        out.append(f)
+    sev = cfg["rules"].get("config", "warn")
+    if report_config and sev != "off":
+        for i in bad:
+            out.append(Finding("config", sev, CONFIG_REL, 0,
+                               f"eccezione #{i} in exceptions ignorata: servono rule, path, reason ed expires "
+                               "(YYYY-MM-DD) validi"))
+    return out
+
+
+def _glob_match(irel: str, pat: str) -> bool:
+    pat = pat.lstrip("./") if pat.startswith("./") else pat
+    if fnmatch.fnmatch(irel, pat):
+        return True
+    if pat.endswith("/**") and (irel == pat[:-3] or irel.startswith(pat[:-2])):
+        return True
+    return pat.startswith("**/") and fnmatch.fnmatch(irel, pat[3:])
+
+
+def baseline_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "templates" / "scanner-baseline.json"
+
+
+def scanner_skips(cfg: dict, env: Optional[str]) -> List[str]:
+    """ID dello scanner configurato esclusi dalla baseline del kit per l'ambiente (env=None: solo le voci "*")."""
+    try:
+        data = json.loads(baseline_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    ids: List[str] = []
+    for entry in data.get(cfg.get("scanner") or "checkov") or []:
+        envs = entry.get("envs")
+        if envs == "*" or (env is not None and isinstance(envs, list) and env in envs):
+            ids.append(entry["id"])
+    return ids
+
+
+def _post_process(findings: List[Finding], cfg: dict, report_config: bool = True) -> List[Finding]:
+    """Severità da cfg["rules"] ("off" elimina il finding), poi le eccezioni dell'utente."""
     out: List[Finding] = []
     for f in findings:
         sev = cfg["rules"].get(f.rule, f.severity)
@@ -339,7 +431,7 @@ def _post_process(findings: List[Finding], cfg: dict) -> List[Finding]:
             continue
         f.severity = sev
         out.append(f)
-    return out
+    return apply_exceptions(out, cfg, report_config=report_config)
 
 
 def check_content(rel: str, text: str, cfg: dict) -> List[Finding]:
@@ -376,7 +468,7 @@ def check_content(rel: str, text: str, cfg: dict) -> List[Finding]:
                                     "verifica il file a mano"))
     for f in findings:
         f.path = rel
-    return _post_process(findings, cfg)
+    return _post_process(findings, cfg, report_config=False)  # il finding `config` lo dà check_project, una volta
 
 
 # ---------------------------------------------------------------- scansione progetto
@@ -652,8 +744,8 @@ def check_project(proj: Path, cfg: dict, stop_gate: bool = False) -> List[Findin
     extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
     extra.extend(_provider_project_findings(parsed, cfg))
     reuse = literal_reuse([(rel, blocks) for rel, _, _, blocks in parsed], cfg, stop_gate)
-    out = per_file + _post_process(extra, cfg)
-    for f in _post_process(reuse, cfg):
+    out = per_file + _post_process(extra, cfg)  # unico punto che segnala le eccezioni malformate
+    for f in _post_process(reuse, cfg, report_config=False):
         if f.resource == "ratio":  # la quota oltre soglia blocca sempre (se la regola non è off)
             f.severity = "block"
         out.append(f)

@@ -1,0 +1,5 @@
+{
+  "_comment": "Baseline dello scanner del kit: le voci si aggiungono con i task dei pattern, ciascuna con il suo motivo (reason) e gli ambienti in cui vale (envs: lista oppure \"*\").",
+  "checkov": [],
+  "trivy": []
+}
