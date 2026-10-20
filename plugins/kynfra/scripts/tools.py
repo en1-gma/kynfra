@@ -397,15 +397,11 @@ def _trusted(proj: Path, path: str, tool: str) -> bool:
 
 
 def resolve_binary(proj: Path, name: str) -> Optional[str]:
-    """.kynfra/bin -> .kynfra/venv/bin -> PATH. Un binario locale il cui SHA256 non coincide con il registro
-    non è affidabile e viene saltato (verify_lock lo segnala)."""
-    tool = _tool_of_binary(name)
-    locked = read_lock(proj)["tools"].get(tool) if tool else None
+    """.kynfra/bin -> .kynfra/venv/bin -> PATH. Un binario sotto .kynfra si restituisce solo se è nel registro con
+    binary_sha256 coincidente (_trusted); altrimenti si salta e si passa al PATH."""
+    tool = _tool_of_binary(name) or name
     for cand in _candidates(proj, name):
-        if cand.is_file() and os.access(cand, os.X_OK):
-            want = (locked or {}).get("binary_sha256")
-            if want and sha256_file(cand) != want:
-                continue
+        if cand.is_file() and os.access(cand, os.X_OK) and _trusted(proj, str(cand), tool):
             return str(cand)
     return shutil.which(name)
 

@@ -279,6 +279,8 @@ class ExternalStepsTest(Base):
     def test_resolve_prefers_project_bin(self):
         self.config()
         make_bin(self.proj / ".kynfra" / "bin", ("terraform",))
+        (self.proj / ".kynfra/tools.lock.json").write_text(json.dumps(
+            {"tools": {"terraform": {"binary_sha256": external.tools.sha256_file(self.proj / ".kynfra/bin/terraform")}}}))
         self.bin.mkdir()
         self.assertEqual(external._resolve(self.proj, "terraform"), str(self.proj / ".kynfra/bin/terraform"))
         self.assertIsNone(external._resolve(self.proj, "nonesiste-xyz"))

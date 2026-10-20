@@ -199,11 +199,8 @@ class ToolsTest(unittest.TestCase):
         self.assertIn("_macOS-ARM64.tar.gz", p["url"])
 
     def test_resolve_prefers_local_bin(self):
-        bindir = self.proj / ".kynfra/bin"
-        bindir.mkdir(parents=True)
-        f = bindir / "tflint"
-        f.write_text("#!/bin/sh\n")
-        f.chmod(0o755)
+        self.do_install("tflint")
+        f = self.proj / ".kynfra/bin/tflint"
         pathdir = self.proj / "pathbin"
         pathdir.mkdir()
         g = pathdir / "tflint"
@@ -214,6 +211,29 @@ class ToolsTest(unittest.TestCase):
             self.assertIsNone(tools.resolve_binary(self.proj, "nonesiste-xyz"))
             f.unlink()
             self.assertEqual(tools.resolve_binary(self.proj, "tflint"), str(g))
+
+    def _planted(self, lock_entry):
+        marker = self.proj / "marker"
+        f = self.proj / ".kynfra/bin/terraform"
+        f.parent.mkdir(parents=True)
+        f.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        f.chmod(0o755)
+        if lock_entry is not None:
+            (self.proj / ".kynfra/tools.lock.json").write_text(json.dumps({"tools": {"terraform": lock_entry}}))
+        empty = self.proj / "emptypath"
+        empty.mkdir()
+        with unittest.mock.patch.dict(os.environ, {"PATH": str(empty)}):
+            self.assertIsNone(tools.resolve_binary(self.proj, "terraform"))
+            import external
+            step = external.Step("fmt", ["terraform", "fmt"], self.proj, True)
+            external.run_external([step], True, self.proj)
+        self.assertFalse(marker.exists())
+
+    def test_unlocked_project_binary_not_resolved_nor_run(self):
+        self._planted(None)
+
+    def test_lock_without_binary_sha_not_resolved_nor_run(self):
+        self._planted({"version": "1.0.0"})
 
     def test_resolve_skips_tampered_binary(self):
         self.do_install("tflint")
@@ -320,6 +340,8 @@ class ToolsTest(unittest.TestCase):
         f = bindir / "tflint"
         f.write_text("#!/bin/sh\necho $TFLINT_PLUGIN_DIR > \"$0.out\"\n")
         f.chmod(0o755)
+        (self.proj / ".kynfra/tools.lock.json").write_text(json.dumps(
+            {"tools": {"tflint": {"binary_sha256": tools.sha256_file(f)}}}))
         step = external.Step("tflint", ["tflint"], self.proj, True)
         external.run_external([step], False, self.proj)
         self.assertEqual((bindir / "tflint.out").read_text().strip(), str(self.proj / ".kynfra/tflint.d/plugins"))
