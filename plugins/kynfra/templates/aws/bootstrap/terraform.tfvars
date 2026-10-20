@@ -1,0 +1,5 @@
+project     = "{{ project }}"
+region      = "{{ region }}"
+account_id  = "{{ account_id }}"
+owner       = "{{ owner }}"
+cost_center = "{{ cost_center }}"

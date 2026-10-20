@@ -1,9 +1,32 @@
 {
-  "_comment": "Versioni da verificare e aggiornare nel Task 14",
-  "terraform": {"version": "1.10.5"},
-  "opentofu": {"version": "1.9.0"},
-  "tflint": {"version": "0.55.1"},
-  "tflint_ruleset_aws": {"version": "0.38.0"},
-  "checkov": {"version": "3.2.370"},
-  "trivy": {"version": "0.58.2"}
+  "_verified": {
+    "date": "2026-10-20",
+    "note": "Ultime stabili verificate alla data indicata. Unico punto delle versioni: le leggono generate.py (template, come ~> MAJOR.MINOR per Terraform e provider, esatte per i chart), tools.py (con gli URL di tools-catalog.json, che contiene anche gli URL dei file SHA256SUMS) e install.sh (ruleset di TFLint).",
+    "sources": {
+      "terraform": "https://api.releases.hashicorp.com/v1/releases/terraform/latest",
+      "opentofu": "https://github.com/opentofu/opentofu/releases/latest",
+      "aws_provider": "https://registry.terraform.io/providers/hashicorp/aws/latest",
+      "helm_provider": "https://registry.terraform.io/providers/hashicorp/helm/latest",
+      "random_provider": "https://registry.terraform.io/providers/hashicorp/random/latest",
+      "tflint": "https://github.com/terraform-linters/tflint/releases/latest",
+      "tflint_ruleset_aws": "https://github.com/terraform-linters/tflint-ruleset-aws/releases/latest",
+      "checkov": "https://pypi.org/project/checkov/",
+      "trivy": "https://github.com/aquasecurity/trivy/releases/latest",
+      "aws_load_balancer_controller_chart": "https://github.com/kubernetes-sigs/aws-load-balancer-controller/blob/v3.6.0/helm/aws-load-balancer-controller/Chart.yaml",
+      "karpenter_chart": "https://karpenter.sh/docs/getting-started/getting-started-with-karpenter/",
+      "keda_chart": "https://github.com/kedacore/charts/releases/latest"
+    }
+  },
+  "terraform": {"version": "1.16.6"},
+  "opentofu": {"version": "1.13.1"},
+  "aws_provider": {"version": "6.69.1"},
+  "helm_provider": {"version": "3.3.0"},
+  "random_provider": {"version": "3.9.1"},
+  "tflint": {"version": "0.64.0"},
+  "tflint_ruleset_aws": {"version": "0.49.0"},
+  "checkov": {"version": "3.3.30"},
+  "trivy": {"version": "0.76.0"},
+  "aws_load_balancer_controller_chart": {"version": "3.6.0"},
+  "karpenter_chart": {"version": "1.15.0"},
+  "keda_chart": {"version": "2.21.0"}
 }

@@ -1,0 +1,16 @@
+{
+  "_comment": "Registro dei pattern AWS per generate.py. Per pattern: description; requires (pattern da generare prima); inputs {nome: {type: string|bool|number, required, default, help, example (valore usato dalla CI del kit per gli input richiesti senza default)}}; env_defaults {ambiente: {input: valore}} (valori prod-restrittivi, prevalgono sul default ma non su --var); stacks (cartelle di stacks/ copiate in envs/<env>/<stack>/, o envs/shared/<stack>/ se shared); dir (cartella copiata una volta sola sotto infra_root, es. bootstrap); next_steps (passi per il DevOps, con segnaposto). Il modulo, se esiste, sta in modules/<pattern>/.",
+  "bootstrap": {
+    "description": "Stato remoto dell'account: bucket S3 <progetto>-tfstate-<account_id> con versioning, SSE-KMS (chiave con rotazione), public access block, policy TLS only e prevent_destroy. Unico root module con backend locale.",
+    "requires": [],
+    "inputs": {},
+    "stacks": [],
+    "shared": false,
+    "dir": "bootstrap",
+    "next_steps": [
+      "Il DevOps, con le credenziali dell'account {{ account_id }}: cd {{ infra_root }}/bootstrap && {{ iac_cli }} init && {{ iac_cli }} plan -out=bootstrap.tfplan && {{ iac_cli }} apply bootstrap.tfplan",
+      "Conserva lo stato locale del bootstrap (terraform.tfstate) in un posto sicuro e fuori dal repository: descrive solo il bucket dello stato",
+      "Gli stack in envs/ usano il backend s3 con bucket {{ state_bucket }}, region {{ region }}, encrypt = true e use_lockfile = true"
+    ]
+  }
+}
