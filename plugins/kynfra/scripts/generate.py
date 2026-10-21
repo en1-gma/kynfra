@@ -232,9 +232,14 @@ def _account_context(cfg: dict, ctx: Dict[str, str], account: str) -> Dict[str, 
 
 
 def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[str, str],
-            pattern: str) -> Dict[str, str]:
+            pattern: str, prod: Optional[bool] = None) -> Dict[str, str]:
+    """Valori degli input: --var, poi env_defaults dell'ambiente, poi il default. `prod` (default: ambiente chiamato
+    `prod`) applica a `env` i valori prod-restrittivi di env_defaults["prod"] (ambienti marcati `"prod": true`)."""
     out: Dict[str, str] = {}
-    env_defaults = (entry.get("env_defaults") or {}).get(env or "", {})
+    by_env = entry.get("env_defaults") or {}
+    if prod is None:
+        prod = env == "prod"
+    env_defaults = by_env.get("prod", {}) if prod else ({} if env == "prod" else by_env.get(env or "", {}))
     for name, spec in sorted(entry["inputs"].items()):
         if name in base or name in CONTEXT_KEYS:
             raise GenerateError(f"input '{name}' del pattern '{pattern}' ha un nome riservato")
@@ -450,7 +455,8 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
             raise GenerateError(f"il pattern '{pattern}' ha stack per ambiente: indica --env <ambiente>[,<ambiente>]")
         for env in targets:
             account = _default_account(cfg, envs, values) if env == "shared" else _env_account(cfg, env)
-            env_ctx = _merge(base, _inputs(entry, values, env, base, pattern), _account_context(cfg, base, account),
+            env_ctx = _merge(base, _inputs(entry, values, env, base, pattern, prod=env in rules.prod_envs(cfg)),
+                             _account_context(cfg, base, account),
                              {"environment": env}, extra or {})
             for stack in stacks:
                 ctx = _merge(env_ctx, {"stack": stack, "state_key": f"{base['project']}/{env}/{stack}.tfstate"})

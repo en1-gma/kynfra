@@ -41,12 +41,14 @@ Ogni scrittura è valutata sul file risultante; lo stop gate e la CI controllano
 
 | Regola | Cosa rifiuta |
 |---|---|
-| `protected-files` | modifiche ai file protetti (config, kit, impostazioni e hook dell'agente, regole/skill/agenti di kynfra, workflow CI di kynfra, `.terraform.lock.hcl`) |
-| `config` (warn) | `.kynfra/config.json` incompleta o incoerente: segnala campi mancanti, ambienti senza account, tag vuoti |
-| `folder-layout` | file IaC fuori da `bootstrap/`, `modules/`, `envs/<env>/<stack>/`, `envs/shared/<stack>/`, `native/`; ambienti non in config; nomi non kebab-case |
+| `protected-files` | modifiche ai file protetti (config, anche una `.kynfra/` annidata, kit, impostazioni e hook dell'agente, regole/skill/agenti di kynfra, workflow CI di kynfra, `.terraform.lock.hcl`) |
+| `config` (warn) | `.kynfra/config.json` incompleta o incoerente: voci di `exceptions` malformate, valori di tipo sbagliato (tornano al default, mai regole spente), provider non supportati |
+| `folder-layout` | file IaC fuori da `bootstrap/`, `modules/`, `envs/<env>/<stack>/`, `envs/shared/<stack>/`, `native/`; ambienti non in config; nomi non kebab-case; link simbolici sotto `infra_root` (e scritture attraverso un link) |
 | `hcl-syntax` | file `.tf`, `.tfvars`, `.tf.json` che non si possono leggere (parentesi, stringhe o heredoc non chiusi) |
 | `remote-state` | root module senza backend `s3` con `encrypt = true` e `use_lockfile = true` (letterali); backend locale fuori da `bootstrap/` |
-| `version-pinning` | `required_version` o `required_providers` senza vincolo pessimistico `~>`; moduli esterni senza versione o ref fissa (git con `?ref=` di un tag o commit) |
+| `version-pinning` | `required_version` o `required_providers` senza vincolo pessimistico `~>` |
+| `module-source` | moduli non locali (registry, git, URL, archivi, anche con versione fissa) o locali che escono da `infra_root`: solo `./` e `../` verso `modules/<pattern>/` |
+| `provider-source` | provider fuori dall'elenco ammesso (`hashicorp/aws`, `helm`, `random`, `kubernetes`, `tls`, `archive`): in `required_providers` (sorgente esplicita o implicita), nei blocchi `provider` e nei tipi di risorsa/data source (es. `local_file`, `http`, `null_resource`) |
 | `static-credentials` | `access_key`, `secret_key`, token nei provider, nei `tfvars` o nelle variabili con default: usa profilo, SSO o OIDC |
 | `secrets` | segreti in chiaro (chiavi, password, connection string) in `.tf`, `.tfvars`, `native/`; `secret_string` con letterale; variabili riservate senza `sensitive = true` o con default |
 | `required-tags` | provider `aws` senza `default_tags` con `Project`, `Environment`, `Owner`, `CostCenter`, `ManagedBy = "kynfra"`: le **chiavi** devono essere letterali |

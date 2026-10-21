@@ -24,6 +24,8 @@ DEFAULT_RULES: Dict[str, str] = {
     "hcl-syntax": "block",
     "remote-state": "block",
     "version-pinning": "block",
+    "module-source": "block",
+    "provider-source": "block",
     "static-credentials": "block",
     "secrets": "block",
     "required-tags": "block",
@@ -141,27 +143,110 @@ def _normalize_infra_root(value) -> str:
     return norm.strip("/") or "."
 
 
+SEVERITIES = ("block", "warn", "off")
+DEFAULT_ENVIRONMENTS = ("dev", "staging", "prod")
+
+
+def _str_list(value, key: str, problems: List[str]) -> List[str]:
+    """Lista di stringhe: una stringa diventa [stringa]; altri tipi o voci non stringa si scartano con un problema."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if not isinstance(value, list):
+        problems.append(f"{key} deve essere una lista di stringhe: valore ignorato")
+        return []
+    out = [v for v in value if isinstance(v, str) and v]
+    if len(out) != len(value):
+        problems.append(f"{key}: voci non stringa ignorate")
+    return out
+
+
+def _dict(value, key: str, problems: List[str]) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        problems.append(f"{key} deve essere un oggetto: valore ignorato")
+        return {}
+    return dict(value)
+
+
+def _str(value, key: str, default: str, problems: List[str]) -> str:
+    if value is None or value == "":
+        return default
+    if not isinstance(value, str):
+        problems.append(f"{key} deve essere una stringa: uso \"{default}\"")
+        return default
+    return value
+
+
 def normalize_config(raw: dict) -> dict:
+    """Config con tipi garantiti: i valori di tipo sbagliato tornano ai default (fail closed: mai regole spente per
+    un errore di battitura) e finiscono in `config_problems`, che check_project segnala con la regola `config`."""
+    problems: List[str] = []
     cfg = dict(raw)
     cfg["iac"] = raw.get("iac") if raw.get("iac") in ("terraform", "opentofu") else "terraform"
-    cfg["providers"] = list(raw.get("providers") or ["aws"])
-    cfg["infra_root"] = _normalize_infra_root(raw.get("infra_root"))
-    cfg["project"] = raw.get("project") or ""
-    cfg["region"] = raw.get("region") or "eu-south-1"
-    cfg["accounts"] = dict(raw.get("accounts") or {})
-    cfg["environments"] = dict(raw.get("environments")
-                               or {e: {"account": "main"} for e in ("dev", "staging", "prod")})
-    cfg["tags"] = dict(raw.get("tags") or {})
-    cfg["rules"] = {**DEFAULT_RULES, **(raw.get("rules") or {})}
-    cfg["exceptions"] = list(raw.get("exceptions") or [])
-    cfg["scanner"] = raw.get("scanner") or "checkov"
+    providers = _str_list(raw.get("providers"), "providers", problems) or ["aws"]
+    unknown = [p for p in providers if p not in PROVIDER_MODULES]
+    if unknown:
+        problems.append(f"providers: {', '.join(unknown)} non supportati (nella v1 solo aws): nessuna regola per "
+                        "questi provider")
+    cfg["providers"] = providers
+    infra_root = raw.get("infra_root")
+    if infra_root is not None and not isinstance(infra_root, str):
+        problems.append("infra_root deve essere una stringa: uso \".\"")
+        infra_root = "."
+    cfg["infra_root"] = _normalize_infra_root(infra_root)
+    cfg["project"] = _str(raw.get("project"), "project", "", problems)
+    cfg["region"] = _str(raw.get("region"), "region", "eu-south-1", problems)
+    cfg["accounts"] = _dict(raw.get("accounts"), "accounts", problems)
+    envs = _dict(raw.get("environments"), "environments", problems) \
+        or {e: {"account": "main"} for e in DEFAULT_ENVIRONMENTS}
+    for name, value in list(envs.items()):
+        if not isinstance(value, dict):
+            problems.append(f"environments.{name} deve essere un oggetto: uso l'account \"main\"")
+            envs[name] = {"account": "main"}
+        elif "prod" in value and not isinstance(value["prod"], bool):
+            problems.append(f"environments.{name}.prod deve essere true o false: ambiente trattato come prod")
+            envs[name] = {**value, "prod": True}
+    cfg["environments"] = envs
+    cfg["tags"] = _dict(raw.get("tags"), "tags", problems)
+    sev = _dict(raw.get("rules"), "rules", problems)
+    bad = sorted(k for k, v in sev.items() if v not in SEVERITIES)
+    if bad:
+        problems.append(f"rules: severità non valida per {', '.join(bad)} (ammesse block, warn, off): uso il default")
+    cfg["rules"] = {**DEFAULT_RULES, **{k: v for k, v in sev.items() if v in SEVERITIES}}
+    exc = raw.get("exceptions")
+    # non lista: una sola voce malformata, che apply_exceptions segnala con la regola `config`
+    cfg["exceptions"] = list(exc) if isinstance(exc, list) else ([] if exc is None else [None])
+    cfg["scanner"] = _str(raw.get("scanner"), "scanner", "checkov", problems)
+    stop = raw.get("stop_gate")
+    if isinstance(stop, bool):
+        stop = {"enabled": stop}
     cfg["stop_gate"] = {"enabled": True, "only_if_changes": True, "max_blocks": 3, "commands": [],
-                        **(raw.get("stop_gate") or {})}
-    cfg["literal_reuse"] = {"max_duplicate_ratio": 0.10, "min_values": 20, **(raw.get("literal_reuse") or {})}
-    cfg["exclude"] = list(raw.get("exclude") or []) + ["**/.terraform/**"]
-    cfg["kybes"] = raw.get("kybes")
-    cfg["public_routes"] = list(raw.get("public_routes") or [])
+                        **_dict(stop, "stop_gate", problems)}
+    cfg["literal_reuse"] = {"max_duplicate_ratio": 0.10, "min_values": 20,
+                            **_dict(raw.get("literal_reuse"), "literal_reuse", problems)}
+    cfg["exclude"] = _str_list(raw.get("exclude"), "exclude", problems) + ["**/.terraform/**"]
+    kyb = raw.get("kybes")
+    if kyb is not None and not isinstance(kyb, dict):
+        problems.append("kybes deve essere un oggetto: sezione ignorata")
+        kyb = None
+    cfg["kybes"] = kyb
+    cfg["public_routes"] = _str_list(raw.get("public_routes"), "public_routes", problems)
+    cfg["config_problems"] = problems
     return cfg
+
+
+def prod_envs(cfg: dict) -> set:
+    """Ambienti di produzione: quelli con `"prod": true` in environments; un ambiente chiamato `prod` lo è salvo
+    `"prod": false` esplicito."""
+    out = set()
+    for name, value in (cfg.get("environments") or {}).items():
+        flag = value.get("prod") if isinstance(value, dict) else None
+        if flag is True or (flag is None and name == "prod"):
+            out.add(name)
+    return out
 
 
 def canonical_rel(rel: str, proj: Path) -> str:
@@ -268,6 +353,9 @@ def protected_reason(rel: str, cfg: Optional[dict] = None) -> Optional[str]:
     for prefix, why in PROTECTED_PATHS:
         if low == prefix.rstrip("/") or low.startswith(prefix):
             return why
+    if ".kynfra" in low.split("/"):
+        # una .kynfra/config.json annidata diventerebbe il progetto più vicino per i file sotto di lei
+        return "una cartella .kynfra (anche annidata) definisce un progetto kynfra: la modifica solo l'utente"
     if low.rsplit("/", 1)[-1] == ".terraform.lock.hcl" and (cfg is None or infra_rel(rel, cfg) is not None):
         return "il lock dei provider lo rigenera solo `terraform init` (stop gate o utente)"
     return None
@@ -515,6 +603,32 @@ def iter_project_files(proj: Path, cfg: dict) -> Iterable[Tuple[str, Path]]:
             if irel is None or glob_match(rel, cfg["exclude"]) or not is_iac_file(irel):
                 continue
             yield rel, Path(dirpath) / fn
+
+
+def symlink_findings(proj: Path, cfg: dict) -> List[Finding]:
+    """Link simbolici sotto infra_root (file o cartelle, esclusi .terraform/.git/node_modules): Terraform li segue,
+    i controlli no (il contenuto sta altrove), quindi bloccano."""
+    root_rel = cfg.get("infra_root", ".")
+    root = proj if root_rel in ("", ".") else proj / root_rel
+    out: List[Finding] = []
+    if root.is_symlink():
+        return [Finding("folder-layout", "block", root_rel, 0, SYMLINK_MESSAGE)]
+    if not root.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(proj).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir
+        dirnames[:] = sorted(d for d in dirnames if d not in (".terraform", ".git", "node_modules"))
+        for name in sorted(dirnames + filenames):
+            full = Path(dirpath) / name
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if full.is_symlink() and not glob_match(rel, cfg["exclude"]):
+                out.append(Finding("folder-layout", "block", rel, 0, SYMLINK_MESSAGE))
+    return out
+
+
+SYMLINK_MESSAGE = ("link simbolico sotto infra_root: Terraform segue il link ma i controlli di kynfra non vedono il "
+                   "contenuto; sostituiscilo con il file o la cartella vera (moduli in modules/<pattern>/)")
 
 
 # ---------------------------------------------------------------- regole a livello di progetto
@@ -791,6 +905,9 @@ def check_project(proj: Path, cfg: dict, stop_gate: bool = False, stats: Optiona
     for rel, _, text, _ in parsed:
         per_file.extend(check_content(rel, text, cfg))
     extra = _stack_findings(parsed, _group_stacks(parsed), per_file, cfg)
+    extra.extend(symlink_findings(proj, cfg))
+    for msg in cfg.get("config_problems") or []:
+        extra.append(Finding("config", "warn", CONFIG_REL, 0, msg))
     extra.extend(_provider_project_findings(parsed, cfg))
     if cfg.get("kybes"):
         import kybes

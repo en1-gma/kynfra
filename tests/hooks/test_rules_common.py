@@ -94,39 +94,40 @@ class VersionPinningTest(unittest.TestCase):
     def test_version_pinning_required_version_open(self):
         self.assertEqual(len(self.tf('terraform {\n  required_version = ">= 1.5"\n}\n')), 1)
 
-    def test_version_pinning_git_module_without_ref(self):
+    # moduli: dalla final review fix wave (C1) solo locali, regola `module-source` (version-pinning non li guarda più)
+    def test_module_source_git_module_without_ref(self):
         f = run(STACK + "main.tf", 'module "x" {\n  source = "git::https://github.com/a/b.git"\n}\n',
-                "version-pinning")
+                "module-source")
         self.assertEqual(len(f), 1)
 
-    def test_version_pinning_git_module_with_branch_ref(self):
+    def test_module_source_git_module_with_branch_ref(self):
         f = run(STACK + "main.tf", 'module "x" {\n  source = "git::https://github.com/a/b.git?ref=main"\n}\n',
-                "version-pinning")
+                "module-source")
         self.assertEqual(len(f), 1)
 
-    def test_version_pinning_git_module_with_tag_ref(self):
-        self.assertEqual(run(STACK + "main.tf",
-                             'module "x" {\n  source = "git::https://github.com/a/b.git?ref=v1.2.3"\n}\n',
-                             "version-pinning"), [])
+    def test_module_source_git_module_with_tag_ref_still_blocked(self):
+        self.assertEqual(len(run(STACK + "main.tf",
+                                 'module "x" {\n  source = "git::https://github.com/a/b.git?ref=v1.2.3"\n}\n',
+                                 "module-source")), 1)
 
-    def test_version_pinning_local_module(self):
+    def test_module_source_local_module(self):
         self.assertEqual(run(STACK + "main.tf", 'module "spa" {\n  source = "../../../modules/spa"\n}\n',
-                             "version-pinning"), [])
+                             "module-source"), [])
 
-    def test_version_pinning_registry_module_without_version(self):
+    def test_module_source_registry_module_without_version(self):
         f = run(STACK + "main.tf", 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n}\n',
-                "version-pinning")
+                "module-source")
         self.assertEqual(len(f), 1)
 
-    def test_version_pinning_registry_module_pessimistic_ok(self):
-        self.assertEqual(run(STACK + "main.tf",
-                             'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n'
-                             '  version = "~> 5.1"\n}\n', "version-pinning"), [])
+    def test_module_source_registry_module_with_version_still_blocked(self):
+        for ver in ("~> 5.1", "5.1.2"):
+            self.assertEqual(len(run(STACK + "main.tf",
+                                     'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n'
+                                     f'  version = "{ver}"\n}}\n', "module-source")), 1)
 
-    def test_version_pinning_registry_module_with_version(self):
-        self.assertEqual(run(STACK + "main.tf",
-                             'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n'
-                             '  version = "5.1.2"\n}\n', "version-pinning"), [])
+    def test_version_pinning_ignores_modules(self):
+        self.assertEqual(run(STACK + "main.tf", 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n}\n',
+                             "version-pinning"), [])
 
 
 class StaticCredentialsDataRefTest(unittest.TestCase):

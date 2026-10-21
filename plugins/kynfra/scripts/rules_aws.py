@@ -33,7 +33,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import hcl
 import rules
-from rules import DEFAULT_RULES, Finding, stack_of
+from rules import DEFAULT_RULES, Finding, prod_envs, stack_of
 
 MESSAGES = {
     # s3-private
@@ -209,10 +209,11 @@ def _f(rule: str, irel: str, line: int, key: str, resource: str = "", **fmt) -> 
 
 
 def is_prod(irel: str, cfg: dict) -> bool:
-    """True per i file degli stack di prod (envs/prod/<stack>/…). Nei moduli il valore di prod non è determinabile:
-    le regole "solo prod" lì si verificano sui tfvars degli stack di prod (`prod_toggles`)."""
+    """True per i file degli stack degli ambienti di produzione (envs/<env>/<stack>/… con <env> in
+    `rules.prod_envs`: flag `"prod": true` in config, o l'ambiente chiamato `prod`). Nei moduli il valore di prod non
+    è determinabile: le regole "solo prod" lì si verificano sui tfvars degli stack di prod (`prod_toggles`)."""
     st = stack_of(irel)
-    return st is not None and st[0] == "prod"
+    return st is not None and st[0] in prod_envs(cfg)
 
 
 # ---------------------------------------------------------------- utilità sui blocchi
@@ -570,6 +571,10 @@ def _is_allow(effect) -> bool:
     return not (isinstance(effect, str) and not isinstance(effect, Expr) and effect.lower() == "deny")
 
 
+# Resource che vale come "*": "*", "arn:*", "arn:aws:*", "arn:*:*:*:*:*" (partizione e campi tutti jolly)
+WILDCARD_RESOURCE = re.compile(r"\*|arn(?::(?:\*|aws[a-z-]*|\$\{[^}]*partition[^}]*\}))?(?::\*)+(?:/\*)?")
+
+
 def _strs(values: list) -> List[str]:
     return [v.lower() for v in values if isinstance(v, str) and not isinstance(v, Expr)]
 
@@ -578,7 +583,7 @@ def _statement_problem(s: Stmt) -> Optional[str]:
     if not _is_allow(s.effect):
         return None
     actions = _strs(s.actions)
-    star_res = "*" in _strs(s.resources) or s.not_resources
+    star_res = any(WILDCARD_RESOURCE.fullmatch(r) for r in _strs(s.resources)) or s.not_resources
     if star_res and ("*" in actions or "*:*" in actions or s.not_actions):
         return "iam-wildcard"
     if star_res and any(fnmatch.fnmatchcase("iam:passrole", a) for a in actions):
@@ -1523,10 +1528,11 @@ def prod_toggles(files: Files, cfg: dict) -> List[Finding]:
         return found
 
     module_toggles = {d: toggle_vars(fs, True) for d, fs in dirs.items() if d.startswith("modules/")}
+    prod_set = prod_envs(cfg)
     out: List[Finding] = []
     for d, fs in sorted(dirs.items()):
         parts = d.split("/")
-        if len(parts) != 3 or parts[0] != "envs" or parts[1] != "prod":
+        if len(parts) != 3 or parts[0] != "envs" or parts[1] not in prod_set:
             continue
         stack = parts[2]
         checked = set()

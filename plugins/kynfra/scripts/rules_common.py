@@ -13,6 +13,7 @@ Le regole a livello di stack (`remote-state`, `version-pinning` su `required_ver
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -28,12 +29,14 @@ MESSAGES = {
     "version-provider": "provider '{name}' senza versione bloccata: aggiungi version = \"~> X.Y\" in "
                         "required_providers",
     "version-provider-range": "provider '{name}' con vincolo aperto ({value}): usa il vincolo pessimistico \"~> X.Y\"",
-    "version-module-source": "source del modulo non letterale: Terraform richiede un percorso o un indirizzo fisso",
-    "version-module-git": "modulo git senza ref fissa: aggiungi ?ref=<tag o commit> (non un branch), o meglio usa un "
-                          "modulo locale in modules/",
-    "version-module-registry": "modulo del registry senza versione fissa: aggiungi version = \"X.Y.Z\" (o \"~> X.Y\"), "
-                               "o meglio usa un modulo locale in modules/",
-    "version-module-remote": "modulo remoto senza versione verificabile: usa un modulo locale in modules/",
+    "module-source": "source del modulo non letterale: Terraform richiede un percorso fisso; usa un modulo locale in "
+                     "modules/<pattern>/",
+    "module-remote": "modulo esterno ({src}): kynfra ammette solo moduli locali (./ o ../ dentro infra_root), così "
+                     "ogni risorsa passa dalle regole; porta il codice in modules/<pattern>/",
+    "module-escape": "modulo locale fuori da infra_root ({src}): i controlli non lo vedono; spostalo in "
+                     "modules/<pattern>/",
+    "provider-source": "provider '{name}' con sorgente {source} non ammessa: kynfra usa solo {allowed} (un provider "
+                       "diverso lo scarica `init` senza controlli); per un'eccezione chiedi all'utente (exceptions)",
     "static-credentials": "credenziale statica ({name}): niente chiavi nel codice o nei tfvars, autenticati con "
                           "profilo, SSO o OIDC",
     "secrets": "segreto in chiaro: crea il contenitore (aws_secretsmanager_secret) e inserisci il valore fuori da "
@@ -101,9 +104,14 @@ REGION_RE = re.compile(r"\b(us|eu|ap|sa|ca|me|af|il|mx|cn)(-gov|-iso[a-z]?)?-(no
 ACCOUNT_RE = re.compile(r"(?<![\d.])\d{12}(?![\d.])")
 
 PINNED_EXACT = re.compile(r"=?\s*v?\d+(\.\d+){1,2}(-[0-9A-Za-z.]+)?")
-GIT_SOURCE = re.compile(r"^(git::|hg::|git@|github\.com/|bitbucket\.org/)|\.git($|[/?])")
-GIT_REF_OK = re.compile(r"v?\d+(\.\d+)*([-+.][0-9A-Za-z.]+)?|[0-9a-f]{7,40}")
-REGISTRY_SOURCE = re.compile(r"([A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?[\w-]+/[\w-]+/[\w-]+(//.*)?")
+
+# provider ammessi (spec §12: niente codice di terze parti); nome locale = tipo del provider
+ALLOWED_PROVIDERS = ("hashicorp/aws", "hashicorp/helm", "hashicorp/random", "hashicorp/kubernetes", "hashicorp/tls",
+                     "hashicorp/archive")
+ALLOWED_PROVIDER_NAMES = tuple(s.split("/", 1)[1] for s in ALLOWED_PROVIDERS)
+REGISTRY_HOSTS = ("registry.terraform.io/", "registry.opentofu.org/")
+# tipi di risorsa del provider interno di Terraform (terraform_data, terraform_remote_state)
+BUILTIN_PROVIDER = "terraform"
 
 TFVARS_EXT = (".tfvars", ".tfvars.json")
 
@@ -222,30 +230,71 @@ def version_pinning(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) ->
                 elif not _pinned(value):
                     out.append(_f("version-pinning", irel, line,
                                   MESSAGES["version-provider-range"].format(name=name, value=ver.raw), "terraform"))
-    for mod in (b for b in blocks if b.type == "module"):
-        msg = _module_problem(mod)
-        if msg:
-            src = mod.get("source")
-            out.append(_f("version-pinning", irel, src.line if src else mod.line, msg, mod.address()))
     return out
 
 
-def _module_problem(mod: hcl.Block) -> Optional[str]:
-    src_attr = mod.get("source")
-    src = src_attr.literal() if src_attr is not None else None
-    if not isinstance(src, str):
-        return MESSAGES["version-module-source"]
-    if src.startswith(("./", "../")):
-        return None
-    if GIT_SOURCE.search(src):
-        m = re.search(r"[?&]ref=([^&]+)", src)
-        return None if m and GIT_REF_OK.fullmatch(m.group(1)) else MESSAGES["version-module-git"]
-    if REGISTRY_SOURCE.fullmatch(src):
-        ver = mod.get("version")
-        value = ver.literal() if ver is not None else None
-        ok = isinstance(value, str) and not re.search(r"[<>!]", value.replace("~>", "")) and _pinned(value)
-        return None if ok else MESSAGES["version-module-registry"]
-    return MESSAGES["version-module-remote"]
+def module_source(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
+    """Solo moduli locali (`./`, `../`) che restano dentro infra_root: registry, git, URL e archivi portano codice
+    che le regole non vedono."""
+    out: List[Finding] = []
+    for mod in (b for b in blocks if b.type == "module"):
+        src_attr = mod.get("source")
+        src = src_attr.literal() if src_attr is not None else None
+        line = src_attr.line if src_attr is not None else mod.line
+        if not isinstance(src, str):
+            msg = MESSAGES["module-source"]
+        elif not src.startswith(("./", "../")):
+            msg = MESSAGES["module-remote"].format(src=src)
+        else:
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(irel), src))
+            msg = MESSAGES["module-escape"].format(src=src) if target == ".." or target.startswith("../") else None
+        if msg:
+            out.append(_f("module-source", irel, line, msg, mod.address()))
+    return out
+
+
+def _provider_source(value: str) -> str:
+    v = value.strip().lower()
+    for host in REGISTRY_HOSTS:
+        if v.startswith(host):
+            return v[len(host):]
+    return v
+
+
+def provider_source(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
+    """Provider ammessi: in required_providers la sorgente (esplicita, o implicita hashicorp/<nome>) è in
+    ALLOWED_PROVIDERS; i blocchi provider e i tipi di risorsa/data source usano un nome locale ammesso."""
+    out: List[Finding] = []
+    allowed = ", ".join(ALLOWED_PROVIDERS)
+    declared = {}
+    for tf in (b for b in blocks if b.type == "terraform"):
+        for rp in tf.children("required_providers"):
+            for name, attr in rp.attrs.items():
+                entries = attr.entries()
+                src = entries.get("source") if entries is not None else None
+                value = src.literal() if src is not None else f"hashicorp/{name}"
+                declared[name] = value
+                if not isinstance(value, str) or _provider_source(value) not in ALLOWED_PROVIDERS:
+                    out.append(_f("provider-source", irel, (src or attr).line,
+                                  MESSAGES["provider-source"].format(name=name, source=src.raw if src is not None
+                                                                     else f'"{value}" (implicita)', allowed=allowed),
+                                  "terraform"))
+    seen = set()
+    for b in blocks:
+        if b.type == "provider" and b.labels:
+            name = b.labels[0]
+        elif b.type in ("resource", "data") and b.labels:
+            name = b.labels[0].split("_", 1)[0]
+        else:
+            continue
+        if name == BUILTIN_PROVIDER or name in declared or name in seen:
+            continue
+        if name not in ALLOWED_PROVIDER_NAMES:
+            seen.add(name)
+            out.append(_f("provider-source", irel, b.line,
+                          MESSAGES["provider-source"].format(name=name, source=f'"hashicorp/{name}" (implicita)',
+                                                             allowed=allowed), b.address()))
+    return out
 
 
 def static_credentials(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> List[Finding]:
@@ -519,6 +568,7 @@ def native_params(irel: str, blocks: List[hcl.Block], text: str, cfg: dict) -> L
     return out
 
 
-COMMON_RULES: List[Callable] = [remote_state, version_pinning, static_credentials, secrets, required_tags,
+COMMON_RULES: List[Callable] = [remote_state, version_pinning, module_source, provider_source,
+                                static_credentials, secrets, required_tags,
                                 account_guard, variables_typed, scanner_suppression, no_provisioners, region_pinning]
 NATIVE_RULES: List[Callable] = [secrets, scanner_suppression, native_params]

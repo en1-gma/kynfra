@@ -35,9 +35,10 @@ In un monorepo ogni progetto ha la sua `.kynfra/config.json`: gli hook usano que
 | `project` | `""` | nome del progetto in kebab-case: prefisso dei nomi (`<progetto>-<env>-…`), delle chiavi di stato e del bucket dello stato |
 | `region` | `eu-south-1` | regione AWS di default (Milano); finisce nei `tfvars`, mai nei moduli |
 | `accounts` | `{}` | account AWS, per nome: `{"main": {"id": "123456789012"}}` (vedi [account](account.md)). Ogni stack riceve `account_id` dai `tfvars` e lo usa in `allowed_account_ids` |
-| `environments` | `dev`, `staging`, `prod` su `main` | ambienti ammessi e account di ciascuno. `folder-layout` rifiuta cartelle `envs/<x>` con `x` non dichiarato (tranne `shared`) |
-| `tags` | `{}` | valori dei tag obbligatori `Owner` e `CostCenter` (gli altri sono calcolati: `Project`, `Environment`, `ManagedBy = "kynfra"`) |
+| `environments` | `dev`, `staging`, `prod` su `main` | ambienti ammessi e account di ciascuno. `folder-layout` rifiuta cartelle `envs/<x>` con `x` non dichiarato (tranne `shared`). `"prod": true` marca un ambiente di produzione (es. `"production": {"account": "main", "prod": true}`): le regole "solo prod" e i default prod-restrittivi del generatore valgono per ogni ambiente marcato; un ambiente chiamato `prod` lo è anche senza flag, salvo `"prod": false`. L'installer imposta il flag con `--prod-envs` |
+| `tags` | `{}` | valori dei tag obbligatori `Owner` e `CostCenter` (gli altri sono calcolati: `Project`, `Environment`, `ManagedBy = "kynfra"`). L'installer li compila con `--owner` e `--cost-center`; vuoti, `generate.py` si ferma |
 | `scanner` | `checkov` | `checkov` o `trivy`. Con Checkov la baseline del kit si applica sull'output JSON; per Trivy non c'è baseline |
+| `config_problems` | calcolata | non si scrive: l'elenco dei valori di tipo sbagliato trovati nella config (tornati al default, mai a regole spente), che `check_project` riporta come avvisi `config` |
 | `rules` | vedi [controlli](controlli.md) | `block`, `warn` oppure `off` per regola; i nomi sconosciuti sono ignorati |
 | `exceptions` | `[]` | eccezioni con scadenza (sotto) |
 | `stop_gate.enabled` | `true` | attiva il controllo finale |
