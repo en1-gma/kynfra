@@ -1,12 +1,6 @@
 variable "project" {
   type        = string
-  description = "Nome del progetto (kebab-case): prefisso dei nomi delle risorse."
-
-  validation {
-    # il nome più lungo con limite stretto è quello dei target group dell'NLB, <project>-<env>-<hash 6>-<porta>: 32
-    condition     = length("${var.project}-${var.environment}") <= 19
-    error_message = "project e environment sono troppo lunghi: <project>-<env> supera i 19 caratteri (i target group dell'NLB, <project>-<env>-<hash>-<porta>, ne ammettono al massimo 32)."
-  }
+  description = "Nome del progetto (kebab-case): prefisso dei nomi delle risorse (limite di <project>-<env> nella validazione di handlers)."
 }
 
 variable "environment" {
@@ -40,6 +34,13 @@ variable "handlers" {
   validation {
     condition     = alltrue([for k, h in var.handlers : can(regex("^[a-z0-9][a-z0-9-]*/(functions|ms)/[a-z0-9][a-z0-9-]*$", k))])
     error_message = "Le chiavi di handlers sono \"<contesto>/functions/<nome>\" o \"<contesto>/ms/<nome>\" in kebab-case."
+  }
+
+  validation {
+    # con microservizi il nome più stretto è quello dei target group dell'NLB, <project>-<env>-<hash 6>-<porta>: 32;
+    # senza, quello delle code e degli altri nomi corti. Qui e non su project: le validazioni non possono citarsi a vicenda
+    condition     = length("${var.project}-${var.environment}") <= (anytrue([for k, h in var.handlers : h.kind == "ms"]) ? 19 : 23)
+    error_message = "project e environment sono troppo lunghi: <project>-<env> supera i 19 caratteri con microservizi (target group dell'NLB, <project>-<env>-<hash>-<porta>, al massimo 32) o i 23 senza."
   }
 
   validation {
@@ -316,18 +317,18 @@ variable "db_instance_identifier" {
 
   validation {
     condition     = !var.has_db || length(var.db_instance_identifier) > 0
-    error_message = "Il progetto ha schemas/db: indica db_instance_identifier (istanza RDS con il segreto gestito da RDS) nei tfvars dello stack."
+    error_message = "Il progetto ha schemas/db: indica db_instance_identifier nei tfvars dello stack (istanza RDS con iam_database_authentication_enabled = true e l'utente db_iam_user creato per l'autenticazione IAM: GRANT rds_iam in PostgreSQL, IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS' in MySQL/MariaDB)."
   }
 }
 
 variable "db_engine_family" {
   type        = string
-  description = "Famiglia del motore del proxy: POSTGRESQL, MYSQL o SQLSERVER."
+  description = "Famiglia del motore del proxy: POSTGRESQL o MYSQL (anche MariaDB). IAM_AUTH non supporta SQL Server."
   default     = "POSTGRESQL"
 
   validation {
-    condition     = contains(["POSTGRESQL", "MYSQL", "SQLSERVER"], var.db_engine_family)
-    error_message = "db_engine_family deve essere POSTGRESQL, MYSQL o SQLSERVER."
+    condition     = contains(["POSTGRESQL", "MYSQL"], var.db_engine_family)
+    error_message = "db_engine_family deve essere POSTGRESQL o MYSQL (anche per MariaDB): l'autenticazione IAM end-to-end di RDS Proxy non supporta SQL Server."
   }
 }
 

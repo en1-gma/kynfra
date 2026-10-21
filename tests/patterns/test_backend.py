@@ -193,6 +193,34 @@ class BackendPatternTest(unittest.TestCase):
             res = generate.generate(proj, cfg, "aws", "backend", ["dev"], {})
             self.assertTrue(any("oidc_audience" in s for s in res["next_steps"]))
 
+    def test_backend_db_engine_iam_auth_only(self):
+        """IAM_AUTH di RDS Proxy: solo famiglie MYSQL (anche MariaDB) e POSTGRESQL; SQLSERVER rifiutato."""
+        entry = generate.load_pattern("aws", "backend")
+        self.assertEqual(entry["inputs"]["db_engine_family"]["choices"], ["POSTGRESQL", "MYSQL"])
+        with tempfile.TemporaryDirectory(prefix="kynfra-backend-eng-") as d:
+            proj = Path(d)
+            cfg = tp.make_project(proj, kybes=True)
+            with self.assertRaisesRegex(generate.GenerateError, "db_engine_family"):
+                generate.generate(proj, cfg, "aws", "backend", ["dev"],
+                                  {"oidc_audience": "acme-api", "db_engine_family": "SQLSERVER"})
+        variables = self.module("variables.tf")
+        self.assertIn('contains(["POSTGRESQL", "MYSQL"], var.db_engine_family)', variables)
+        self.assertNotIn("SQLSERVER", self.module("main.tf") + variables + self.stack("dev", "variables.tf"))
+        # nessun riferimento residuo al segreto gestito da RDS; utenti IAM documentati per PostgreSQL e MySQL
+        texts = [self.module("variables.tf"), self.stack("dev", "variables.tf"),
+                 (tp.PLUGIN / "scripts/generate.py").read_text(encoding="utf-8"),
+                 json.dumps(entry, ensure_ascii=False)]
+        for t in texts:
+            self.assertNotIn("manage_master_user_password", t)
+            self.assertNotIn("segreto gestito da RDS", t)
+        skill = (tp.PLUGIN / "skills/create-backend-infra-aws/SKILL.md").read_text(encoding="utf-8")
+        for needle in ("GRANT rds_iam", "IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'", "REQUIRE SSL",
+                       "iam_database_authentication_enabled = true"):
+            self.assertIn(needle, skill)
+        self.assertIn("iam_database_authentication_enabled = true", entry["inputs"]["db_instance_identifier"]["help"])
+        # limite di <project>-<env>: 19 caratteri solo con microservizi (target group dell'NLB), 23 altrimenti
+        self.assertIn("? 19 : 23", variables)
+
     def test_backend_job_name_collision(self):
         with tempfile.TemporaryDirectory(prefix="kynfra-backend-coll-") as d:
             proj = Path(d)

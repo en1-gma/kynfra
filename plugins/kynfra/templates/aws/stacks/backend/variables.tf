@@ -146,12 +146,12 @@ variable "kubernetes_namespace" {
 
 variable "db_instance_identifier" {
   type        = string
-  description = "Istanza RDS esistente dietro RDS Proxy (con schemas/db), con il segreto gestito da RDS."
+  description = "Istanza RDS esistente dietro RDS Proxy (con schemas/db), con iam_database_authentication_enabled = true e l'utente db_iam_user per l'autenticazione IAM."
 }
 
 variable "db_engine_family" {
   type        = string
-  description = "Famiglia del motore di RDS Proxy: POSTGRESQL, MYSQL o SQLSERVER."
+  description = "Famiglia del motore di RDS Proxy: POSTGRESQL o MYSQL (anche MariaDB)."
 }
 
 variable "context_secrets" {

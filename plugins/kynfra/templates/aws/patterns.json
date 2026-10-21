@@ -1,5 +1,5 @@
 {
-  "_comment": "Registro dei pattern AWS per generate.py. Per pattern: description; requires (pattern da generare prima); inputs {nome: {type: string|bool|number, required, default, help, example (valore usato dalla CI del kit per gli input richiesti senza default, o {ambiente: valore})}}; env_defaults {ambiente: {input: valore}} (valori prod-restrittivi, prevalgono sul default ma non su --var); stacks (cartelle di stacks/ copiate in envs/<env>/<stack>/, o envs/shared/<stack>/ se shared); shared_stacks [{stack, when {input: valore}}] (stack copiati una sola volta in envs/shared/<stack>/ se ogni input di when ha quel valore); single_env (true: un solo ambiente per comando, per input come il dominio che cambiano da ambiente ad ambiente); dir (cartella copiata una volta sola sotto infra_root, es. bootstrap); next_steps (passi per il DevOps, con segnaposto). Il modulo, se esiste, sta in modules/<pattern>/.",
+  "_comment": "Registro dei pattern AWS per generate.py. Per pattern: description; requires (pattern da generare prima); inputs {nome: {type: string|bool|number, required, default, help, choices (valori ammessi), example (valore usato dalla CI del kit per gli input richiesti senza default, o {ambiente: valore})}}; env_defaults {ambiente: {input: valore}} (valori prod-restrittivi, prevalgono sul default ma non su --var); stacks (cartelle di stacks/ copiate in envs/<env>/<stack>/, o envs/shared/<stack>/ se shared); shared_stacks [{stack, when {input: valore}}] (stack copiati una sola volta in envs/shared/<stack>/ se ogni input di when ha quel valore); single_env (true: un solo ambiente per comando, per input come il dominio che cambiano da ambiente ad ambiente); dir (cartella copiata una volta sola sotto infra_root, es. bootstrap); next_steps (passi per il DevOps, con segnaposto). Il modulo, se esiste, sta in modules/<pattern>/.",
   "bootstrap": {
     "description": "Stato remoto dell'account: bucket S3 <progetto>-tfstate-<account_id> con versioning, SSE-KMS (chiave con rotazione), public access block, policy TLS only e prevent_destroy. Unico root module con backend locale.",
     "requires": [],
@@ -192,12 +192,16 @@
         "type": "string",
         "required": false,
         "default": "",
-        "help": "Con schemas/db: istanza RDS esistente (manage_master_user_password = true) dietro RDS Proxy; il database stesso è fuori dalla v1"
+        "help": "Con schemas/db: istanza RDS esistente dietro RDS Proxy con autenticazione IAM end-to-end: iam_database_authentication_enabled = true sull'istanza e l'utente db_iam_user creato nel database (GRANT rds_iam in PostgreSQL, IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS' in MySQL/MariaDB); il database stesso è fuori dalla v1"
       },
       "db_engine_family": {
         "type": "string",
         "default": "POSTGRESQL",
-        "help": "Motore del database per RDS Proxy: POSTGRESQL, MYSQL o SQLSERVER"
+        "choices": [
+          "POSTGRESQL",
+          "MYSQL"
+        ],
+        "help": "Motore del database per RDS Proxy: POSTGRESQL o MYSQL (anche per MariaDB); IAM_AUTH di RDS Proxy non supporta SQL Server"
       }
     },
     "env_defaults": {

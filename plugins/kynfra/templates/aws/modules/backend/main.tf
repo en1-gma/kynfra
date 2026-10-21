@@ -67,7 +67,7 @@ locals {
   pod_policies = { for k, p in local.pods : k => p if p.job != "" || length(p.secrets) > 0 }
   scheduled    = { for j, v in var.jobs : j => v if v.trigger == "schedule" }
 
-  db_ports = { POSTGRESQL = 5432, MYSQL = 3306, SQLSERVER = 1433 }
+  db_ports = { POSTGRESQL = 5432, MYSQL = 3306 }
   db_port  = local.db_ports[var.db_engine_family]
   # rds-db:connect si concede sul resource id del proxy (prx-…), ultimo campo dell'ARN
   db_user_arn = var.has_db ? "arn:${local.partition}:rds-db:${local.region}:${local.account_id}:dbuser:${element(split(":", aws_db_proxy.this[0].arn), 6)}/${var.db_iam_user}" : ""

@@ -249,6 +249,10 @@ def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[
         else:
             continue  # facoltativo senza default: fuori dal contesto (un template che lo usa è un errore)
         out[name] = _check_value(name, value, spec.get("type", "string"))
+        choices = spec.get("choices")
+        if choices and value not in [_text(c) for c in choices]:
+            raise GenerateError(f"'{name}' deve essere uno di: {', '.join(_text(c) for c in choices)} "
+                                f"(ricevuto '{value}')")
     return out
 
 
@@ -394,7 +398,9 @@ def _kybes_steps(kv: Dict[str, str], values: Dict[str, str]) -> List[str]:
                      + kv["kybes_repositories"])
     if kv["kybes_has_db"] == "true" and not values.get("db_instance_identifier"):
         steps.append("Il progetto ha schemas/db: indica db_instance_identifier (istanza RDS esistente con "
-                     "manage_master_user_password = true) con --var o nei terraform.tfvars dello stack, poi ammetti "
+                     "iam_database_authentication_enabled = true e l'utente db_iam_user creato per l'autenticazione IAM: "
+                     "GRANT rds_iam in PostgreSQL, IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS' in MySQL/MariaDB) "
+                     "con --var o nei terraform.tfvars dello stack, poi ammetti "
                      "nel security group del database la sua porta dal security group db_proxy_security_group_id")
     return steps
 
