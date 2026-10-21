@@ -73,12 +73,11 @@ module "backend" {
   artifact_keys    = var.artifact_keys
   artifact_sha256s = var.artifact_sha256s
 
-  log_retention_days         = var.log_retention_days
-  throttling_rate_limit      = var.throttling_rate_limit
-  throttling_burst_limit     = var.throttling_burst_limit
-  waf_enabled                = var.waf_enabled
-  deletion_protection        = var.deletion_protection
-  manage_api_gateway_account = var.manage_api_gateway_account
+  log_retention_days     = var.log_retention_days
+  throttling_rate_limit  = var.throttling_rate_limit
+  throttling_burst_limit = var.throttling_burst_limit
+  waf_enabled            = var.waf_enabled
+  deletion_protection    = var.deletion_protection
 
   eks_cluster_name           = local.has_workloads ? data.terraform_remote_state.kubernetes[0].outputs.cluster_name : ""
   eks_node_security_group_id = local.has_workloads ? data.terraform_remote_state.kubernetes[0].outputs.node_security_group_id : ""

@@ -23,6 +23,7 @@ generate = tp.generate
 arch_check = tp.arch_check
 rules = tp.rules
 import hcl  # noqa: E402
+import tools  # noqa: E402
 
 ENVS = ["dev", "prod"]
 NEW_OPERATION = '''  /v1/ordini/{id}:
@@ -55,6 +56,33 @@ def block(text: str, header: str) -> str:
     m = re.search(re.escape(header) + r" \{(.*?)\n\}", text, re.S)
     assert m, f"blocco assente: {header}"
     return m.group(1)
+
+
+def console_paths(terraform: str, d: Path, module_text: str, servers: str, path: str) -> dict:
+    """Valuta con `terraform console` (config senza provider, riferimenti alle risorse sostituiti) i `local` del body
+    OpenAPI del modulo su uno schema minimo: percorsi del body, percorso dell'integrazione, chiave della route."""
+    start = module_text.index("  # ------------------------------------------------------------ OpenAPI")
+    body = module_text[start:module_text.index("\n}\n", start)]
+    body = body.replace("aws_lb.ms[0].dns_name", '"nlb"').replace("aws_api_gateway_vpc_link.ms[0].id", '"vl"')
+    body = re.sub(r"aws_lambda_alias\.this\[[^\]]+\]\.invoke_arn", '"arn:fn"', body)
+    (d / "openapi.yaml").write_text(f"openapi: 3.0.3\n{servers}paths:\n  {path}:\n    get:\n"
+                                    "      x-kybes-handler: ordini/functions/lista\n", encoding="utf-8")
+    (d / "main.tf").write_text(
+        'variable "handlers" {\n  default = { "ordini/functions/lista" = { kind = "function" } }\n}\n'
+        'variable "routes" {\n  default = {}\n}\nvariable "public_routes" {\n  default = []\n}\n'
+        'variable "authorizer" {\n  default = "lambda"\n}\nvariable "cognito_user_pool_arn" {\n  default = ""\n}\n'
+        'variable "openapi_file" {\n  default = "openapi.yaml"\n}\nlocals {\n'
+        '  methods        = ["get", "put", "post", "delete", "options", "head", "patch", "trace"]\n'
+        '  auth_scheme    = "kynfra-authorizer"\n  authorizer_key = "authorizer"\n'
+        '  use_lambda_jwt = true\n  ms_ports       = {}\n' + body + "\n}\n", encoding="utf-8")
+    env = dict(os.environ, TF_IN_AUTOMATION="1", TF_INPUT="0", TF_DATA_DIR=str(d / ".terraform"))
+    subprocess.run([terraform, "init", "-input=false", "-backend=false"], cwd=d, env=env, check=True,
+                   capture_output=True, timeout=120)
+    expr = ('jsonencode({ paths = keys(local.paths), route_path = values(local.operations)[0].path, '
+            'routes_key = keys(local.operations)[0] })')
+    r = subprocess.run([terraform, "console"], cwd=d, env=env, input=expr, capture_output=True, text=True,
+                       timeout=120, check=True)
+    return json.loads(json.loads(r.stdout.strip()))
 
 
 class BackendPatternTest(unittest.TestCase):
@@ -111,6 +139,24 @@ class BackendPatternTest(unittest.TestCase):
         r = subprocess.run([sys.executable, "-B", str(SCRIPTS / "arch_check.py"), str(self.proj), "--strict"],
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_backend_shared_apigw_account(self):
+        """R40: il ruolo CloudWatch di API Gateway (singleton per account) sta solo nello stack condiviso
+        envs/shared/apigw-account, da applicare prima degli stack backend."""
+        shared = self.proj / "infra/envs/shared/apigw-account"
+        main = (shared / "main.tf").read_text(encoding="utf-8")
+        self.assertIn('resource "aws_api_gateway_account" "this"', main)
+        self.assertIn("AmazonAPIGatewayPushToCloudWatchLogs", main)
+        self.assertIn('key          = "acme/shared/apigw-account.tfstate"',
+                      (shared / "backend.tf").read_text(encoding="utf-8"))
+        for path in (self.proj / "infra").glob("**/*.tf"):
+            if "apigw-account" not in path.parts:
+                self.assertNotIn("aws_api_gateway_account", path.read_text(encoding="utf-8"), str(path))
+        steps = self.result["next_steps"]
+        first_shared = next(i for i, x in enumerate(steps) if "envs/shared/apigw-account" in x)
+        first_backend = next(i for i, x in enumerate(steps) if "envs/<env>/backend &&" in x)
+        self.assertLess(first_shared, first_backend)
+        self.assertIn("infra/envs/shared/apigw-account/main.tf", self.result["created"])
 
     def test_backend_requires_eks_and_ecr_with_workloads(self):
         with tempfile.TemporaryDirectory(prefix="kynfra-backend-req-") as d:
@@ -217,7 +263,6 @@ class BackendPatternTest(unittest.TestCase):
         self.assertRegex(api, r"body\s*=\s*jsonencode\(local\.openapi\)")
         self.assertIn('"x-amazon-apigateway-request-validator" = "all"', text)
         self.assertIn("validateRequestBody = true, validateRequestParameters = true", text)
-        self.assertIn('stage_name     = "v1"', text)
         stage = block(text, 'resource "aws_api_gateway_stage" "this"')
         self.assertRegex(stage, r"xray_tracing_enabled\s*=\s*true")
         self.assertIn('correlationId      = "$context.requestId"', stage)
@@ -236,6 +281,35 @@ class BackendPatternTest(unittest.TestCase):
         queue = block(text, 'resource "aws_sqs_queue" "job"')
         self.assertIn("maxReceiveCount     = 5", queue)
         self.assertIn("aws_sqs_queue.dlq[each.key].arn", queue)
+
+    def test_backend_stage_api_and_base_path(self):
+        """R39: stage `api`, risorse = percorso base di servers[0].url + percorso dell'operazione (salvo che lo
+        contenga già), api_origin_path vuoto; le chiavi di routes restano i percorsi dello schema."""
+        text = self.module("main.tf")
+        self.assertIn('stage_name     = "api"', text)
+        self.assertNotIn('"v1"', text)
+        self.assertRegex(block(self.module("outputs.tf"), 'output "api_origin_path"'), r'value\s*=\s*""')
+        self.assertIn("module.backend.api_origin_path", self.stack("dev", "outputs.tf"))
+        self.assertIn("local.resource_paths[p] => merge(", text)
+        perm = block(text, 'resource "aws_lambda_permission" "api"')
+        self.assertIn("/${local.stage_name}/*/*", perm)
+        terraform = tools.resolve_binary(Path(os.environ.get("KYNFRA_TOOLS_PROJECT") or ROOT), "terraform")
+        if not terraform:
+            self.skipTest("terraform non disponibile: verifica dei percorsi con terraform console saltata")
+        cases = {
+            # servers con /v1 e percorsi senza: prefisso aggiunto
+            "servers": ("servers:\n  - url: https://api.example.com/v1/\n", "/ordini", "/v1/ordini"),
+            # percorsi che iniziano già con /v1: invariati
+            "already": ("servers:\n  - url: https://api.example.com/v1\n", "/v1/ordini", "/v1/ordini"),
+            # nessun percorso in servers (la fixture): invariati
+            "none": ("servers:\n  - url: https://api.example.com\n", "/v1/ordini", "/v1/ordini"),
+            "absent": ("", "/ordini/{id}", "/ordini/{id}"),
+        }
+        for name, (servers, path, expected) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="kynfra-basepath-") as d:
+                got = console_paths(terraform, Path(d), text, servers, path)
+                self.assertEqual(got, {"paths": [expected], "route_path": expected,
+                                       "routes_key": f"GET {path}"})
 
     def test_backend_schedule_and_errors(self):
         with tempfile.TemporaryDirectory(prefix="kynfra-backend-err-") as d:

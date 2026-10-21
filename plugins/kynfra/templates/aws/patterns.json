@@ -118,7 +118,7 @@
     ]
   },
   "backend": {
-    "description": "Infrastruttura completa del backend kybes letta dal progetto (schemas/openapi.yaml, services/<contesto>/functions|ms/<nome>, jobs/<nome>, schemas/db): API Gateway REST con body dallo schema OpenAPI (yamldecode(file(...))) arricchito con integrazione e validatore per operazione, authorizer TOKEN su Lambda che valida il JWT OIDC (o Cognito user pool), stage v1 con X-Ray, throttling, metriche, log INFO e access log JSON con correlationId, WAF regionale (obbligatorio in prod); una Lambda per function (timeout 10 s, ruolo dedicato, X-Ray, log group cifrato con retention, alias live, zip dal bucket di artefatti privato e versionato, nessun segreto nelle variabili d'ambiente); VPC link verso un NLB interno con un target group IP per microservizio su EKS; per ogni job coda SQS cifrata con DLQ (maxReceiveCount 5), schedule di EventBridge Scheduler per i job a calendario e ruolo Pod Identity; con schemas/db RDS Proxy con TLS e autenticazione IAM, segreto gestito da RDS e security group dal solo backend. handlers.auto.tfvars e jobs.auto.tfvars si rigenerano a ogni comando (regola api-coverage).",
+    "description": "Infrastruttura completa del backend kybes letta dal progetto (schemas/openapi.yaml, services/<contesto>/functions|ms/<nome>, jobs/<nome>, schemas/db): API Gateway REST con body dallo schema OpenAPI (yamldecode(file(...))) arricchito con integrazione e validatore per operazione, authorizer TOKEN su Lambda che valida il JWT OIDC (o Cognito user pool), stage api (percorso base da servers[0].url dello schema, es. /api/v1/...) con X-Ray, throttling, metriche, log INFO e access log JSON con correlationId, WAF regionale (obbligatorio in prod); una Lambda per function (timeout 10 s, ruolo dedicato, X-Ray, log group cifrato con retention, alias live, zip dal bucket di artefatti privato e versionato, nessun segreto nelle variabili d'ambiente); VPC link verso un NLB interno con un target group IP per microservizio su EKS; per ogni job coda SQS cifrata con DLQ (maxReceiveCount 5), schedule di EventBridge Scheduler per i job a calendario e ruolo Pod Identity; con schemas/db RDS Proxy con TLS e autenticazione IAM, segreto gestito da RDS e security group dal solo backend. handlers.auto.tfvars e jobs.auto.tfvars si rigenerano a ogni comando (regola api-coverage). Stack condiviso envs/shared/apigw-account per il ruolo CloudWatch di API Gateway dell'account (singleton).",
     "requires": [
       "network",
       "secrets"
@@ -182,11 +182,6 @@
         "default": false,
         "help": "Deletion protection dell'NLB interno dei microservizi (sempre attiva in prod)"
       },
-      "manage_api_gateway_account": {
-        "type": "bool",
-        "default": false,
-        "help": "true: questo stack imposta il ruolo CloudWatch di API Gateway dell'account e della regione (impostazione unica: attivala in un solo stack per account e regione, o impostala una volta a mano); senza il ruolo access log ed execution log non si scrivono"
-      },
       "kubernetes_namespace": {
         "type": "string",
         "default": "default",
@@ -215,13 +210,19 @@
       "backend"
     ],
     "shared": false,
+    "shared_stacks": [
+      {
+        "stack": "apigw-account",
+        "when": {}
+      }
+    ],
     "next_steps": [
+      "Una sola volta per account e regione, prima di ogni stack backend: il DevOps, con le credenziali dell'account {{ account_id }}: cd {{ infra_root }}/envs/shared/apigw-account && {{ iac_cli }} init && {{ iac_cli }} plan -out=apigw-account.tfplan && {{ iac_cli }} apply apigw-account.tfplan (ruolo CloudWatch di API Gateway: impostazione unica dell'account, senza la quale gli stage con access log non si creano)",
       "Prima gli stack network e secrets dello stesso ambiente (chiavi {{ project }}/<env>/network.tfstate e secrets.tfstate) e, con microservizi o job, kubernetes, kubernetes-addons e envs/shared/ecr; poi il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/backend && {{ iac_cli }} init && {{ iac_cli }} plan -out=backend.tfplan && {{ iac_cli }} apply backend.tfplan",
       "La CI carica gli zip delle Lambda nel bucket artifacts_bucket (chiavi <contesto>/<nome>.zip e authorizer/authorizer.zip, o artifact_keys) con kms:GenerateDataKey sulla chiave kms_key_arn e passa a ogni build artifact_sha256s (SHA-256 in base64 di ogni zip) con -var o con un suo file *.auto.tfvars: gli zip devono esistere prima del primo apply",
-      "Ruolo CloudWatch di API Gateway: impostazione unica per account e regione; senza, access log ed execution log non si scrivono. Attiva manage_api_gateway_account = true in un solo stack backend dell'account (es. prod)",
       "Dopo ogni modifica di services/, jobs/ o di x-kybes-handler nello schema rigenera con /kynfra:create-backend-infra-aws (handlers.auto.tfvars e jobs.auto.tfvars si riscrivono): la regola api-coverage blocca finché schema e infrastruttura divergono",
       "Microservizi: registra i pod nel target group ms_target_group_arns con un TargetGroupBinding dell'AWS Load Balancer Controller (targetType ip, porta 8080) e usa i service account di service_accounts nel namespace indicato; i job leggono la propria coda (queue_urls) con il ruolo Pod Identity e KEDA scala con il ruolo dell'operatore (identityOwner: operator)",
-      "Con api_origin=backend lo stack spa dello stesso ambiente legge api_domain_name e api_origin_path (chiave {{ project }}/<env>/backend.tfstate)"
+      "Con api_origin=backend lo stack spa dello stesso ambiente legge api_domain_name e api_origin_path (vuoto: lo stage si chiama api e /api/v1/... arriva così com'è alla risorsa /v1/...; chiave {{ project }}/<env>/backend.tfstate)"
     ]
   },
   "elb": {

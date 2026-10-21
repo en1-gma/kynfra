@@ -245,12 +245,6 @@ variable "deletion_protection" {
   }
 }
 
-variable "manage_api_gateway_account" {
-  type        = bool
-  description = "true imposta il ruolo CloudWatch di API Gateway a livello di account e regione (aws_api_gateway_account, singleton): attivalo in un solo stack per account e regione."
-  default     = false
-}
-
 variable "eks_cluster_name" {
   type        = string
   description = "Cluster EKS (stack kubernetes) delle associazioni Pod Identity di microservizi e job; vuoto senza ms né job."

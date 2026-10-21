@@ -139,11 +139,6 @@ variable "deletion_protection" {
   description = "Deletion protection dell'NLB interno dei microservizi: obbligatoria in prod."
 }
 
-variable "manage_api_gateway_account" {
-  type        = bool
-  description = "true imposta il ruolo CloudWatch di API Gateway dell'account e della regione (singleton: un solo stack per account)."
-}
-
 variable "kubernetes_namespace" {
   type        = string
   description = "Namespace dei service account di microservizi e job."

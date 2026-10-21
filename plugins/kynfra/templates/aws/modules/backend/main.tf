@@ -14,7 +14,7 @@ locals {
   region     = data.aws_region.current.region
   vpc_cidr   = data.aws_vpc.this.cidr_block
 
-  stage_name     = "v1"
+  stage_name     = "api"
   alias_name     = "live"
   methods        = ["get", "put", "post", "delete", "options", "head", "patch", "trace"]
   auth_scheme    = "kynfra-authorizer"
@@ -86,10 +86,19 @@ locals {
   # o, senza rigenerare, con x-kybes-handler verso un handler già esistente).
   openapi_doc = yamldecode(file(var.openapi_file))
 
+  # Percorso base dell'API = percorso di servers[0].url (es. https://api.example.com/v1 -> /v1; vuoto se assente),
+  # anteposto ai percorsi delle operazioni che non lo contengono già. Stage "api": l'URL diretto è
+  # https://<id>.execute-api.<regione>.amazonaws.com/api/v1/... e il behavior /api/* della SPA (origin path vuoto)
+  # inoltra /api/v1/... senza modifiche. Le chiavi di routes restano i percorsi dello schema.
+  base_path = trimsuffix(try(regex("^(?:[A-Za-z][A-Za-z0-9+.-]*://[^/]+)?(/[^?#]*)", local.openapi_doc.servers[0].url)[0], ""), "/")
+  resource_paths = { for p in keys(local.openapi_doc.paths) : p => (
+    local.base_path == "" || p == local.base_path || startswith(p, "${local.base_path}/") ? p : "${local.base_path}${p}"
+  ) }
+
   operations = merge([
     for p, item in local.openapi_doc.paths : {
       for m, op in item : "${upper(m)} ${p}" => {
-        path    = p
+        path    = local.resource_paths[p]
         method  = upper(m)
         handler = try(var.routes["${upper(m)} ${p}"], trim(op["x-kybes-handler"], "/ "), "")
         public  = length(try(op.security, ["eredita"])) == 0
@@ -140,7 +149,7 @@ locals {
     }
   }))
 
-  paths = { for p, item in local.openapi_doc.paths : p => merge(
+  paths = { for p, item in local.openapi_doc.paths : local.resource_paths[p] => merge(
     { for k, v in item : k => v if !contains(local.methods, k) },
     { for m, op in item : m => merge(op, {
       "x-amazon-apigateway-integration"       = local.integrations["${upper(m)} ${p}"]
@@ -460,7 +469,7 @@ resource "aws_lambda_alias" "this" {
   function_version = aws_lambda_function.this[each.key].version
 }
 
-# Invocazione solo da questa API: lo stage v1 per le function, gli authorizer per la Lambda authorizer.
+# Invocazione solo da questa API: lo stage api per le function, gli authorizer per la Lambda authorizer.
 resource "aws_lambda_permission" "api" {
   for_each = local.lambdas
 
@@ -519,42 +528,9 @@ resource "aws_cloudwatch_log_group" "execution" {
   kms_key_id        = aws_kms_key.this.arn
 }
 
-# Ruolo CloudWatch di API Gateway: impostazione unica per account e regione (singleton). Con più stack backend nello
-# stesso account attivala in uno solo (manage_api_gateway_account = true), o impostala una volta fuori da Terraform.
-resource "aws_iam_role" "api_gateway_logs" {
-  count = var.manage_api_gateway_account ? 1 : 0
-
-  name = "${local.name}-apigateway-logs"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect    = "Allow"
-        Principal = { Service = "apigateway.amazonaws.com" }
-        Action    = "sts:AssumeRole"
-        Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "api_gateway_logs" {
-  count = var.manage_api_gateway_account ? 1 : 0
-
-  role       = aws_iam_role.api_gateway_logs[0].name
-  policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
-}
-
-resource "aws_api_gateway_account" "this" {
-  count = var.manage_api_gateway_account ? 1 : 0
-
-  # con il provider 6 il destroy riporta sempre le impostazioni dell'account al default
-  cloudwatch_role_arn = aws_iam_role.api_gateway_logs[0].arn
-
-  depends_on = [aws_iam_role_policy_attachment.api_gateway_logs]
-}
-
-# Stage v1: tracing X-Ray, access log JSON con correlationId = $context.requestId.
+# Stage api: tracing X-Ray, access log JSON con correlationId = $context.requestId. Il ruolo CloudWatch di API
+# Gateway (impostazione unica per account e regione) lo imposta lo stack condiviso envs/shared/apigw-account, da
+# applicare prima: senza, access log ed execution log non si scrivono.
 resource "aws_api_gateway_stage" "this" {
   rest_api_id          = aws_api_gateway_rest_api.this.id
   deployment_id        = aws_api_gateway_deployment.this.id
@@ -582,7 +558,7 @@ resource "aws_api_gateway_stage" "this" {
     })
   }
 
-  depends_on = [aws_api_gateway_account.this, aws_cloudwatch_log_group.execution]
+  depends_on = [aws_cloudwatch_log_group.execution]
 }
 
 resource "aws_api_gateway_method_settings" "all" {

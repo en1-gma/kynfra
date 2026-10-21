@@ -4,7 +4,7 @@ output "api_id" {
 }
 
 output "stage_name" {
-  description = "Nome dello stage (versione dell'API)."
+  description = "Nome dello stage (api)."
   value       = aws_api_gateway_stage.this.stage_name
 }
 
@@ -14,8 +14,13 @@ output "api_domain_name" {
 }
 
 output "api_origin_path" {
-  description = "Percorso dello stage da anteporre alle richieste verso l'origin (es. /v1)."
-  value       = "/${aws_api_gateway_stage.this.stage_name}"
+  description = "Origin path per lo stack spa: vuoto, perché lo stage si chiama api e il behavior /api/* inoltra /api/<base>/... così com'è."
+  value       = ""
+}
+
+output "base_path" {
+  description = "Percorso base delle risorse (percorso di servers[0].url dello schema, es. /v1; vuoto se assente)."
+  value       = local.base_path
 }
 
 output "invoke_url" {

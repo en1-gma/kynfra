@@ -4,7 +4,7 @@ output "api_domain_name" {
 }
 
 output "api_origin_path" {
-  description = "Percorso dello stage (/v1): lo legge lo stack spa come origin_path."
+  description = "Origin path per lo stack spa: vuoto (stage api, il behavior /api/* inoltra il percorso così com'è)."
   value       = module.backend.api_origin_path
 }
 
@@ -16,6 +16,11 @@ output "api_id" {
 output "stage_name" {
   description = "Nome dello stage."
   value       = module.backend.stage_name
+}
+
+output "base_path" {
+  description = "Percorso base delle risorse (da servers[0].url dello schema)."
+  value       = module.backend.base_path
 }
 
 output "invoke_url" {

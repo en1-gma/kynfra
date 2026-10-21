@@ -12,7 +12,7 @@ Static hosting for a single-page application: a private S3 bucket served only by
 | Cache | Default behavior honours the object `Cache-Control` (default TTL 0); `/index.html` never cached (managed CachingDisabled); `/assets/*` and `/_app/immutable/*` with managed CachingOptimized. |
 | Logs | CloudFront standard logs v2 (delivery source/destination/delivery in `us-east-1`) to the private `<project>-<env>-cdn-logs-<account>` bucket under the explicit `cloudfront/` prefix (365-day expiration); `project` + `environment` are validated so this name fits in 63 characters. |
 | WAF | With `waf_enabled` (mandatory in prod): CLOUDFRONT web ACL in `us-east-1` with AWSManagedRulesCommonRuleSet, KnownBadInputs, AmazonIpReputationList and a per-IP rate limit (`waf_rate_limit`); logs to a KMS-encrypted log group (`aws-waf-logs-*`, 365 days). |
-| API | With `api_domain_name` set: second origin (HTTPS only, TLSv1.2) and `/api/*` behavior with CachingDisabled and AllViewerExceptHostHeader; `api_origin_path` adds the API Gateway stage (e.g. `/v1`). |
+| API | With `api_domain_name` set: second origin (HTTPS only, TLSv1.2) and `/api/*` behavior with CachingDisabled and AllViewerExceptHostHeader; `api_origin_path` is prepended to the forwarded path (empty for the kynfra `backend` stack, whose stage is `api`: `/api/v1/...` reaches the API unchanged). |
 
 The caller passes both providers: `providers = { aws = aws, aws.us_east_1 = aws.us_east_1 }`.
 

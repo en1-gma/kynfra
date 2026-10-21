@@ -63,7 +63,7 @@ variable "api_domain_name" {
 
 variable "api_origin_path" {
   type        = string
-  description = "Prefisso aggiunto alle richieste verso l'origin API (es. /v1 per lo stage di API Gateway); vuoto se l'API ha un dominio personalizzato."
+  description = "Prefisso aggiunto alle richieste verso l'origin API ; vuoto per lo stack backend di kynfra (stage api: /api/... arriva così com'è) o con un dominio personalizzato."
   default     = ""
 
   validation {
