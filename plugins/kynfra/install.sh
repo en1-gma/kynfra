@@ -3,8 +3,14 @@
 #
 # Uso:
 #   ./install.sh [--target DIR] [--iac terraform|opentofu] [--providers aws] [--infra-root DIR] [--project NAME]
-#                [--envs dev,staging,prod] [--region eu-south-1] [--account-id ID] [--agents claude|codex|both]
-#                [--ci github|none] [--scope local|project|user] [--no-plugin] [--force] [--uninstall]
+#                [--envs dev,staging,prod] [--prod-envs prod] [--region eu-south-1] [--account-id ID]
+#                [--owner TEAM] [--cost-center CC] [--agents claude|codex|both] [--ci github|none]
+#                [--scope local|project|user] [--no-plugin] [--force] [--uninstall]
+#
+# --prod-envs: ambienti di produzione (regole "solo prod" e default prod-restrittivi); default: prod, se c'è.
+# --owner, --cost-center: valori dei tag obbligatori Owner e CostCenter (senza, il generatore si ferma finché
+#   non li compili in .kynfra/config.json).
+# --no-plugin: non registra il plugin di Claude Code; gli hook di Claude Code arrivano SOLO dal plugin.
 #
 # Rilanciarlo è sicuro: aggiorna il kit, rigenera i blocchi in CLAUDE.md e AGENTS.md e non sovrascrive
 # configurazione, regole o .tflint.hcl esistenti (salvo --force). Non scrive file IaC, non lancia terraform
@@ -18,6 +24,10 @@ PROVIDERS="aws"
 INFRA_ROOT=""
 PROJECT=""
 ENVS="dev,staging,prod"
+PROD_ENVS=""
+PROD_ENVS_SET=0
+OWNER=""
+COST_CENTER=""
 REGION="eu-south-1"
 ACCOUNT_ID=""
 AGENTS="both"
@@ -43,6 +53,9 @@ while [ $# -gt 0 ]; do
     --infra-root) INFRA_ROOT="${2:?}"; shift 2 ;;
     --project)    PROJECT="${2:?}"; shift 2 ;;
     --envs)       ENVS="${2:?}"; shift 2 ;;
+    --prod-envs)  PROD_ENVS="${2:?}"; PROD_ENVS_SET=1; shift 2 ;;
+    --owner)      OWNER="${2:?}"; shift 2 ;;
+    --cost-center) COST_CENTER="${2:?}"; shift 2 ;;
     --region)     REGION="${2:?}"; shift 2 ;;
     --account-id) ACCOUNT_ID="${2:?}"; shift 2 ;;
     --agents)     AGENTS="${2:?}"; shift 2 ;;
@@ -71,6 +84,15 @@ printf '%s\n' "$REGION" | grep -Eq '^[a-z]{2}(-[a-z]+)+-[0-9]$' || die "--region
 case "$SCOPE" in local|project|user) ;; *) die "--scope: local, project o user" ;; esac
 printf '%s\n' "$ENVS" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*(,[a-z0-9]+(-[a-z0-9]+)*)*$' || die "--envs: nomi kebab-case separati da virgola, ricevuto '$ENVS'"
 case "$INFRA_ROOT" in *'|'*|*'&'*|*'\'*) die "--infra-root: caratteri | & \\ non ammessi" ;; esac
+if [ "$PROD_ENVS_SET" = 1 ]; then
+  printf '%s\n' "$PROD_ENVS" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*(,[a-z0-9]+(-[a-z0-9]+)*)*$' || die "--prod-envs: nomi kebab-case separati da virgola, ricevuto '$PROD_ENVS'"
+  for e in $(printf '%s' "$PROD_ENVS" | tr ',' ' '); do
+    case ",$ENVS," in *",$e,"*) ;; *) die "--prod-envs: '$e' non è tra gli ambienti di --envs ($ENVS)" ;; esac
+  done
+fi
+for v in "$OWNER" "$COST_CENTER"; do
+  case "$v" in *[[:cntrl:]]*) die "--owner/--cost-center: caratteri di controllo non ammessi" ;; esac
+done
 for f in "$TARGET/.claude/settings.json" "$TARGET/.codex/hooks.json"; do
   [ -f "$f" ] || continue
   python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f" >/dev/null 2>&1 \
@@ -127,7 +149,7 @@ merge_claude_permissions() {  # $1 .claude/settings.json, $2 add|remove
   python3 - "$1" "$2" <<'PY'
 import json, sys, pathlib
 dst, mode = pathlib.Path(sys.argv[1]), sys.argv[2]
-ours = [f"Edit({p})" for p in (".kynfra/**", "/.kynfra/**", "tools/kynfra/**", "/tools/kynfra/**",
+ours = [f"Edit({p})" for p in (".kynfra/**", "/.kynfra/**", "**/.kynfra/**", "tools/kynfra/**", "/tools/kynfra/**",
                                ".claude/settings.json", "/.claude/settings.json",
                                ".claude/settings.local.json", "/.claude/settings.local.json")]
 cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
@@ -185,6 +207,8 @@ for k, v in (("INFRA_ROOT", c.get("infra_root")), ("IAC", c.get("iac")), ("PROJE
         print(f"[ -n \"${k}\" ] || {k}={shlex.quote(v)}")
 PY
 )"
+  # infra_root letto dalla config: stessi controlli di --infra-root (finisce in sed e nei percorsi)
+  case "$INFRA_ROOT" in *'|'*|*'&'*|*'\'*) die "infra_root in .kynfra/config.json: caratteri | & \\ non ammessi" ;; esac
 fi
 if [ -z "$INFRA_ROOT" ]; then
   if [ -d "$TARGET/.kybes" ] || [ -d "$TARGET/.kyfes" ] || [ -d "$TARGET/infra" ]; then INFRA_ROOT="infra"; else INFRA_ROOT="."; fi
@@ -227,16 +251,18 @@ fi
 # ------------------------------------------------------------------ configurazione
 if [ "$CFG_EXISTS" = 0 ]; then
   mkdir -p "$TARGET/.kynfra"
-  python3 - "$KIT_DIR/templates/kynfra.config.json" "$CFG" "$IAC" "$INFRA_ROOT" "$PROJECT" "$REGION" "$ACCOUNT_ID" "$ENVS" "$HAS_KYBES" <<'PY'
+  python3 - "$KIT_DIR/templates/kynfra.config.json" "$CFG" "$IAC" "$INFRA_ROOT" "$PROJECT" "$REGION" "$ACCOUNT_ID" "$ENVS" "$HAS_KYBES" "$PROD_ENVS_SET" "$PROD_ENVS" "$OWNER" "$COST_CENTER" <<'PY'
 import json, sys, re
-tpl, dst, iac, root, project, region, account, envs, kybes = sys.argv[1:10]
+tpl, dst, iac, root, project, region, account, envs, kybes, prod_set, prod_envs, owner, cost = sys.argv[1:14]
 cfg = json.load(open(tpl, encoding="utf-8"))
 cfg["iac"], cfg["infra_root"], cfg["project"], cfg["region"] = iac, root, project, region
 cfg["accounts"] = {"main": {"id": account or "000000000000"}}
 names = [e.strip() for e in envs.split(",") if e.strip()]
 if not names or any(not re.fullmatch(r"[a-z0-9][a-z0-9-]*", e) for e in names):
     sys.exit("--envs: nomi in minuscolo separati da virgola (es. dev,staging,prod)")
-cfg["environments"] = {e: {"account": "main"} for e in names}
+prod = [e.strip() for e in prod_envs.split(",") if e.strip()] if prod_set == "1" else [e for e in names if e == "prod"]
+cfg["environments"] = {e: {"account": "main", "prod": e in prod} for e in names}
+cfg["tags"] = {"Owner": owner, "CostCenter": cost}
 if kybes == "1":
     cfg["kybes"] = {"root": ".", "openapi": "schemas/openapi.yaml"}
 with open(dst, "w", encoding="utf-8") as fh:
@@ -245,7 +271,14 @@ with open(dst, "w", encoding="utf-8") as fh:
 PY
   ok ".kynfra/config.json creato"
   [ -n "$ACCOUNT_ID" ] || warn "account AWS non indicato: imposta accounts.main.id in .kynfra/config.json (segnaposto 000000000000)"
-  warn "tag Owner e CostCenter vuoti: compilali in .kynfra/config.json (tags)"
+  if [ -z "$OWNER" ] || [ -z "$COST_CENTER" ]; then
+    warn "tag $([ -z "$OWNER" ] && printf 'Owner ')$([ -z "$COST_CENTER" ] && printf 'CostCenter ')vuoti: compilali in .kynfra/config.json (tags) o rilancia con --owner/--cost-center su una config nuova; senza, generate.py si ferma"
+  fi
+  if [ "$PROD_ENVS_SET" = 0 ]; then
+    case ",$ENVS," in *",prod,"*) ;; *) warn "nessun ambiente di produzione: senza --prod-envs le regole \"solo prod\" (WAF, deletion protection, retention 365) non valgono per nessun ambiente" ;; esac
+  elif [ -z "$PROD_ENVS" ]; then
+    warn "nessun ambiente di produzione (--prod-envs vuoto)"
+  fi
 else
   info ".kynfra/config.json esistente: non modificato"
 fi
@@ -293,6 +326,8 @@ if want_claude; then
     else
       warn "comando 'claude' non trovato: installa il plugin con /plugin marketplace add en1-gma/kynfra"
     fi
+  else
+    warn "--no-plugin: Claude Code riceve regole e permissions.deny ma NESSUN hook (PreToolUse, Stop…), che arrivano solo dal plugin: installalo con /plugin marketplace add en1-gma/kynfra e /plugin install kynfra@kynfra, o esegui $KIT_REL/setup.sh"
   fi
 fi
 

@@ -156,7 +156,8 @@ Then: *"Use $kynfra-init to set up kynfra in this project"*. The installer also 
 
 ```bash
 git clone https://github.com/en1-gma/kynfra
-kynfra/install.sh --target /path/to/project --project acme --envs dev,staging,prod --region eu-south-1 --account-id 123456789012
+kynfra/install.sh --target /path/to/project --project acme --envs dev,staging,prod --region eu-south-1 --account-id 123456789012 \
+  --owner platform-team --cost-center cc-001
 ```
 
 | Option | Values |
@@ -164,8 +165,14 @@ kynfra/install.sh --target /path/to/project --project acme --envs dev,staging,pr
 | `--iac` | `terraform` (default), `opentofu` |
 | `--infra-root` | folder of the infrastructure (auto: `infra` if `.kybes/`, `.kyfes/` or `infra/` exists, otherwise `.`) |
 | `--project`, `--envs`, `--region`, `--account-id` | project name (kebab-case), environments (default `dev,staging,prod`), region (default `eu-south-1`), AWS account |
+| `--prod-envs` | production environments, comma separated (default: `prod` if listed); prod-only rules and prod-restrictive defaults apply to each of them. The installer warns when no environment is production |
+| `--owner`, `--cost-center` | values of the mandatory `Owner` and `CostCenter` tags; without them `generate.py` stops until you fill `tags` in `.kynfra/config.json` |
 | `--agents` | `claude`, `codex`, `both` (default) |
-| `--ci github\|none`, `--scope local\|project\|user`, `--no-plugin`, `--force`, `--uninstall` | |
+| `--ci` | `github` (default: writes `.github/workflows/kynfra-check.yml`) or `none` |
+| `--scope` | where the Claude Code plugin is registered: `local` (default, only you in this project), `project` (shared via `.claude/settings.json`), `user` (all your projects) |
+| `--no-plugin` | do not register the Claude Code plugin. **Claude Code hooks come only from the plugin**: without it Claude Code gets rules and `permissions.deny` but no `PreToolUse`/`Stop` guardrails (the installer warns; Codex hooks are written to `.codex/hooks.json` anyway) |
+| `--force` | overwrite existing config, rules, `.tflint.hcl` and CI workflow (refused to the agent) |
+| `--uninstall` | remove kynfra from the project (`.kynfra/` is kept unless `--force`; refused to the agent) |
 
 The installer is idempotent. It creates `.kynfra/config.json`, a versioned copy of the kit in `tools/kynfra/` (used by CI, Codex hooks and teammates), `.tflint.hcl`, `.claude/rules/kynfra/`, the `permissions.deny` rules in `.claude/settings.json`, the managed blocks in `CLAUDE.md` / `AGENTS.md` and `.github/workflows/kynfra-check.yml`. It writes no IaC, runs no Terraform and downloads no tool: tools are installed one at a time with `/kynfra:kynfra-tools`. `--force` and `--uninstall` are refused to the agent.
 

@@ -41,7 +41,8 @@ class InstallerTest(InstallerCase):
         self.assertEqual(cfg["project"], "my-proj")  # kebab-case dal nome cartella
         self.assertEqual(cfg["region"], "eu-south-1")
         self.assertEqual(cfg["accounts"], {"main": {"id": "123456789012"}})
-        self.assertEqual(cfg["environments"], {e: {"account": "main"} for e in ("dev", "staging", "prod")})
+        self.assertEqual(cfg["environments"], {e: {"account": "main", "prod": e == "prod"}
+                                               for e in ("dev", "staging", "prod")})
         self.assertNotIn("kybes", cfg)
         self.assertIn("tags", cfg)
         self.assertNotIn("000000000000", res.stdout)
