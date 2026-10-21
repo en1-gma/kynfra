@@ -124,9 +124,13 @@ class BackendPatternTest(unittest.TestCase):
             self.assertEqual(gen["public_routes"], [])
             self.assertEqual(tfvars(stack / "jobs.auto.tfvars")["jobs"], {"sync-giacenze": {"trigger": "sqs"}})
             tv = tfvars(stack / "terraform.tfvars")
-            self.assertIs(tv["has_db"], True)
+            # valori dedotti dal progetto: nel file rigenerato kybes.auto.tfvars, non in terraform.tfvars
+            kv = tfvars(stack / "kybes.auto.tfvars")
+            self.assertIs(kv["has_db"], True)
+            for name in ("has_db", "kybes_root", "openapi_path"):
+                self.assertNotIn(name, tv)
             # lo schema si raggiunge dallo stack con kybes_root + openapi_path (relativo a kybes.root)
-            self.assertTrue((stack / tv["kybes_root"] / tv["openapi_path"]).resolve().samefile(
+            self.assertTrue((stack / kv["kybes_root"] / kv["openapi_path"]).resolve().samefile(
                 self.proj / "schemas/openapi.yaml"))
             self.assertEqual(tv["oidc_issuer"], "https://login.example.com")
         self.assertTrue(any("GET /v1/magazzino/giacenze" in s and "public_routes" in s
@@ -140,6 +144,64 @@ class BackendPatternTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_backend_has_db_regenerated(self):
+        """I valori dedotti dal progetto (has_db, kybes_root, openapi_path) stanno in kybes.auto.tfvars, rigenerato
+        senza --force: aggiungere schemas/db più tardi porta has_db a true."""
+        with tempfile.TemporaryDirectory(prefix="kynfra-backend-db-") as d:
+            proj = Path(d)
+            cfg = tp.make_project(proj, kybes=True)
+            shutil.rmtree(proj / "schemas/db")
+            generate.generate(proj, cfg, "aws", "backend", ["dev"], {"oidc_audience": "acme-api"})
+            kv = proj / "infra/envs/dev/backend/kybes.auto.tfvars"
+            self.assertIs(tfvars(kv)["has_db"], False)
+            (proj / "schemas/db").mkdir()
+            (proj / "schemas/db/Ordini.yaml").write_text("table: Ordini\n", encoding="utf-8")
+            res = generate.generate(proj, cfg, "aws", "backend", ["dev"], {"oidc_audience": "acme-api"})
+            self.assertIn("infra/envs/dev/backend/kybes.auto.tfvars", res["regenerated"])
+            self.assertIs(tfvars(kv)["has_db"], True)
+            self.assertIn("infra/envs/dev/backend/terraform.tfvars", res["skipped"])
+
+    def test_backend_minor_hardening(self):
+        text = self.module("main.tf")
+        variables = self.module("variables.tf")
+        # {proxy+} nel percorso della risorsa, {proxy} nell'URI dell'integrazione
+        self.assertIn('replace(o.path, "+}", "}")', text)
+        # target group: porta nel nome e create_before_destroy
+        tg = block(text, 'resource "aws_lb_target_group" "ms"')
+        self.assertRegex(tg, r'\n  name\s+= "\$\{local\.name\}-\$\{substr\(sha1\(each\.key\), 0, 6\)\}-\$\{var\.ms_target_port\}"')
+        self.assertIn("create_before_destroy = true", tg)
+        # nomi di Lambda e ruoli entro 64 caratteri, job senza collisione con <contesto>-<ms>
+        self.assertIn("<= 64", variables)
+        self.assertIn("collide con un microservizio", variables)
+        # bucket dei log unico: NLB e access log S3 del bucket degli artefatti
+        self.assertIn('resource "aws_s3_bucket_logging" "artifacts"', text)
+        self.assertIn("logging.s3.amazonaws.com", text)
+        baseline = json.loads((tp.PLUGIN / "templates/scanner-baseline.json").read_text(encoding="utf-8"))
+        ids = {e["id"] for e in baseline["checkov"] if e["paths"] == ["modules/backend/**"]}
+        self.assertNotIn("CKV_AWS_297", ids)
+        # oidc_audience facoltativo con Cognito
+        entry = generate.load_pattern("aws", "backend")
+        self.assertFalse(entry["inputs"]["oidc_audience"].get("required", True))
+        with tempfile.TemporaryDirectory(prefix="kynfra-backend-cog-") as d:
+            proj = Path(d)
+            cfg = tp.make_project(proj, kybes=True)
+            res = generate.generate(proj, cfg, "aws", "backend", ["dev"], {
+                "authorizer": "cognito",
+                "cognito_user_pool_arn": "arn:aws:cognito-idp:eu-south-1:123456789012:userpool/eu-south-1_Abc123"})
+            self.assertTrue(res["created"])
+            self.assertFalse(any("oidc_audience" in s for s in res["next_steps"]))
+            res = generate.generate(proj, cfg, "aws", "backend", ["dev"], {})
+            self.assertTrue(any("oidc_audience" in s for s in res["next_steps"]))
+
+    def test_backend_job_name_collision(self):
+        with tempfile.TemporaryDirectory(prefix="kynfra-backend-coll-") as d:
+            proj = Path(d)
+            cfg = tp.make_project(proj, kybes=True)
+            (proj / "jobs/magazzino-giacenze").mkdir()
+            (proj / "jobs/magazzino-giacenze/Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            with self.assertRaisesRegex(generate.GenerateError, "magazzino-giacenze"):
+                generate.generate(proj, cfg, "aws", "backend", ["dev"], {"oidc_audience": "acme-api"})
+
     def test_backend_shared_apigw_account(self):
         """R40: il ruolo CloudWatch di API Gateway (singleton per account) sta solo nello stack condiviso
         envs/shared/apigw-account, da applicare prima degli stack backend."""
@@ -147,6 +209,9 @@ class BackendPatternTest(unittest.TestCase):
         main = (shared / "main.tf").read_text(encoding="utf-8")
         self.assertIn('resource "aws_api_gateway_account" "this"', main)
         self.assertIn("AmazonAPIGatewayPushToCloudWatchLogs", main)
+        # un solo ruolo per account, anche tra progetti diversi
+        self.assertIn('name = "kynfra-apigateway-cloudwatch"', main)
+        self.assertTrue(any("envs/shared/apigw-account" in s and "salta" in s for s in self.result["next_steps"]))
         self.assertIn('key          = "acme/shared/apigw-account.tfstate"',
                       (shared / "backend.tf").read_text(encoding="utf-8"))
         for path in (self.proj / "infra").glob("**/*.tf"):
@@ -241,17 +306,28 @@ class BackendPatternTest(unittest.TestCase):
         self.assertRegex(env, r"SECRET_ARNS = jsonencode\(local\.lambda_secrets\[each\.key\]\)")
         self.assertRegex(text, r"lambda_secrets = \{ for k, l in local\.lambdas : k => \[for n in "
                                r"lookup\(var\.context_secrets, l\.context, \[\]\) : var\.secret_arns\[n\]\] \}")
-        for bad in ("secret_string", "password", "GetSecretValue\"]\n    resources = [\"*\"]"):
-            self.assertNotIn(bad, env.lower() if bad == "password" else env)
-        # niente valori di segreti in nessun file generato del backend, e il proxy usa IAM + il segreto gestito da RDS
+        # i valori vengono solo da variabili non riservate e da riferimenti (ARN, endpoint), mai da segreti
+        self.assertEqual(sorted(set(re.findall(r"\bvar\.(\w+)", env))),
+                         ["db_iam_user", "environment", "oidc_audience", "oidc_issuer"])
+        self.assertEqual(sorted(set(re.findall(r"\baws_\w+\.\w+", env))), ["aws_db_proxy.this"])
+        # niente valori di segreti in nessun file generato del backend
         for path in sorted((self.proj / "infra").glob("**/backend/**/*.tf*")):
             content = path.read_text(encoding="utf-8")
             self.assertNotRegex(content, r"secret_string|master_password\s*=|random_password", str(path))
+        # RDS Proxy con IAM end-to-end: nessun segreto, il ruolo del proxy si collega al DB come db_iam_user
         proxy = block(text, 'resource "aws_db_proxy" "this"')
-        self.assertRegex(proxy, r'iam_auth\s*=\s*"REQUIRED"')
+        self.assertRegex(proxy, r'default_auth_scheme\s*=\s*"IAM_AUTH"')
         self.assertRegex(proxy, r"require_tls\s*=\s*true")
-        self.assertRegex(proxy, r"secret_arn\s*=\s*local\.db_secret_arn")
-        self.assertRegex(text, r"master_user_secret\[0\]\.secret_arn")
+        self.assertNotIn("auth {", proxy)
+        self.assertNotIn("secret_arn", proxy)
+        self.assertNotIn("master_user_secret", text)
+        proxy_policy = block(text, 'resource "aws_iam_role_policy" "proxy"')
+        self.assertIn('Action   = "rds-db:connect"', proxy_policy)
+        self.assertIn("dbuser:${data.aws_db_instance.this[0].resource_id}/${var.db_iam_user}", proxy_policy)
+        self.assertNotIn("secretsmanager", proxy_policy)
+        skill = (tp.PLUGIN / "skills/create-backend-infra-aws/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("GRANT rds_iam", skill)
+        self.assertIn("IAM_AUTH", skill)
         # le regole di kynfra sulle Lambda (variabili sensibili letterali, tracing, log group) non trovano nulla
         self.assertEqual([f.format() for f in arch_check.run(self.proj, self.cfg) if f.rule == "lambda-hardening"],
                          [])

@@ -114,7 +114,7 @@ locals {
   integrations = { for r, o in local.operations : r => jsondecode(try(var.handlers[o.handler].kind, "") == "ms" ? jsonencode({
     type                = "http_proxy"
     httpMethod          = o.method
-    uri                 = "http://${try(aws_lb.ms[0].dns_name, "")}:${try(local.ms_ports[o.handler], 0)}${o.path}"
+    uri                 = "http://${try(aws_lb.ms[0].dns_name, "")}:${try(local.ms_ports[o.handler], 0)}${replace(o.path, "+}", "}")}"
     connectionType      = "VPC_LINK"
     connectionId        = try(aws_api_gateway_vpc_link.ms[0].id, "")
     passthroughBehavior = "when_no_match"
@@ -774,31 +774,24 @@ resource "aws_wafv2_web_acl_logging_configuration" "this" {
   depends_on = [aws_cloudwatch_log_resource_policy.waf]
 }
 
-# ---------------------------------------------------------------- microservizi: VPC link -> NLB interno -> EKS
+# ---------------------------------------------------------------- bucket dei log
 
-# API Gateway REST raggiunge la VPC solo tramite un VPC link verso un NLB: un NLB interno condiviso, un listener TCP
-# per microservizio (porta 10001, 10002, … o ms_listener_ports) e un target group IP per microservizio, popolato dal
-# TargetGroupBinding dell'AWS Load Balancer Controller (stack kubernetes-addons).
-resource "aws_s3_bucket" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = "${local.name}-ms-lb-logs-${local.account_id}"
+# Log di accesso S3 del bucket degli artefatti (prefisso s3/artifacts/) e access log dell'NLB dei microservizi
+# (prefisso nlb/). SSE-S3: è l'unica cifratura di default ammessa come destinazione dei log di accesso S3.
+resource "aws_s3_bucket" "logs" {
+  bucket = "${local.name}-backend-logs-${local.account_id}"
 }
 
-resource "aws_s3_bucket_ownership_controls" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = aws_s3_bucket.lb_logs[0].id
+resource "aws_s3_bucket_ownership_controls" "logs" {
+  bucket = aws_s3_bucket.logs.id
 
   rule {
     object_ownership = "BucketOwnerEnforced"
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = aws_s3_bucket.lb_logs[0].id
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket = aws_s3_bucket.logs.id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -806,20 +799,16 @@ resource "aws_s3_bucket_public_access_block" "lb_logs" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_versioning" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = aws_s3_bucket.lb_logs[0].id
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
 
   versioning_configuration {
     status = "Enabled"
   }
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = aws_s3_bucket.lb_logs[0].id
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -828,10 +817,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs" {
   }
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
-  bucket = aws_s3_bucket.lb_logs[0].id
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
 
   rule {
     id     = "expire-logs"
@@ -852,17 +839,15 @@ resource "aws_s3_bucket_lifecycle_configuration" "lb_logs" {
     }
   }
 
-  depends_on = [aws_s3_bucket_versioning.lb_logs]
+  depends_on = [aws_s3_bucket_versioning.logs]
 }
 
-data "aws_iam_policy_document" "lb_logs" {
-  count = local.has_ms ? 1 : 0
-
+data "aws_iam_policy_document" "logs" {
   statement {
     sid       = "DenyInsecureTransport"
     effect    = "Deny"
     actions   = ["s3:*"]
-    resources = [aws_s3_bucket.lb_logs[0].arn, "${aws_s3_bucket.lb_logs[0].arn}/*"]
+    resources = [aws_s3_bucket.logs.arn, "${aws_s3_bucket.logs.arn}/*"]
 
     principals {
       type        = "*"
@@ -877,9 +862,32 @@ data "aws_iam_policy_document" "lb_logs" {
   }
 
   statement {
+    sid       = "S3ServerAccessLogs"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.logs.arn}/s3/artifacts/*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["logging.s3.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = [aws_s3_bucket.artifacts.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
+
+  statement {
     sid       = "NlbLogDeliveryWrite"
     actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.lb_logs[0].arn}/nlb/AWSLogs/${local.account_id}/*"]
+    resources = ["${aws_s3_bucket.logs.arn}/nlb/AWSLogs/${local.account_id}/*"]
 
     principals {
       type        = "Service"
@@ -908,7 +916,7 @@ data "aws_iam_policy_document" "lb_logs" {
   statement {
     sid       = "NlbLogDeliveryAclCheck"
     actions   = ["s3:GetBucketAcl"]
-    resources = [aws_s3_bucket.lb_logs[0].arn]
+    resources = [aws_s3_bucket.logs.arn]
 
     principals {
       type        = "Service"
@@ -929,15 +937,26 @@ data "aws_iam_policy_document" "lb_logs" {
   }
 }
 
-resource "aws_s3_bucket_policy" "lb_logs" {
-  count = local.has_ms ? 1 : 0
+resource "aws_s3_bucket_policy" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  policy = data.aws_iam_policy_document.logs.json
 
-  bucket = aws_s3_bucket.lb_logs[0].id
-  policy = data.aws_iam_policy_document.lb_logs[0].json
-
-  depends_on = [aws_s3_bucket_public_access_block.lb_logs]
+  depends_on = [aws_s3_bucket_public_access_block.logs]
 }
 
+resource "aws_s3_bucket_logging" "artifacts" {
+  bucket        = aws_s3_bucket.artifacts.id
+  target_bucket = aws_s3_bucket.logs.id
+  target_prefix = "s3/artifacts/"
+
+  depends_on = [aws_s3_bucket_policy.logs]
+}
+
+# ---------------------------------------------------------------- microservizi: VPC link -> NLB interno -> EKS
+
+# API Gateway REST raggiunge la VPC solo tramite un VPC link verso un NLB: un NLB interno condiviso, un listener TCP
+# per microservizio (porta 10001, 10002, … o ms_listener_ports) e un target group IP per microservizio, popolato dal
+# TargetGroupBinding dell'AWS Load Balancer Controller (stack kubernetes-addons).
 # Nessun ingress: il traffico del VPC link (PrivateLink) non passa dalle regole in ingresso
 # (enforce_security_group_inbound_rules_on_private_link_traffic = "off"); uscita solo verso la VPC sulla porta dei pod.
 resource "aws_security_group" "nlb" {
@@ -991,7 +1010,7 @@ resource "aws_lb" "ms" {
   # i log di accesso dell'NLB si scrivono solo per i listener TLS: per il traffico TCP fanno fede gli access log di
   # API Gateway (correlationId) e i flow log della VPC
   access_logs {
-    bucket  = aws_s3_bucket.lb_logs[0].id
+    bucket  = aws_s3_bucket.logs.id
     prefix  = "nlb"
     enabled = true
   }
@@ -1003,13 +1022,14 @@ resource "aws_lb" "ms" {
     }
   }
 
-  depends_on = [aws_s3_bucket_policy.lb_logs]
+  depends_on = [aws_s3_bucket_policy.logs]
 }
 
 resource "aws_lb_target_group" "ms" {
   for_each = local.services
 
-  name                 = "${local.name}-${substr(sha1(each.key), 0, 8)}"
+  # porta nel nome: cambiandola il gruppo nuovo nasce prima che il vecchio sia tolto dal listener
+  name                 = "${local.name}-${substr(sha1(each.key), 0, 6)}-${var.ms_target_port}"
   vpc_id               = var.vpc_id
   target_type          = "ip"
   port                 = var.ms_target_port
@@ -1030,6 +1050,10 @@ resource "aws_lb_target_group" "ms" {
 
   tags = {
     KybesHandler = each.key
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
@@ -1256,18 +1280,14 @@ resource "aws_eks_pod_identity_association" "pod" {
 
 # ---------------------------------------------------------------- RDS Proxy (con schemas/db)
 
-# Il database è fuori dalla v1: un'istanza esistente con manage_master_user_password = true, il cui segreto gestito da
-# RDS usa il proxy. Le Lambda si collegano al proxy con autenticazione IAM e TLS.
+# Il database è fuori dalla v1: un'istanza esistente con l'autenticazione IAM attiva
+# (iam_database_authentication_enabled = true sull'istanza: la data source non la espone). IAM end-to-end
+# (default_auth_scheme = "IAM_AUTH"): le Lambda si collegano al proxy con un token IAM come db_iam_user e il proxy
+# si collega al database con il proprio ruolo come lo stesso utente (GRANT rds_iam), senza segreti.
 data "aws_db_instance" "this" {
   count = var.has_db ? 1 : 0
 
   db_instance_identifier = var.db_instance_identifier
-}
-
-locals {
-  db_secret_arn  = var.has_db ? data.aws_db_instance.this[0].master_user_secret[0].secret_arn : ""
-  db_secret_kms  = var.has_db ? data.aws_db_instance.this[0].master_user_secret[0].kms_key_id : ""
-  db_secret_list = var.has_db ? [local.db_secret_arn] : []
 }
 
 resource "aws_security_group" "lambda" {
@@ -1360,23 +1380,15 @@ resource "aws_iam_role_policy" "proxy" {
 
   name = "${local.name}-db-proxy"
   role = aws_iam_role.proxy[0].id
+  # il proxy si collega al database come db_iam_user con il proprio ruolo (resource id dbi-… dell'istanza)
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadDbSecret"
+        Sid      = "ConnectDatabase"
         Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = local.db_secret_list
-      },
-      {
-        Sid      = "DecryptDbSecret"
-        Effect   = "Allow"
-        Action   = "kms:Decrypt"
-        Resource = local.db_secret_kms
-        Condition = {
-          StringEquals = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
-        }
+        Action   = "rds-db:connect"
+        Resource = "arn:${local.partition}:rds-db:${local.region}:${local.account_id}:dbuser:${data.aws_db_instance.this[0].resource_id}/${var.db_iam_user}"
       }
     ]
   })
@@ -1387,19 +1399,13 @@ resource "aws_db_proxy" "this" {
 
   name                   = "${local.name}-db"
   engine_family          = var.db_engine_family
+  default_auth_scheme    = "IAM_AUTH"
   require_tls            = true
   idle_client_timeout    = 1800
   debug_logging          = false
   role_arn               = aws_iam_role.proxy[0].arn
   vpc_security_group_ids = [aws_security_group.proxy[0].id]
   vpc_subnet_ids         = var.private_subnet_ids
-
-  auth {
-    auth_scheme = "SECRETS"
-    description = "Credenziali gestite da RDS dell'istanza ${var.db_instance_identifier}"
-    iam_auth    = "REQUIRED"
-    secret_arn  = local.db_secret_arn
-  }
 
   depends_on = [aws_iam_role_policy.proxy]
 }

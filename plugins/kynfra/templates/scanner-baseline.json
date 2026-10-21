@@ -203,25 +203,25 @@
       "id": "CKV_AWS_18",
       "envs": "*",
       "paths": ["modules/backend/**"],
-      "reason": "Bucket degli artefatti delle Lambda (scritto solo dalla CI) e degli access log dell'NLB: registrarne gli accessi richiederebbe un altro bucket di log, a sua volta senza log. Per tracciare letture e scritture si attivano i data event S3 di CloudTrail a livello di account."
+      "reason": "Bucket dei log del backend (destinazione dei log di accesso S3 del bucket degli artefatti e degli access log dell'NLB): registrarne a sua volta gli accessi richiederebbe un altro bucket di log, senza fine. Il bucket degli artefatti ha i log di accesso attivi; per il bucket dei log si usano i data event S3 di CloudTrail a livello di account."
     },
     {
       "id": "CKV2_AWS_62",
       "envs": "*",
       "paths": ["modules/backend/**"],
-      "reason": "Bucket degli artefatti e dei log dell'NLB: scritti solo dalla CI e dal servizio di log; le notifiche di eventi non hanno un destinatario e non aggiungono protezione."
+      "reason": "Bucket degli artefatti e dei log del backend: scritti solo dalla CI e dai servizi di log; le notifiche di eventi non hanno un destinatario e non aggiungono protezione."
     },
     {
       "id": "CKV_AWS_144",
       "envs": "*",
       "paths": ["modules/backend/**"],
-      "reason": "Bucket degli artefatti (ricostruibili dalla pipeline) e dei log dell'NLB, entrambi con versioning e scadenza delle versioni vecchie: la replica in un'altra regione richiede un secondo bucket e un ruolo IAM ed è una scelta del DevOps, non un default del kit."
+      "reason": "Bucket degli artefatti (ricostruibili dalla pipeline) e dei log del backend, entrambi con versioning e scadenza delle versioni vecchie: la replica in un'altra regione richiede un secondo bucket e un ruolo IAM ed è una scelta del DevOps, non un default del kit."
     },
     {
       "id": "CKV_AWS_145",
       "envs": "*",
       "paths": ["modules/backend/**"],
-      "reason": "Bucket degli access log dell'NLB con SSE-S3 (AES256), come il pattern elb: l'NLB scrive log solo per i listener TLS, quelli del VPC link sono TCP, quindi il bucket resta di norma vuoto; il bucket degli artefatti usa SSE-KMS con la chiave del backend."
+      "reason": "Bucket dei log del backend con SSE-S3 (AES256): è l'unica cifratura di default ammessa da S3 come destinazione dei log di accesso del bucket degli artefatti. Il bucket degli artefatti usa SSE-KMS con la chiave del backend."
     }
   ],
   "trivy": []

@@ -3,9 +3,9 @@ variable "project" {
   description = "Nome del progetto (kebab-case): prefisso dei nomi delle risorse."
 
   validation {
-    # il nome più lungo con limite stretto è quello dei target group dell'NLB, <project>-<env>-<hash 8>: 32 caratteri
-    condition     = length("${var.project}-${var.environment}") <= 23
-    error_message = "project e environment sono troppo lunghi: <project>-<env> supera i 23 caratteri (i target group dell'NLB, <project>-<env>-<hash>, ne ammettono al massimo 32)."
+    # il nome più lungo con limite stretto è quello dei target group dell'NLB, <project>-<env>-<hash 6>-<porta>: 32
+    condition     = length("${var.project}-${var.environment}") <= 19
+    error_message = "project e environment sono troppo lunghi: <project>-<env> supera i 19 caratteri (i target group dell'NLB, <project>-<env>-<hash>-<porta>, ne ammettono al massimo 32)."
   }
 }
 
@@ -41,6 +41,12 @@ variable "handlers" {
     condition     = alltrue([for k, h in var.handlers : can(regex("^[a-z0-9][a-z0-9-]*/(functions|ms)/[a-z0-9][a-z0-9-]*$", k))])
     error_message = "Le chiavi di handlers sono \"<contesto>/functions/<nome>\" o \"<contesto>/ms/<nome>\" in kebab-case."
   }
+
+  validation {
+    # nome della Lambda e del suo ruolo <project>-<env>-<contesto>-<nome>, ruolo del pod <project>-<env>-pod-<contesto>-<nome>: <= 64
+    condition     = alltrue([for k, h in var.handlers : length("${var.project}-${var.environment}-${h.kind == "ms" ? "pod-" : ""}${replace(replace(k, "/functions/", "-"), "/ms/", "-")}") <= 64])
+    error_message = "Nome di Lambda o di ruolo IAM oltre 64 caratteri (<project>-<env>-<contesto>-<nome>, <project>-<env>-pod-<contesto>-<nome> per i microservizi): accorcia il nome del contesto o dell'handler."
+  }
 }
 
 variable "routes" {
@@ -70,6 +76,17 @@ variable "jobs" {
   validation {
     condition     = alltrue([for k, j in var.jobs : can(regex("^[a-z0-9][a-z0-9-]*$", k))])
     error_message = "I nomi dei job sono in kebab-case."
+  }
+
+  validation {
+    # ruolo del pod <project>-<env>-pod-<job> e coda <project>-<env>-<job>-dlq
+    condition     = alltrue([for k, j in var.jobs : length("${var.project}-${var.environment}-pod-${k}") <= 64])
+    error_message = "Nome del ruolo Pod Identity di un job oltre 64 caratteri (<project>-<env>-pod-<job>): accorcia il nome del job."
+  }
+
+  validation {
+    condition     = length(setintersection(keys(var.jobs), [for k, h in var.handlers : replace(k, "/ms/", "-") if h.kind == "ms"])) == 0
+    error_message = "Un job collide con un microservizio (<contesto>-<nome>): ruoli Pod Identity, service account e repository ECR avrebbero lo stesso nome; rinomina il job."
   }
 }
 
@@ -294,7 +311,7 @@ variable "has_db" {
 
 variable "db_instance_identifier" {
   type        = string
-  description = "Istanza RDS esistente (fuori dalla v1) dietro il proxy, con manage_master_user_password = true: il proxy usa il suo segreto gestito da RDS."
+  description = "Istanza RDS esistente (fuori dalla v1) dietro il proxy, con l'autenticazione IAM attiva: il proxy usa IAM end-to-end (IAM_AUTH), senza segreti."
   default     = ""
 
   validation {
@@ -316,6 +333,6 @@ variable "db_engine_family" {
 
 variable "db_iam_user" {
   type        = string
-  description = "Utente del database con cui le Lambda si collegano al proxy con autenticazione IAM (rds-db:connect)."
+  description = "Utente del database (GRANT rds_iam) con cui le Lambda si collegano al proxy e il proxy al database, con autenticazione IAM (rds-db:connect)."
   default     = "app"
 }

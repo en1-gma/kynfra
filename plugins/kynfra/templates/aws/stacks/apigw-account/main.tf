@@ -7,10 +7,12 @@ locals {
 }
 
 # Ruolo CloudWatch di API Gateway: impostazione unica per account e regione (singleton), condivisa da tutti gli stack
-# backend dell'account. Vive in envs/shared/apigw-account e si applica una sola volta, prima degli stack backend:
-# senza, gli stage con access log o execution log non si creano.
+# backend dell'account, anche di progetti diversi. Vive in envs/shared/apigw-account e si applica una sola volta per
+# account, prima degli stack backend (se un altro progetto l'ha già applicato, non serve): senza, gli stage con access
+# log o execution log non si creano.
 resource "aws_iam_role" "api_gateway_logs" {
-  name = "${var.project}-apigateway-cloudwatch"
+  # un solo ruolo per account, anche tra progetti diversi: nome senza prefisso di progetto
+  name = "kynfra-apigateway-cloudwatch"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [

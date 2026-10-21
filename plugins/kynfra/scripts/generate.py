@@ -297,8 +297,8 @@ def _oidc_issuer(openapi: Path) -> str:
 
 def kybes_values(proj: Path, cfg: dict) -> Dict[str, str]:
     """Valori del contesto ricavati dal progetto kybes (spec 6.2) per il pattern backend: il contenuto di
-    `handlers.auto.tfvars` (`kybes_handlers`: handlers, routes, public_routes) e di `jobs.auto.tfvars`
-    (`kybes_jobs`), la radice kybes relativa allo stack (`kybes_root`), lo schema (`kybes_openapi`), `kybes_has_db`,
+    `handlers.auto.tfvars` (`kybes_handlers`: handlers, routes, public_routes), di `jobs.auto.tfvars` (`kybes_jobs`)
+    e di `kybes.auto.tfvars` (radice kybes relativa allo stack `kybes_root`, schema `kybes_openapi`, `kybes_has_db`),
     più i dati per requires e passi successivi (`kybes_has_workloads`, `kybes_repositories`, `kybes_oidc_issuer`,
     `kybes_unapproved_public`, `kybes_no_runtime`, separati da virgola). Operazioni ambigue o handler inesistenti
     sono un errore: kynfra non inventa mai un handler."""
@@ -335,6 +335,11 @@ def kybes_values(proj: Path, cfg: dict) -> Dict[str, str]:
     for job in p.jobs:
         if not JOB_RE.fullmatch(job):
             raise GenerateError(f"job '{job}': i nomi in jobs/ devono essere in kebab-case minuscolo")
+    # ruoli Pod Identity, service account e repository ECR: <contesto>-<nome> per i microservizi, <nome> per i job
+    clash = sorted(set(p.jobs) & {k.replace("/ms/", "-") for k, h in p.handlers.items() if h.kind == "ms"})
+    if clash:
+        raise GenerateError("job con lo stesso nome di un microservizio (<contesto>-<nome>): " + ", ".join(clash)
+                            + "; ruoli Pod Identity, service account e repository ECR collidono, rinomina il job")
     for op in p.operations:
         if not ROUTE_PATH_RE.fullmatch(op.path):
             raise GenerateError(f"percorso OpenAPI non supportato: '{op.path}'")
@@ -372,6 +377,9 @@ def kybes_values(proj: Path, cfg: dict) -> Dict[str, str]:
 def _kybes_steps(kv: Dict[str, str], values: Dict[str, str]) -> List[str]:
     """Passi per il DevOps che dipendono dal progetto kybes."""
     steps: List[str] = []
+    if values.get("authorizer", "lambda") == "lambda" and not values.get("oidc_audience"):
+        steps.append("authorizer=lambda senza oidc_audience: indica l'audience attesa nei token (--var oidc_audience=… "
+                     "o nei terraform.tfvars dello stack), altrimenti il plan fallisce")
     if kv["kybes_no_runtime"]:
         steps.append("Function senza runtime o handler deducibile dal manifest (package.json engines.node e main, "
                      "pyproject.toml requires-python e handler.py/app.py): " + kv["kybes_no_runtime"].replace(",", ", ")
