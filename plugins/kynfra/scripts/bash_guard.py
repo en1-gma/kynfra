@@ -13,7 +13,13 @@ Nega:
 - download e installazioni di strumenti (`curl | sh`, `curl -o`, `wget`, gestori di pacchetti, `pip install`,
   `npm i -g`, `go install`, `tfenv`…): gli strumenti si installano con `tools.py install <tool>`, uno per comando;
 - le scritture da shell dei file IaC sotto `infra_root`, dei `.env*`, degli hook di git e dei file protetti
-  (`.kynfra/`, kit, impostazioni dell'agente), `git apply`/`patch`, `install.sh --force/--uninstall`.
+  (`.kynfra/`, kit, impostazioni dell'agente), `git apply`/`patch`, `install.sh --force/--uninstall`, i link
+  (`ln`, `link`, `cp -s/-l`) creati sotto `infra_root`;
+- la lettura di credenziali (`~/.aws/credentials`, cache SSO/CLI) e dei `.env*` con comandi che ne mostrano il
+  contenuto.
+
+`tools.py install <tool>` ben formato non si nega ma chiede conferma all'utente (`ask` in Claude Code; in Codex,
+che non supporta `ask`, si nega con il comando da far eseguire all'utente).
 
 Il comando viene scomposto come farebbe la shell (virgolette, escape, `;`/`&&`/`||`/`|`/a capo, `$(…)` e backtick,
 heredoc, variabili assegnate nel comando, alias, funzioni) e i comandi che ne lanciano altri (`env`, `sudo`,
@@ -126,7 +132,7 @@ IAC_ARG_EXEMPT = {"terraform", "tofu", "terragrunt", "git", "aws", "kubectl", "h
 
 TF_NAME_RE = re.compile(r"(terraform|tofu|opentofu|tf|terragrunt)(?:[-_.]?v?\d[\w.]*)?")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh", "pwsh"}
-INTERPRETERS = {"python", "node", "deno", "bun", "ts-node", "tsx", "ruby", "perl", "php"}
+INTERPRETERS = {"python", "node", "deno", "bun", "ts-node", "tsx", "ruby", "perl", "php", "lua"}
 CLOUD_DENIED = {"az", "gcloud", "gsutil", "bq", "vercel", "netlify", "flyctl", "fly", "doctl", "heroku", "pulumi",
                 "cdk", "cdktf", "sam", "serverless", "sls", "eksctl", "copilot", "amplify", "firebase", "wrangler",
                 "oci", "ibmcloud", "aliyun", "hcloud", "linode-cli", "scw"}
@@ -180,7 +186,20 @@ AWS_SECRET_OPS = {
     ("cognito-identity", "get-credentials-for-identity"): None,
     ("cognito-identity", "get-open-id-token"): None,
     ("cognito-identity", "get-open-id-token-for-developer-identity"): None,
+    ("redshift", "get-cluster-credentials"): None, ("redshift", "get-cluster-credentials-with-iam"): None,
+    ("redshift-serverless", "get-credentials"): None, ("lightsail", "get-instance-access-details"): None,
+    ("lightsail", "get-relational-database-master-user-password"): None,
+    ("lightsail", "download-default-key-pair"): None,
 }
+# file di credenziali che l'agente non legge (con `~` già espanso): prefissi sotto la home
+CREDENTIAL_HOME_PATHS = (".aws/credentials", ".aws/sso/cache/", ".aws/cli/cache/", ".aws/login/cache/")
+# .env di esempio (senza valori veri): leggibili
+ENV_TEMPLATES = (".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults")
+# comandi che mostrano il contenuto dei file che ricevono
+READERS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg", "diff", "jq", "yq", "cut", "tr",
+           "nl", "column", "cmp", "comm", "strings", "od", "xxd", "hexdump", "base64", "bat", "batcat", "sort",
+           "uniq", "tac", "rev", "fold", "paste", "iconv", "awk", "gawk", "mawk", "nawk", "sed", "gsed", "view",
+           "vi", "vim", "nvim", "nano", "emacs", "open", "code", "cp", "rsync", "scp", "dd", "tee", "zip", "tar"}
 KUBECTL_SECRET_RESOURCES = {"secret", "secrets"}
 KUBECTL_SAFE_OUTPUT = {"", "wide", "name"}
 HELM_VALUE_OPTS = {"--kube-context", "--kubeconfig", "-n", "--namespace", "--registry-config", "--repository-cache",
@@ -197,6 +216,10 @@ SPAWN_RE = re.compile(r"subprocess|\bos\.(?:system|popen|exec\w*|spawn\w*|posix_
                       r"|child_process|\bexec(?:Sync|File(?:Sync)?)?\s*\(|\bspawn(?:Sync)?\s*\(|\bsystem\s*\("
                       r"|\bpopen\s*\(|IO\.popen|Open3|Bun\.(?:spawn|\$)|Deno\.(?:Command|run)|\bshell_exec"
                       r"|\bpassthru|\bproc_open|\bqx\s*[/{(\[]|%x\s*[{(\[]|__import__|\bpexpect|\bplumbum")
+# ruby/perl/php/lua lanciano comandi anche senza parentesi (`system "…"`, `exec "a","b"`, `os.execute "…"`) e
+# con `open` su una pipe (`open(F, "|-", …)`, `open("| cmd")`)
+LOOSE_SPAWN_RE = re.compile(r"\b(?:system|exec\w*|spawn\w*|popen\w*|os\.execute|io\.popen|shell_exec|passthru"
+                            r"|proc_open|pcntl_exec|syscall)\b|\bopen\b[^;\n]*['\"][^'\"]*\|")
 AWK_SPAWN_RE = re.compile(r"\|\s*getline|print[^;\n]*\|\s*\"")
 TICK_RE = re.compile(r"`[^`]+`")
 CLOUD_WORD_RE = re.compile(r"\b(?:terraform|tofu|terragrunt|aws|az|gcloud|gsutil|kubectl|helm|vercel|pulumi|cdktf"
@@ -270,6 +293,8 @@ def norm_name(text: str, lower: bool = True) -> str:
         return "pip"
     if base == "nodejs":
         return "node"
+    if re.fullmatch(r"lua(?:jit|\d+(?:\.\d+)*)?|texlua", base):
+        return "lua"
     if base in ("gmake", "go-task", "pnpx", "bunx"):
         return {"gmake": "make", "go-task": "task"}.get(base, "npx")
     return base
@@ -289,6 +314,12 @@ def long_opt(x: str, names: Tuple[str, ...], exact: Set[str] = frozenset(),
         if n == key or (abbrev and len(key) >= 3 and n.startswith(key)):
             return n, (val if eq else None)
     return None
+
+
+def _abbrev_of(arg: str, flag: str) -> bool:
+    """`arg` è un'abbreviazione di `flag` (la CLI aws accetta i prefissi: `--with-d` = `--with-decryption`)."""
+    key = arg.split("=", 1)[0]
+    return key.startswith("--") and len(key) > 3 and flag.startswith(key)
 
 
 def is_env_name(name: str) -> bool:
@@ -693,6 +724,7 @@ class Analyzer:
                                       "batch", "crontab")):
             self.deny(f"`xargs {name}`: argomenti letti da stdin, comando non verificabile")
             return
+        self.credential_reads(name, args, ctx)
         kind = self.dispatch(name, args, ctx)
         if kind in (KIT, DELEGATED):
             return
@@ -707,6 +739,39 @@ class Analyzer:
                 self.iac_args(name, args[1:], ctx.cwds)
             if any(TF_CLI_RE.search(a.text) for a in args[1:]):
                 self.deny("variabile TF_CLI_ARGS*: inietta opzioni nei comandi terraform/tofu e non è consentita")
+
+    def credential_file(self, a: Arg, cwds: List[Path]) -> Optional[str]:
+        """Il percorso è un file di credenziali (~/.aws/credentials, cache SSO/CLI) o un .env non di esempio?"""
+        if a.dyn and not a.globby:
+            return None
+        home = Path.home().resolve()
+        for c in self.candidates(a, cwds):
+            text = c.split("=", 1)[1] if c.startswith("-") and "=" in c else c
+            if not text or text.startswith("-"):
+                continue
+            base = text.rstrip("/").rsplit("/", 1)[-1]
+            if is_env_name(base) and base.lower() not in ENV_TEMPLATES:
+                return text
+            for p in self.resolve_all(text, cwds):
+                try:
+                    rel = p.relative_to(home).as_posix()
+                except ValueError:
+                    continue
+                if any(rel == x.rstrip("/") or (x.endswith("/") and rel.startswith(x))
+                       for x in CREDENTIAL_HOME_PATHS):
+                    return text
+        return None
+
+    def credential_reads(self, name: str, args: List[Arg], ctx: Ctx) -> None:
+        """Lettura di credenziali o .env da parte dell'agente (comandi che ne mostrano il contenuto, o `< file`)."""
+        found = None
+        if name in READERS:
+            found = next((f for f in (self.credential_file(a, ctx.cwds) for a in args[1:]) if f), None)
+        if found is None:
+            found = next((f for f in (self.credential_file(a, ctx.cwds) for a in ctx.stdin_files) if f), None)
+        if found:
+            self.deny(f"lettura di {found}: credenziali e .env non si leggono dall'agente (finirebbero nella "
+                      "conversazione); se serve un valore chiedilo all'utente")
 
     def output_opts(self, rest: List[Arg], cwds: List[Path], short_o: bool = False,
                     names: Tuple[str, ...] = ("--output",)) -> None:
@@ -992,7 +1057,7 @@ class Analyzer:
             return self.python(args, ctx)
         if name in ("node", "deno", "bun", "ts-node", "tsx"):
             return self.node(name, args, ctx)
-        if name in ("ruby", "perl", "php"):
+        if name in ("ruby", "perl", "php", "lua"):
             return self.ruby_perl(name, args, ctx)
         if name in ("awk", "gawk", "mawk", "nawk"):
             return self.awk(args, ctx)
@@ -1038,6 +1103,8 @@ class Analyzer:
             return RW
         if name == "find":
             return self.find(args, ctx)
+        if name == "link":
+            self.links(name, args[1:], ctx)
         if name in ("patch",):
             self.deny("git apply/patch scrivono file senza passare dai controlli: applica le modifiche con Write/Edit")
             return RW
@@ -1266,7 +1333,8 @@ class Analyzer:
         svc, op = pos[0].text, pos[1].text
         if (svc, op) in AWS_SECRET_OPS:
             flag = AWS_SECRET_OPS[(svc, op)]
-            if flag is None or any(a.text == flag or a.text.startswith(flag + "=") for a in args[2:]):
+            if flag is None or any(a.text == flag or a.text.startswith(flag + "=")
+                                   or _abbrev_of(a.text, flag) for a in args[2:]):
                 self.deny(f"`aws {svc} {op}`" + (f" {flag}" if flag else "") + ": restituisce segreti o credenziali "
                           "in chiaro; l'agente non li legge (li usa il DevOps o la pipeline)")
                 return RW
@@ -1483,7 +1551,7 @@ class Analyzer:
             shebang = first[2:] if first.startswith("#!") else ""
             code_lang = lang
             if code_lang in (None, "sh") and shebang:
-                for key in ("python", "node", "deno", "bun", "ruby", "perl", "php"):
+                for key in ("python", "node", "deno", "bun", "ruby", "perl", "php", "lua"):
                     if re.search(rf"\b{key}", shebang):
                         code_lang = key
                         break
@@ -1494,7 +1562,8 @@ class Analyzer:
             return
 
     def check_code(self, code: str, origin: str, lang: str = "python") -> None:
-        spawn = bool(SPAWN_RE.search(code)) or (lang in ("ruby", "perl", "php") and bool(TICK_RE.search(code))) \
+        spawn = bool(SPAWN_RE.search(code)) \
+            or (lang in ("ruby", "perl", "php", "lua") and bool(TICK_RE.search(code) or LOOSE_SPAWN_RE.search(code))) \
             or (lang == "awk" and bool(AWK_SPAWN_RE.search(code)))
         write = bool(WRITE_RE.search(code)) or (lang == "awk" and bool(AWK_WRITE_RE.search(code)))
         if SDK_RE.search(code):
@@ -1657,7 +1726,7 @@ class Analyzer:
         codes: List[str] = []
         inplace = False
         pos: List[Arg] = []
-        code_flags = {"ruby": "e", "perl": "eE", "php": "r"}[name]
+        code_flags = {"ruby": "e", "perl": "eE", "php": "r", "lua": "e"}[name]
         i = 1
         while i < len(args):
             x = args[i].text
@@ -2430,6 +2499,10 @@ class Analyzer:
         elif name in ("cp", "mv", "install", "ln", "rsync", "scp", "ditto"):
             if name == "install" and any(x in ("-d", "--directory") for x in t):
                 return
+            if name == "ln" or (name == "cp" and any(
+                    x in ("--link", "--symbolic-link") or (x.startswith("-") and not x.startswith("--")
+                                                            and re.search(r"[sl]", x[1:])) for x in t)):
+                self.links(name, rest, ctx)
             if name == "ditto" and any(x.startswith("-") and not x.startswith("--") and "x" in x[1:] for x in t):
                 pos = positional()
                 if pos:
@@ -2502,6 +2575,58 @@ class Analyzer:
                      for x in t):
                 pos = positional({"-H", "-F", "-E", "-R", "-I", "-O", "-M", "-C", "--format", "--file"})
                 self.target(pos[-1] if pos else Arg("."), cw, extract=True)
+
+    def links(self, name: str, rest: List[Arg], ctx: Ctx) -> None:
+        """`ln`, `link`, `cp -s/-l`: un link (simbolico o fisso) sotto infra_root fa leggere a Terraform un file che
+        i controlli non vedono (o che cambia fuori da Write/Edit): rifiutato. Si controlla il percorso del link, non
+        quello a cui punta."""
+        t = [a.text for a in rest]
+        tdir: Optional[Arg] = None
+        for i, x in enumerate(t):
+            if x in ("-t", "--target-directory") and i + 1 < len(t):
+                tdir = rest[i + 1]
+            elif x.startswith("--target-directory="):
+                tdir = Arg(x.split("=", 1)[1])
+        no_deref = any(x in ("-T", "--no-target-directory", "-n", "--no-dereference") for x in t)
+        pos = _opt_split(rest, {"-t", "--target-directory", "-S", "--suffix"}) if name != "link" else rest
+        if tdir is not None:
+            dests = [(tdir, True, pos)]
+        elif len(pos) == 1:
+            dests = [(Arg("."), True, pos)]
+        elif len(pos) >= 2:
+            dests = [(pos[-1], None, pos[:-1])]
+        else:
+            return
+        for dest, is_dir, sources in dests:
+            if dest.dyn:
+                self.deny(f"`{name}`: link creato in un percorso non determinabile ({dest.text}): non verificabile")
+                return
+            for c in self.candidates(dest, ctx.cwds):
+                for d in self.resolve_dest(c, ctx.cwds):
+                    into = is_dir if is_dir is not None else (d.is_dir() and not (no_deref and d.is_symlink()))
+                    paths = [d / (s.text.rstrip("/").rsplit("/", 1)[-1] or "x") for s in sources] if into else [d]
+                    for lp in paths:
+                        rel = rules.rel_to_project(str(lp.parent), self.proj)
+                        if rel is None:
+                            continue
+                        rel = lp.name if rel in ("", ".") else f"{rel}/{lp.name}"
+                        if self.in_infra_scope(rel) or (self.protect and rules.protected_reason(rel, self.cfg)):
+                            self.deny(f"`{name}` crea un link in {rel}: Terraform seguirebbe il link e i controlli "
+                                      "di kynfra non vedrebbero il contenuto; sotto infra_root niente link, usa i "
+                                      "file veri (Write/Edit)")
+                            return
+
+    def resolve_dest(self, text: str, cwds: List[Path]) -> List[Path]:
+        """Come resolve_all ma senza seguire l'ultimo componente (che può essere già un link)."""
+        t = os.path.expanduser(text).rstrip("/") or "/"
+        bases = [Path(t)] if os.path.isabs(t) else [c / t for c in cwds if c != UNKNOWN_DIR]
+        out = []
+        for b in bases:
+            if b.name in ("", ".", ".."):
+                out.append(b.resolve())
+            else:
+                out.append(b.parent.resolve() / b.name)
+        return out
 
     def producers(self, name: str, args: List[Arg], ctx: Ctx) -> None:
         """Comandi che producono file (decompressori, base64, xxd, openssl, pax, split): i percorsi di output
@@ -2720,17 +2845,22 @@ def check(cmd: str, cwd: Path, proj: Path, cfg: dict) -> List[str]:
     return analyze(cmd, cwd, proj, cfg).reasons
 
 
-def main() -> int:
-    event = hc.read_event()
-    hc.debug_dump(event, "bash")
-    cmd = command_text(event)
-    if not cmd.strip():
-        return 0
+CLAUDE_TOOLS = {"Bash"}  # nome del tool shell in Claude Code; Codex usa shell, exec_command, local_shell
+
+
+def _output(decision: str, reason: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                             "permissionDecisionReason": reason}}, ensure_ascii=False))
+
+
+def _evaluate(event: dict, cmd: str) -> Tuple[List[str], bool, List[str]]:
+    """(motivi di rifiuto, serve /kynfra:kynfra-tools, comandi tools.py install da far approvare all'utente)."""
     cwd = Path(event.get("cwd") or os.getcwd()).resolve()
     projects = [rules.find_project_dir(str(cwd))]
     if rules.load_config(projects[0]) is None:
         projects = rules.discover_projects(cwd)
     reasons: List[str] = []
+    installs: List[str] = []
     tool = False
     for proj in projects:
         cfg = rules.load_config(proj)
@@ -2742,16 +2872,42 @@ def main() -> int:
         for r in an.reasons:
             if r not in reasons:
                 reasons.append(r)
-    if not reasons:
+        if an.installs:
+            installs.append(cmd)
+    return reasons, tool, installs
+
+
+def main() -> int:
+    event = hc.read_event()
+    hc.debug_dump(event, "bash")
+    cmd = command_text(event)
+    if not cmd.strip():
         return 0
-    reason = ("Comando rifiutato dalle regole di infrastruttura del progetto (kynfra):\n"
-              + "\n".join(f"- {r}" for r in reasons)
-              + "\nNon aggirare i controlli: segui la skill kynfra-architecture (il codice IaC si scrive con "
-                "Write/Edit; apply, plan e le CLI cloud mutanti li esegue il DevOps).")
-    if tool:
-        reason += "\nPer gli strumenti esterni usa /kynfra:kynfra-tools (un'installazione approvata per strumento)."
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                             "permissionDecisionReason": reason}}, ensure_ascii=False))
+    try:
+        reasons, tool, installs = _evaluate(event, cmd)
+    except Exception as e:  # fail closed dentro un progetto kynfra (config illeggibile, errore imprevisto)
+        if hc.in_kynfra_project(event):
+            _output("deny", f"Comando rifiutato: errore interno della guardia di kynfra ({type(e).__name__}), comando "
+                            "non verificabile. Segnala il problema; controlla che .kynfra/config.json sia valido.")
+        return 0
+    if reasons:
+        reason = ("Comando rifiutato dalle regole di infrastruttura del progetto (kynfra):\n"
+                  + "\n".join(f"- {r}" for r in reasons)
+                  + "\nNon aggirare i controlli: segui la skill kynfra-architecture (il codice IaC si scrive con "
+                    "Write/Edit; apply, plan e le CLI cloud mutanti li esegue il DevOps).")
+        if tool:
+            reason += "\nPer gli strumenti esterni usa /kynfra:kynfra-tools (un'installazione approvata per strumento)."
+        _output("deny", reason)
+        return 0
+    if installs:
+        # spec 7.3.1: ogni installazione la autorizza l'utente, non basta che il comando sia ben formato
+        if event.get("tool_name") in CLAUDE_TOOLS:
+            _output("ask", "kynfra: installazione di uno strumento esterno con tools.py. Approva solo se hai letto "
+                           f"e accettato il piano (`tools.py plan`) per questo strumento:\n  {cmd}")
+        else:  # Codex non supporta "ask" nei PreToolUse: l'installazione la lancia l'utente
+            _output("deny", "L'installazione di strumenti esterni la autorizza l'utente ogni volta e Codex non può "
+                            "chiedergliela da un hook: mostra all'utente il piano (`tools.py plan <tool>`) e chiedigli "
+                            f"di eseguire lui stesso, nel terminale:\n  {cmd}")
     return 0
 
 

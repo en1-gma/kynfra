@@ -27,6 +27,27 @@ def project_and_config(event: dict) -> Tuple[Path, Optional[dict]]:
     return proj, rules.load_config(proj)
 
 
+def in_kynfra_project(event: dict, paths: Optional[List[str]] = None) -> bool:
+    """C'è un progetto kynfra (una .kynfra/config.json) per il cwd dell'evento o per uno dei file? Serve agli hook
+    per fallire chiusi solo dentro i progetti. Nel dubbio (errore) sì."""
+    try:
+        cwd = event.get("cwd") or os.getcwd()
+        if rules.nearest_project(Path(cwd)) is not None:
+            return True
+        env = os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("KYNFRA_PROJECT_DIR")
+        if env and (Path(env) / rules.CONFIG_REL).is_file():
+            return True
+        for p in paths or []:
+            probe = _abs(p, cwd).parent
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            if rules.nearest_project(probe) is not None:
+                return True
+        return bool(rules.discover_projects(Path(cwd)))
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------- operazioni sui file
 
 @dataclass
