@@ -29,7 +29,7 @@ flowchart TB
 
 | Area | Dettaglio |
 |---|---|
-| Control plane | cluster `<progetto>-<env>` alla `kubernetes_version` (default `1.36`: l'ultima supportata sia da EKS sia dai chart bloccati, KEDA 2.21 arriva a 1.36); `endpoint_private_access = true`, endpoint pubblico solo con `public_endpoint_cidrs` non vuoto (`0.0.0.0/0` e `::/0` rifiutati); deletion protection (obbligatoria in prod); ogni add-on è un add-on gestito |
+| Control plane | cluster `<progetto>-<env>` alla `kubernetes_version` (default `1.36`: l'ultima supportata sia da EKS sia dai chart bloccati, KEDA 2.21 arriva a 1.36); `endpoint_private_access = true`, endpoint pubblico solo con `public_endpoint_cidrs` non vuoto (`0.0.0.0/0` e `::/0` rifiutati); deletion protection (obbligatoria in prod); `upgrade_policy { support_type = var.support_type }` (default `STANDARD`: alla fine dello standard support EKS aggiorna il control plane invece di passare all'extended support a pagamento); ogni add-on è un add-on gestito |
 | Cifratura | Secret Kubernetes con chiave KMS dedicata; log del control plane con chiave KMS; volumi dei nodi con chiave EBS; rotazione attiva su tutte |
 | Log | log group `/aws/eks/<cluster>/cluster` creato prima del cluster, con `log_retention_days` e KMS; tutti e cinque i tipi di log |
 | Accesso | `authentication_mode = "API"`, nessun `aws-auth`, nessun amministratore implicito (`bootstrap_cluster_creator_admin_permissions = false`); ogni ARN di `admin_principals` (stesso account, controllato in plan) ha una access entry con `AmazonEKSClusterAdminPolicy`; i nodi Karpenter entrano con una access entry `EC2_LINUX` |
@@ -74,4 +74,4 @@ flowchart TB
 | `log_retention_days` | 90 | 365 |
 | `deletion_protection` | opzionale | **attiva** |
 
-Costo fisso: il control plane EKS e i nodi di sistema. Voci di baseline motivate: retention a 90 giorni in dev (`CKV_AWS_338`), endpoint pubblico acceso solo con CIDR (`CKV_AWS_39`), versione di default in standard support (`CKV_AWS_339`) e le azioni della policy ufficiale dell'AWS Load Balancer Controller trascritta senza modifiche (`CKV_AWS_290`, `CKV_AWS_355`).
+Costo fisso: il control plane EKS e i nodi di sistema. Voci di baseline motivate: retention a 90 giorni in dev (`CKV_AWS_338`), endpoint pubblico acceso solo con CIDR (`CKV_AWS_39`), versione di default in standard support (`CKV_AWS_339`) e le azioni della policy ufficiale dell'AWS Load Balancer Controller trascritta senza modifiche (`CKV_AWS_290`, `CKV_AWS_355`), limitate al file `modules/eks/iam_lb_controller.tf` che contiene solo quella policy: le altre policy del modulo restano controllate.

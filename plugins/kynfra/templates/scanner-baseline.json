@@ -136,13 +136,13 @@
     {
       "id": "CKV_AWS_290",
       "envs": "*",
-      "paths": ["modules/eks/**"],
+      "paths": ["modules/eks/iam_lb_controller.tf"],
       "reason": "Policy ufficiale dell'AWS Load Balancer Controller v3.6.0 (docs/install/iam_policy.json del progetto kubernetes-sigs/aws-load-balancer-controller), trascritta senza modifiche: alcune azioni di scrittura (CreateSecurityGroup, Authorize/RevokeSecurityGroupIngress, CreateListener/Rule, ModifyListener) non hanno condizioni perché il controller le usa su risorse che crea o che riceve dagli Ingress e dai TargetGroupBinding. Il ruolo è assumibile solo dal service account kube-system/aws-load-balancer-controller di questo cluster (Pod Identity con session tag)."
     },
     {
       "id": "CKV_AWS_355",
       "envs": "*",
-      "paths": ["modules/eks/**"],
+      "paths": ["modules/eks/iam_lb_controller.tf"],
       "reason": "Policy ufficiale dell'AWS Load Balancer Controller v3.6.0, trascritta senza modifiche: le azioni Describe* di EC2 ed ELB e alcune azioni sui listener e sui security group non supportano ARN di risorsa specifici o li ricevono a runtime, quindi usano Resource = \"*\" come nel documento ufficiale. Il ruolo è assumibile solo dal service account kube-system/aws-load-balancer-controller di questo cluster."
     },
     {

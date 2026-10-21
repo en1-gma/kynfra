@@ -24,6 +24,17 @@ variable "kubernetes_version" {
   }
 }
 
+variable "support_type" {
+  type        = string
+  description = "Politica di supporto del cluster (upgrade_policy): STANDARD (default) aggiorna il control plane alla fine dello standard support; EXTENDED lo tiene sulla versione con l'extended support a pagamento."
+  default     = "STANDARD"
+
+  validation {
+    condition     = contains(["STANDARD", "EXTENDED"], var.support_type)
+    error_message = "support_type deve essere STANDARD o EXTENDED."
+  }
+}
+
 variable "vpc_id" {
   type        = string
   description = "ID della VPC (output vpc_id dello stack network)."
