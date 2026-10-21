@@ -11,7 +11,7 @@ Il kit si trova in `tools/kynfra/plugins/kynfra/` (nel repository del plugin: `p
 
 1. Stato: `python3 -B <kit>/scripts/tools.py status`. Elenca per ogni strumento se è installato, la versione e se corrisponde al registro. Se tutto è a posto, fermati e dillo.
 2. Considera solo gli strumenti marcati `richiesto` da `status` che risultano `MANCA` o `NON CONFORME`; quelli `opzionale` (OpenTofu se si usa Terraform e viceversa, Trivy se lo scanner è Checkov e viceversa) si saltano, salvo richiesta esplicita dell'utente. Nomi accettati da `plan`/`install`: `terraform`, `opentofu` (o `tofu`), `tflint`, `tflint_ruleset_aws` (o `tflint-ruleset-aws`), `checkov`, `trivy`. Per ognuno, in sequenza e uno strumento alla volta:
-   1. esegui `python3 -B <kit>/scripts/tools.py plan <strumento>` e mostra all'utente l'output (nome, versione, sorgente, checksum atteso, cartella di destinazione);
+   1. esegui `python3 -B <kit>/scripts/tools.py plan <strumento>` e mostra all'utente l'output (nome, versione, sorgente, origine del checksum, cartella di destinazione);
    2. fai all'utente **una sola domanda, per quello strumento**: "Installo `<strumento>` <versione> da <sorgente>?";
    3. solo se la risposta è un sì esplicito per quello strumento, esegui un solo comando:
 
@@ -19,6 +19,7 @@ Il kit si trova in `tools/kynfra/plugins/kynfra/` (nel repository del plugin: `p
       python3 -B <kit>/scripts/tools.py install <strumento> --approved-by "$(git config user.name)"
       ```
 
+      In Claude Code il comando apre comunque una richiesta di permesso (la guardia risponde `ask`): è la conferma dell'utente, non aggirarla. In Codex la guardia nega il comando: mostra all'utente il comando esatto e chiedigli di eseguirlo lui nel terminale, poi riprendi da `status`.
    4. riporta l'esito e la voce aggiunta a `.kynfra/tools.lock.json` (versione, sorgente, checksum, data, chi ha approvato); poi passa allo strumento successivo.
 3. Un sì vale per uno strumento e una versione: non esistono approvazioni cumulative, "sì a tutto" o risposte riutilizzate per un altro strumento. Se l'utente non risponde con un sì, o dice no, non installare e passa oltre.
 4. Mai più strumenti in un comando; mai un'installazione senza il sì dell'utente; mai l'approvazione a nome di qualcun altro (`--approved-by` è l'utente git reale: se `git config user.name` è vuoto, chiedilo).

@@ -214,22 +214,26 @@ def plan_install(proj: Path, tool: str, os_: str, arch: str) -> dict:
     if e["kind"] == "pypi":
         url = e["url_template"].format(version=e["version"])
         sha_url = None
-        how = (f"virtualenv dedicato in {proj / VENV_REL}, `pip install {e['binary']}=={e['version']}` da PyPI "
-               "(pip.pypa.io); l'hash della wheel è quello scelto da pip")
-        sha_line = "SHA256 atteso: non pubblicato in anticipo (fonte PyPI, hash registrato dopo l'installazione)"
+        how = (f"virtualenv dedicato in {proj / VENV_REL}; `pip download {e['binary']}=={e['version']} --no-deps "
+               "--only-binary=:all:` dal solo indice PyPI ufficiale, poi `pip install` di quella wheel (le "
+               "dipendenze le risolve pip dallo stesso indice)")
+        sha_line = ("SHA256 atteso: non pubblicato in anticipo (fonte PyPI): si registra nel lock lo SHA256 della "
+                    "wheel scaricata, verificato alle esecuzioni successive")
+        sig_line = "Firme: PyPI via HTTPS; nessuna firma GPG verificata nella v1."
     else:
         url = _fill(e["url_template"], e, os_, arch)
         sha_url = _fill(e["checksums_url"], e, os_, arch)
         how = f"archivio {e['archive']}, estratto solo il file '{e['binary']}'"
         sha_line = (f"SHA256 atteso: letto da {sha_url} (file ufficiale via HTTPS) per "
                     f"{posixpath.basename(urllib.parse.urlparse(url).path)}")
+        sig_line = "Firme GPG: non verificate nella v1 (si verifica il checksum SHA256 via HTTPS dall'host ufficiale)."
     text = "\n".join([
         f"Installazione di {name} {e['version']}",
         f"  Sorgente ufficiale: {url}",
         f"  {sha_line}",
         f"  Destinazione: {dest}",
         f"  Modalità: {how}",
-        "  Firme GPG: non verificate nella v1 (si verifica il checksum SHA256 via HTTPS dall'host ufficiale).",
+        f"  {sig_line}",
         "  L'approvazione vale solo per questo strumento e questa versione.",
     ])
     return {"tool": name, "version": e["version"], "url": url, "sha256_url": sha_url, "dest": str(dest),

@@ -31,6 +31,7 @@ Genera il modulo `modules/network` e lo stack `envs/<env>/network` per ogni ambi
 4. **Personalizzazioni** (altri endpoint, CIDR per ambiente diversi nei `tfvars`) solo con gli strumenti di modifica dei file, mai con redirect o `sed -i` da shell: ogni scrittura passa dalle regole. Mantieni letterali gli attributi di sicurezza, `enable_key_rotation = true`, la retention dei log e il security group di default senza regole.
 5. **Controlla**: `python3 -B <kit>/scripts/arch_check.py . --external` e correggi la causa di ogni finding (mai soppressioni inline). Se mancano strumenti esterni proponi `/kynfra:kynfra-tools`.
 6. **Riepiloga** in poche righe:
+   - lock dei provider: il primo stop gate (o la CI) crea un `.terraform.lock.hcl` in ogni stack nuovo; l'agente non può scriverli (`protected-files`): ricorda all'utente di committarli;
    - file creati (modulo e stack per ambiente) e output di ogni stack: `vpc_id`, `public_subnet_ids`, `private_subnet_ids`, `isolated_subnet_ids`, `vpc_endpoint_sg_id`;
    - costi fissi: NAT gateway (uno per zona in prod) ed endpoint VPC interface (cinque per ogni zona);
    - comandi che esegue il DevOps con le sue credenziali, per ogni ambiente: `cd <infra_root>/envs/<env>/network && terraform init && terraform plan -out=network.tfplan && terraform apply network.tfplan` (o `tofu`). Tu non li lanci;

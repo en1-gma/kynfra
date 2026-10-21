@@ -22,5 +22,6 @@ Codex carica configurazione e hook di progetto solo se il progetto è *trusted*,
 - Le scritture da shell (es. `cat > infra/envs/dev/x.tf`, `sed -i`, `git apply`) le intercetta `bash_guard.py`, con un controllo euristico: lo stop gate e la CI eseguono comunque `arch_check` sull'intero progetto.
 - L'installer scrive le regole `permissions.deny` solo per Claude Code: in Codex i file protetti (`.kynfra/`, `tools/kynfra/`, `.codex/hooks.json`, `.codex/config.toml`, `.codex/agents/kynfra_*`, …) sono difesi solo dagli hook e dalla CI.
 - `.codex/hooks.json` registra `Stop` ma non `SubagentStop`.
+- Codex non supporta `permissionDecision: "ask"` negli hook `PreToolUse`: `tools.py install` viene negato con il comando da far eseguire all'utente nel suo terminale (in Claude Code la guardia risponde `ask`).
 - Le regole per percorso di Claude Code (`.claude/rules/kynfra/*.md`) non hanno un equivalente diretto: in Codex il contenuto è nella skill e in `AGENTS.md`.
 - Come per Claude Code, la barriera decisiva contro un `apply` è l'assenza di credenziali cloud nella sessione dell'agente (vedi [controlli](controlli.md#un-controllo-euristico)).

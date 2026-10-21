@@ -14,11 +14,11 @@ python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py verify
 | Comando | Cosa fa |
 |---|---|
 | `status` | per ogni strumento: richiesto o opzionale, versione attesa, versione trovata, presenza nel registro, esito (`ok`, `MANCA`, `NON CONFORME`) |
-| `plan <tool>` | mostra nome, versione, sorgente ufficiale, checksum atteso e cartella di destinazione: il testo da sottoporre all'utente prima di installare |
+| `plan <tool>` | mostra nome, versione, sorgente ufficiale, da dove si legge il checksum (URL del file ufficiale dei checksum per gli archivi; per Checkov "non pubblicato in anticipo": si registra lo SHA256 della wheel scaricata) e cartella di destinazione: il testo da sottoporre all'utente prima di installare |
 | `install <tool> --approved-by "<utente>"` | scarica, verifica, installa e registra **un** strumento. `--approved-by` è obbligatorio (utente git che approva) |
 | `verify` | controlla che i binari installati corrispondano al registro (checksum del binario e versione) |
 
-Gli strumenti sono `terraform`, `opentofu` (alias `tofu`), `tflint`, `tflint-ruleset-aws`, `trivy` e `checkov`. `status` considera richiesti lo strumento IaC e lo scanner scelti in config, TFLint e il suo ruleset. Dentro l'agente si usa la skill `kynfra-tools` (`/kynfra:kynfra-tools`): mostra lo stato, propone **un** strumento, attende il sì dell'utente per quello strumento, lo installa, poi passa al successivo. Non esistono approvazioni cumulative né "sì a tutto": una risposta vale per uno strumento e una versione. `tools.py install` passa dalla richiesta di permesso del comando shell, quindi l'utente lo autorizza ogni volta.
+Gli strumenti sono `terraform`, `opentofu` (alias `tofu`), `tflint`, `tflint-ruleset-aws`, `trivy` e `checkov`. `status` considera richiesti lo strumento IaC e lo scanner scelti in config, TFLint e il suo ruleset. Dentro l'agente si usa la skill `kynfra-tools` (`/kynfra:kynfra-tools`): mostra lo stato, propone **un** strumento, attende il sì dell'utente per quello strumento, lo installa, poi passa al successivo. Non esistono approvazioni cumulative né "sì a tutto": una risposta vale per uno strumento e una versione. `tools.py install` lo autorizza l'utente ogni volta: in Claude Code `bash_guard` risponde `ask`, quindi compare la richiesta di permesso anche se i comandi shell sono consentiti in automatico; in Codex (che dagli hook non supporta `ask`) il comando è negato con il testo da far eseguire all'utente nel suo terminale.
 
 ```mermaid
 sequenceDiagram
@@ -30,7 +30,7 @@ sequenceDiagram
     S->>T: status
     T-->>S: terraform MANCA, tflint MANCA…
     S->>T: plan terraform
-    T-->>S: versione, sorgente, checksum atteso, destinazione
+    T-->>S: versione, sorgente, origine del checksum, destinazione
     S-->>U: installo terraform 1.x? (solo questo)
     U-->>S: sì
     S->>T: install terraform --approved-by utente
@@ -67,6 +67,8 @@ Checkov è l'unico strumento Python e il rischio principale è l'esecuzione di c
 Limite dichiarato: le wheel delle **dipendenze** di Checkov non sono fissate una per una (arrivano dallo stesso indice); restano coperte dall'isolamento ma non dal checksum.
 
 ## Installazione e risoluzione
+
+- **Cache dei provider**: lo stop gate e `arch_check --external` lanciano `init -backend=false` in ogni stack e scaricano i provider ogni volta. Imposta `TF_PLUGIN_CACHE_DIR` (es. `mkdir -p ~/.terraform.d/plugin-cache` e `export TF_PLUGIN_CACHE_DIR=~/.terraform.d/plugin-cache` nel profilo della shell da cui parte l'agente) per scaricarli una volta sola. I `.terraform.lock.hcl` creati dal primo `init` vanno committati (l'agente non può scriverli).
 
 - Gli strumenti si installano **solo** sotto `.kynfra/bin/` (e `.kynfra/venv/` per Checkov, `.kynfra/tflint.d/plugins/…` per il ruleset di TFLint), mai globalmente, **mai come root** né con `sudo` (lo script lo rifiuta). La cartella è ignorata da git.
 - Lo stop gate usa prima quei binari, poi quelli nel `PATH`; un binario sotto `.kynfra/` è eseguito solo se il suo SHA256 coincide con quello del registro (altrimenti si passa al `PATH`).
