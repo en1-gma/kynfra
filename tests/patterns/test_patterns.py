@@ -5,11 +5,14 @@ strumenti esterni; con KYNFRA_REQUIRE_TOOLS=1 (CI) sono obbligatori. KYNFRA_PATT
 KYNFRA_TOOLS_PROJECT=<dir> usa i binari verificati sul registro di <dir>/.kynfra (e i suoi plugin di TFLint) invece
 di quelli del progetto temporaneo, es. gli strumenti installati con tools.py nel repository del kit.
 I pattern `single_env` si generano un ambiente per comando; `example` può essere un dizionario {ambiente: valore}.
+I pattern con `kybes` (backend) si generano nella copia della fixture tests/fixtures/kybes-repo (con `kybes.root = "."`
+in config), con i requires estesi da `requires_with_workloads` (la fixture ha microservizi e job).
 VARIANTS aggiunge combinazioni di input da verificare allo stesso modo (es. spa con zona esistente e /api/*).
 """
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -17,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN = ROOT / "plugins" / "kynfra"
+KYBES_FIXTURE = ROOT / "tests" / "fixtures" / "kybes-repo"
 sys.path.insert(0, str(PLUGIN / "scripts"))
 
 import arch_check  # noqa: E402
@@ -52,7 +56,8 @@ def patterns(provider: str):
 def with_requires(provider: str, pattern: str, seen=None) -> list:
     """Il pattern preceduto dai suoi requires (in profondità, senza doppioni)."""
     seen = [] if seen is None else seen
-    for req in generate.load_pattern(provider, pattern)["requires"]:
+    entry = generate.load_pattern(provider, pattern)
+    for req in entry["requires"] + (entry["kybes"] or {}).get("requires_with_workloads", []):
         if req not in seen:
             with_requires(provider, req, seen)
     if pattern not in seen:
@@ -76,6 +81,9 @@ VARIANTS = {
     # endpoint pubblico con CIDR espliciti, due amministratori e un altro tipo di istanza
     "eks": [{"public_endpoint_cidrs": "203.0.113.0/24,198.51.100.10/32", "node_instance_types": "m6i.xlarge",
              "admin_principals": "arn:aws:iam::123456789012:role/acme-devops,arn:aws:iam::123456789012:user/ops"}],
+    # authorizer Cognito e RDS Proxy verso un'istanza esistente
+    "backend": [{"authorizer": "cognito", "db_instance_identifier": "acme-db", "db_engine_family": "MYSQL",
+                 "cognito_user_pool_arn": "arn:aws:cognito-idp:eu-south-1:123456789012:userpool/eu-south-1_Abc123"}],
     "secrets": [{"replica_region": "eu-west-1", "_tfvars": [
         ('    description = "Credenziali del database dell\'applicazione"\n    readers     = []\n    # rotation_lambda_arn',
          '    description         = "Credenziali del database dell\'applicazione"\n'
@@ -104,9 +112,14 @@ def generate_pattern(proj: Path, cfg: dict, provider: str, pattern: str, extra: 
                               {**sample_values(provider, pattern, envs[0]), **(extra or {})}) for envs in groups]
 
 
-def make_project(base: Path) -> dict:
+def make_project(base: Path, kybes: bool = False) -> dict:
+    """Progetto con la config di riferimento; con kybes=True è la copia della fixture kybes con `kybes` in config."""
+    config = dict(REFERENCE_CONFIG)
+    if kybes:
+        shutil.copytree(KYBES_FIXTURE, base, dirs_exist_ok=True)
+        config["kybes"] = {"root": "."}
     (base / ".kynfra").mkdir(parents=True)
-    (base / ".kynfra/config.json").write_text(json.dumps(REFERENCE_CONFIG), encoding="utf-8")
+    (base / ".kynfra/config.json").write_text(json.dumps(config), encoding="utf-8")
     cfg = rules.load_config(base)
     infra = base / cfg["infra_root"]
     infra.mkdir(parents=True, exist_ok=True)
@@ -122,7 +135,7 @@ class PatternsTest(unittest.TestCase):
     def check_pattern(self, provider: str, pattern: str, extra: dict = None):
         with tempfile.TemporaryDirectory(prefix=f"kynfra-{pattern}-") as d:
             proj = Path(d)
-            cfg = make_project(proj)
+            cfg = make_project(proj, kybes=bool(generate.load_pattern(provider, pattern).get("kybes")))
             extra = dict(extra or {})
             edits = extra.pop("_tfvars", [])
             for p in with_requires(provider, pattern):

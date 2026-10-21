@@ -25,8 +25,12 @@ File generati dal comando backend in `envs/<env>/backend/` (non scritti a mano; 
 
     # jobs.auto.tfvars
     jobs = {
-      "<nome>" = { trigger = "sqs" }   # oppure "schedule"
+      "<nome>" = { trigger = "sqs" }   # oppure { trigger = "schedule", schedule = "cron(...)" }
     }
+
+    Il trigger di un job è "schedule" se `jobs/<nome>/job.yaml` ha la chiave `schedule` (`job_schedule`), altrimenti
+    "sqs". `handlers.auto.tfvars` contiene anche `public_routes = [...]`: le operazioni con `security: []` approvate in
+    `public_routes` della config (le altre restano dietro l'authorizer).
 
 `api-coverage` (block, solo con `kybes` in config e lo schema OpenAPI presente) confronta il progetto con ogni stack
 `envs/<env>/backend/` esistente: ogni operazione ha una voce in `routes` verso un handler che esiste in `services/`
@@ -222,6 +226,33 @@ def runtime_of(h: Handler) -> Tuple[Optional[str], Optional[str]]:
         if (d / f"{module}.py").is_file():
             return runtime, f"{module}.handler"
     return runtime, None
+
+
+SCHEDULE_RE = re.compile(r"(cron|rate)\([^\"\\$%{}]+\)")
+
+
+def job_schedule(root: Path, name: str) -> Optional[str]:
+    """Espressione di schedule del job da `jobs/<nome>/job.yaml` (o `.yml`), chiave `schedule` (es.
+    `cron(0 2 * * ? *)` o `rate(1 hour)`, sintassi di EventBridge Scheduler); None senza file o senza chiave (job su
+    coda SQS). KybesError se il file non è leggibile o la chiave non è un'espressione valida."""
+    for fname in ("job.yaml", "job.yml"):
+        f = Path(root) / "jobs" / name / fname
+        if not f.is_file():
+            continue
+        try:
+            doc = mini_yaml.load(f.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            raise KybesError(f"jobs/{name}/{fname}: non è testo UTF-8") from None
+        except (OSError, ValueError, RecursionError) as e:
+            raise KybesError(f"jobs/{name}/{fname}: {e}") from None
+        value = doc.get("schedule") if isinstance(doc, dict) else None
+        if value is None:
+            return None
+        if not isinstance(value, str) or not SCHEDULE_RE.fullmatch(value.strip()):
+            raise KybesError(f"jobs/{name}/{fname}: schedule deve essere 'cron(...)' o 'rate(...)' "
+                             "(sintassi di EventBridge Scheduler)")
+        return value.strip()
+    return None
 
 
 # ---------------------------------------------------------------- mappatura

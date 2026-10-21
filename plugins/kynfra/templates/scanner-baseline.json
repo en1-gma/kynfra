@@ -144,6 +144,84 @@
       "envs": "*",
       "paths": ["modules/eks/**"],
       "reason": "Policy ufficiale dell'AWS Load Balancer Controller v3.6.0, trascritta senza modifiche: le azioni Describe* di EC2 ed ELB e alcune azioni sui listener e sui security group non supportano ARN di risorsa specifici o li ricevono a runtime, quindi usano Resource = \"*\" come nel documento ufficiale. Il ruolo è assumibile solo dal service account kube-system/aws-load-balancer-controller di questo cluster."
+    },
+    {
+      "id": "CKV_AWS_338",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Log del backend (Lambda, access log ed execution log di API Gateway, WAF): 90 giorni in dev e staging per contenere i costi. In prod il modulo impone almeno 365 giorni con una validazione di log_retention_days (environment = prod) e il default di prod è 365 da env_defaults; il controllo scatta sul file del modulo, dove l'ambiente non è noto."
+    },
+    {
+      "id": "CKV_AWS_116",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Le Lambda del backend sono invocate in modo sincrono da API Gateway (e l'authorizer dal suo flusso di autorizzazione): l'errore torna al client e finisce negli access log con correlationId. La DLQ di una Lambda vale solo per le invocazioni asincrone, che il pattern non usa; i job asincroni hanno la loro coda SQS con DLQ."
+    },
+    {
+      "id": "CKV_AWS_272",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "La firma del codice (aws_signer_signing_profile e code_signing_config) richiede che la CI firmi gli zip con un profilo del team: è una scelta della pipeline, non un default del kit. Gli zip arrivano solo dal bucket degli artefatti privato, versionato e cifrato, scritto dalla CI, con source_code_hash passato a ogni build."
+    },
+    {
+      "id": "CKV_AWS_115",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Concorrenza riservata per funzione non impostata: sottrae capacità al pool dell'account (negli account nuovi il limite può essere 10 e l'apply fallirebbe) e va dimensionata sul carico reale. Il carico è limitato dal throttling dello stage (aws_api_gateway_method_settings, verificato da api-hardening) e dal rate limit del WAF; reserved_concurrent_executions si aggiunge nel modulo quando il team conosce il carico."
+    },
+    {
+      "id": "CKV_AWS_120",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Cache dello stage disattiva: le risposte del backend sono dati gestionali per utente dietro authorizer, una cache per chiave di richiesta rischierebbe di servire dati di un utente a un altro e ha un costo orario fisso. La cache si attiva per singoli metodi di sola lettura quando il team ne definisce le chiavi."
+    },
+    {
+      "id": "CKV_AWS_225",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Stessa scelta della cache dello stage: caching_enabled resta spento nelle method settings (dati per utente dietro authorizer, costo fisso); throttling, metriche e log INFO sono attivi."
+    },
+    {
+      "id": "CKV_AWS_150",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "enable_deletion_protection = var.deletion_protection sull'NLB interno dei microservizi: in prod la variabile è obbligatoriamente true (validazione del modulo, env_defaults e regola prod_toggles di kynfra); il controllo scatta sul file del modulo, dove l'ambiente non è noto."
+    },
+    {
+      "id": "CKV2_AWS_5",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Falso positivo: il security group del proxy è collegato ad aws_db_proxy tramite vpc_security_group_ids, che il controllo non riconosce come risorsa a cui collegare un security group."
+    },
+    {
+      "id": "CKV2_AWS_51",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Certificato client dello stage verso i backend non necessario: le integrazioni sono Lambda (AWS_PROXY, autenticate con IAM da API Gateway) e il VPC link verso un NLB interno raggiungibile solo tramite PrivateLink; il certificato client serve per backend HTTP pubblici."
+    },
+    {
+      "id": "CKV_AWS_18",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Bucket degli artefatti delle Lambda (scritto solo dalla CI) e degli access log dell'NLB: registrarne gli accessi richiederebbe un altro bucket di log, a sua volta senza log. Per tracciare letture e scritture si attivano i data event S3 di CloudTrail a livello di account."
+    },
+    {
+      "id": "CKV2_AWS_62",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Bucket degli artefatti e dei log dell'NLB: scritti solo dalla CI e dal servizio di log; le notifiche di eventi non hanno un destinatario e non aggiungono protezione."
+    },
+    {
+      "id": "CKV_AWS_144",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Bucket degli artefatti (ricostruibili dalla pipeline) e dei log dell'NLB, entrambi con versioning e scadenza delle versioni vecchie: la replica in un'altra regione richiede un secondo bucket e un ruolo IAM ed è una scelta del DevOps, non un default del kit."
+    },
+    {
+      "id": "CKV_AWS_145",
+      "envs": "*",
+      "paths": ["modules/backend/**"],
+      "reason": "Bucket degli access log dell'NLB con SSE-S3 (AES256), come il pattern elb: l'NLB scrive log solo per i listener TLS, quelli del VPC link sono TCP, quindi il bucket resta di norma vuoto; il bucket degli artefatti usa SSE-KMS con la chiave del backend."
     }
   ],
   "trivy": []

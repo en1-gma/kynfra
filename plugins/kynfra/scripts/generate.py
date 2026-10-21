@@ -13,8 +13,12 @@ Uso: python3 -B generate.py --pattern P [--provider aws] [--env dev,prod] [--var
 - I template usano solo segnaposto `{{ nome }}`, senza logica: un segnaposto sconosciuto è un errore.
 - Ogni file generato ha in testa `# Generato da kynfra <versione> — pattern <p>` (nessuna intestazione nei JSON).
 - Deterministico: nessuna data, iterazione ordinata, un solo a capo in fondo.
-- Non sovrascrive i file esistenti (finiscono in "skipped") salvo `--force`; con `--upgrade` non scrive nulla e
-  restituisce le differenze unificate tra i file presenti e quelli che genererebbe ora.
+- Non sovrascrive i file esistenti (finiscono in "skipped") salvo `--force` e salvo i file `regenerate` del pattern
+  (generati dal progetto, es. handlers.auto.tfvars del backend kybes: riscritti a ogni comando, in "regenerated");
+  con `--upgrade` non scrive nulla e restituisce le differenze unificate tra i file presenti e quelli che genererebbe
+  ora.
+- `kybes: {requires_with_workloads}` (pattern backend): i valori degli stack vengono dal progetto kybes
+  (`kybes_values`); con microservizi o job i requires si estendono a quei pattern.
 Solo libreria standard.
 """
 from __future__ import annotations
@@ -23,6 +27,7 @@ import argparse
 import difflib
 import json
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -89,7 +94,8 @@ def load_pattern(provider: str, pattern: str) -> dict:
         raise GenerateError(f"pattern '{pattern}' sconosciuto per {provider} (disponibili: {', '.join(names)})")
     raw = data[pattern]
     entry = {"description": "", "requires": [], "inputs": {}, "env_defaults": {}, "stacks": [], "shared": False,
-             "shared_stacks": [], "single_env": False, "dir": None, "next_steps": [], **raw}
+             "shared_stacks": [], "single_env": False, "dir": None, "next_steps": [], "kybes": None,
+             "regenerate": [], **raw}
     for name, spec in entry["inputs"].items():
         if spec.get("type", "string") not in INPUT_TYPES:
             raise GenerateError(f"input '{name}' del pattern '{pattern}': tipo non supportato")
@@ -246,6 +252,145 @@ def _inputs(entry: dict, values: Dict[str, str], env: Optional[str], base: Dict[
     return out
 
 
+# ---------------------------------------------------------------- progetto kybes (pattern backend)
+
+HANDLER_KEY_RE = re.compile(r"[a-z0-9][a-z0-9-]*/(functions|ms)/[a-z0-9][a-z0-9-]*")
+JOB_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+ROUTE_PATH_RE = re.compile(r"/[A-Za-z0-9._~{}/+-]*")
+WELL_KNOWN = "/.well-known/openid-configuration"
+
+
+def _hcl(value: Optional[str]) -> str:
+    """Stringa HCL letterale (o null) per i tfvars generati: niente interpolazioni né segnaposto."""
+    if value is None:
+        return "null"
+    if any(t in value for t in ("${", "%{", "{{", "}}")) or any(ord(c) < 32 for c in value):
+        raise GenerateError(f"valore non ammesso nei tfvars generati: {value!r}")
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _hcl_map(name: str, entries: List[Tuple[str, str]]) -> str:
+    """`name = { "chiave" = valore … }` con gli `=` allineati come `terraform fmt`."""
+    if not entries:
+        return f"{name} = {{}}"
+    width = max(len(_hcl(k)) for k, _ in entries)
+    body = "\n".join(f"  {_hcl(k).ljust(width)} = {v}" for k, v in entries)
+    return f"{name} = {{\n{body}\n}}"
+
+
+def _oidc_issuer(openapi: Path) -> str:
+    """Issuer dagli schemi openIdConnect dello schema OpenAPI (openIdConnectUrl senza /.well-known/…); "" se assente
+    o se gli schemi indicano issuer diversi."""
+    import mini_yaml
+    try:
+        doc = mini_yaml.load(openapi.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    schemes = ((doc.get("components") or {}).get("securitySchemes") or {}) if isinstance(doc, dict) else {}
+    found = set()
+    for sc in schemes.values() if isinstance(schemes, dict) else []:
+        url = sc.get("openIdConnectUrl") if isinstance(sc, dict) and sc.get("type") == "openIdConnect" else None
+        if isinstance(url, str) and url.startswith("https://"):
+            found.add(url[:-len(WELL_KNOWN)] if url.endswith(WELL_KNOWN) else url.rstrip("/"))
+    return found.pop() if len(found) == 1 else ""
+
+
+def kybes_values(proj: Path, cfg: dict) -> Dict[str, str]:
+    """Valori del contesto ricavati dal progetto kybes (spec 6.2) per il pattern backend: il contenuto di
+    `handlers.auto.tfvars` (`kybes_handlers`: handlers, routes, public_routes) e di `jobs.auto.tfvars`
+    (`kybes_jobs`), la radice kybes relativa allo stack (`kybes_root`), lo schema (`kybes_openapi`), `kybes_has_db`,
+    più i dati per requires e passi successivi (`kybes_has_workloads`, `kybes_repositories`, `kybes_oidc_issuer`,
+    `kybes_unapproved_public`, `kybes_no_runtime`, separati da virgola). Operazioni ambigue o handler inesistenti
+    sono un errore: kynfra non inventa mai un handler."""
+    import kybes
+    import rules_aws
+    conf = cfg.get("kybes")
+    if not conf:
+        raise GenerateError(f"il pattern backend legge un progetto kybes, ma {rules.CONFIG_REL} non ha la sezione "
+                            "kybes: l'utente la aggiunge ({\"kybes\": {\"root\": \".\"}}) o reinstalla kynfra nel "
+                            "repository kybes")
+    conf = conf if isinstance(conf, dict) else {}
+    root_rel = rules._normalize_infra_root(conf.get("root"))
+    openapi = rules._normalize_infra_root(conf.get("openapi") or "schemas/openapi.yaml")
+    if openapi == ".":
+        openapi = "schemas/openapi.yaml"
+    kroot = proj / root_rel
+    try:
+        p = kybes.read_project(kroot, openapi)
+        schedules = {j: kybes.job_schedule(kroot, j) for j in p.jobs}
+    except kybes.KybesError as e:
+        raise GenerateError(f"progetto kybes non leggibile ({posixpath.join(root_rel, openapi)}): {e}")
+    mapping, unresolved = kybes.resolve_mapping(p)
+    if unresolved:
+        raise GenerateError("operazioni senza handler deducibile (contesto con più handler o fuori dalla convenzione "
+                            "/v1/<contesto>/...): " + ", ".join(op.route for op in unresolved) + ". Chiedi all'utente "
+                            "l'handler di ognuna e aggiungi x-kybes-handler: <contesto>/functions/<nome> (o /ms/<nome>) "
+                            "all'operazione in " + openapi)
+    missing = sorted(f"{r} -> {h}" for r, h in mapping.items() if h not in p.handlers)
+    if missing:
+        raise GenerateError("operazioni mappate su handler che non esistono in services/: " + ", ".join(missing))
+    for key in p.handlers:
+        if not HANDLER_KEY_RE.fullmatch(key):
+            raise GenerateError(f"handler '{key}': contesti e nomi in services/ devono essere in kebab-case minuscolo")
+    for job in p.jobs:
+        if not JOB_RE.fullmatch(job):
+            raise GenerateError(f"job '{job}': i nomi in jobs/ devono essere in kebab-case minuscolo")
+    for op in p.operations:
+        if not ROUTE_PATH_RE.fullmatch(op.path):
+            raise GenerateError(f"percorso OpenAPI non supportato: '{op.path}'")
+    pub = rules_aws._public_routes(cfg)
+    public = [op.route for op in p.operations if op.public]
+    approved = [op.route for op in p.operations
+                if op.public and ((op.method, op.path) in pub or ("ANY", op.path) in pub)]
+    handlers = []
+    for key, h in sorted(p.handlers.items()):
+        runtime, handler = (h.runtime, h.handler) if h.kind == "function" else (None, None)
+        handlers.append((key, f"{{ kind = {_hcl(h.kind)}, runtime = {_hcl(runtime)}, handler = {_hcl(handler)} }}"))
+    routes = [(op.route, _hcl(mapping[op.route])) for op in p.operations]
+    pub_list = ", ".join(_hcl(r) for r in approved)
+    handlers_tfvars = "\n\n".join([_hcl_map("handlers", handlers), _hcl_map("routes", routes),
+                                    f"public_routes = [{pub_list}]"])
+    jobs = [(j, f"{{ trigger = \"schedule\", schedule = {_hcl(sched)} }}" if sched else '{ trigger = "sqs" }')
+            for j, sched in sorted(schedules.items())]
+    stack_dir = posixpath.join(proj.as_posix(), _infra_prefix(cfg), "envs", "env", "backend")
+    ms = [h for h in sorted(p.handlers) if p.handlers[h].kind == "ms"]
+    return {
+        "kybes_handlers": handlers_tfvars,
+        "kybes_jobs": _hcl_map("jobs", jobs),
+        "kybes_root": posixpath.relpath(posixpath.normpath(posixpath.join(proj.as_posix(), root_rel)), stack_dir),
+        "kybes_openapi": _check_value("kybes.openapi", openapi),
+        "kybes_has_db": "true" if p.has_db else "false",
+        "kybes_has_workloads": "true" if (ms or p.jobs) else "false",
+        "kybes_repositories": ",".join([m.replace("/ms/", "-") for m in ms] + sorted(p.jobs)),
+        "kybes_oidc_issuer": _oidc_issuer(kroot / openapi),
+        "kybes_unapproved_public": ",".join(r for r in public if r not in approved),
+        "kybes_no_runtime": ",".join(k for k, h in sorted(p.handlers.items())
+                                     if h.kind == "function" and not (h.runtime and h.handler)),
+    }
+
+
+def _kybes_steps(kv: Dict[str, str], values: Dict[str, str]) -> List[str]:
+    """Passi per il DevOps che dipendono dal progetto kybes."""
+    steps: List[str] = []
+    if kv["kybes_no_runtime"]:
+        steps.append("Function senza runtime o handler deducibile dal manifest (package.json engines.node e main, "
+                     "pyproject.toml requires-python e handler.py/app.py): " + kv["kybes_no_runtime"].replace(",", ", ")
+                     + "; completa il manifest e rigenera, altrimenti il plan fallisce")
+    if kv["kybes_unapproved_public"]:
+        steps.append("Operazioni con security: [] che restano dietro l'authorizer perché non sono in public_routes di "
+                     ".kynfra/config.json: " + kv["kybes_unapproved_public"].replace(",", ", ") + "; se sono davvero "
+                     "pubbliche l'utente le aggiunge a public_routes e si rigenera")
+    if kv["kybes_has_workloads"] == "true":
+        steps.append("Microservizi e job girano su EKS: servono lo stack kubernetes (con kubernetes-addons) dello stesso "
+                     "ambiente e i repository ECR nello stack envs/shared/ecr: repositories="
+                     + kv["kybes_repositories"])
+    if kv["kybes_has_db"] == "true" and not values.get("db_instance_identifier"):
+        steps.append("Il progetto ha schemas/db: indica db_instance_identifier (istanza RDS esistente con "
+                     "manage_master_user_password = true) con --var o nei terraform.tfvars dello stack, poi ammetti "
+                     "nel security group del database la sua porta dal security group db_proxy_security_group_id")
+    return steps
+
+
 # ---------------------------------------------------------------- piano dei file
 
 def _infra_prefix(cfg: dict) -> str:
@@ -263,7 +408,7 @@ def _default_account(cfg: dict, envs: List[str], values: Dict[str, str]) -> str:
 
 
 def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
-          values: Dict[str, str]) -> List[Tuple[str, str]]:
+          values: Dict[str, str], extra: Optional[Dict[str, str]] = None) -> List[Tuple[str, str]]:
     """[(percorso relativo al progetto, contenuto)] dei file del pattern."""
     base = _base_context(cfg, pattern, provider)
     version = base["kynfra_version"]
@@ -292,7 +437,7 @@ def _plan(cfg: dict, provider: str, pattern: str, entry: dict, envs: List[str],
         for env in targets:
             account = _default_account(cfg, envs, values) if env == "shared" else _env_account(cfg, env)
             env_ctx = _merge(base, _inputs(entry, values, env, base, pattern), _account_context(cfg, base, account),
-                             {"environment": env})
+                             {"environment": env}, extra or {})
             for stack in stacks:
                 ctx = _merge(env_ctx, {"stack": stack, "state_key": f"{base['project']}/{env}/{stack}.tfstate"})
                 add(tpl / "stacks" / stack, f"envs/{env}/{stack}", ctx)
@@ -358,7 +503,8 @@ def generate(proj: Path, cfg: dict, provider: str, pattern: str, envs: List[str]
              force: bool = False, upgrade: bool = False) -> dict:
     """Genera il pattern nel progetto (vedi docstring del modulo).
 
-    Ritorna {created, skipped, diffs, missing_requires, next_steps}."""
+    Ritorna {created, regenerated, skipped, diffs, missing_requires, next_steps}: `regenerated` sono i file in
+    `regenerate` del pattern (generati dal progetto, es. handlers.auto.tfvars) riscritti anche senza --force."""
     if provider not in (cfg.get("providers") or []):
         raise GenerateError(f"provider '{provider}' non in config (providers: {', '.join(cfg.get('providers') or [])})")
     entry = load_pattern(provider, pattern)
@@ -373,8 +519,15 @@ def generate(proj: Path, cfg: dict, provider: str, pattern: str, envs: List[str]
     if unknown:
         raise GenerateError(f"variabili sconosciute per il pattern '{pattern}': {', '.join(unknown)} "
                             f"(ammesse: {', '.join(sorted(allowed)) or 'nessuna'})")
-    files = _plan(cfg, provider, pattern, entry, envs, values)
+    kv: Dict[str, str] = {}
+    if entry.get("kybes"):
+        kv = kybes_values(proj, cfg)
+        if "oidc_issuer" in entry["inputs"] and not values.get("oidc_issuer") and kv["kybes_oidc_issuer"]:
+            values["oidc_issuer"] = kv["kybes_oidc_issuer"]
+    files = _plan(cfg, provider, pattern, entry, envs, values, kv)
+    regenerate = set(entry.get("regenerate") or [])
     created: List[str] = []
+    regenerated: List[str] = []
     skipped: List[str] = []
     diffs: Dict[str, str] = {}
     for rel, content in files:
@@ -387,24 +540,35 @@ def generate(proj: Path, cfg: dict, provider: str, pattern: str, envs: List[str]
                     fromfile=f"a/{rel}" if current is not None else "/dev/null", tofile=f"b/{rel}"))
             continue
         if dest.exists() and not force:
-            skipped.append(rel)
-            continue
+            # file generati dal progetto (es. handlers.auto.tfvars): si rigenerano sempre, non si modificano a mano
+            if posixpath.basename(rel) not in regenerate:
+                skipped.append(rel)
+                continue
+            if current == content:
+                continue
+            regenerated.append(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".kynfra-tmp")
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, dest)
-        created.append(rel)
-    missing = [r for r in entry["requires"] if not _present(proj, cfg, provider, r, envs)]
+        if current is None or force or posixpath.basename(rel) not in regenerate:
+            created.append(rel)
+    requires = list(entry["requires"])
+    if kv.get("kybes_has_workloads") == "true":
+        requires += [r for r in (entry["kybes"] or {}).get("requires_with_workloads", []) if r not in requires]
+    missing = [r for r in requires if not _present(proj, cfg, provider, r, envs)]
     summary = _merge(_base_context(cfg, pattern, provider), {"envs": ",".join(envs)})
     try:
         summary = _merge(summary, _account_context(cfg, summary, _default_account(cfg, envs, values)))
     except GenerateError:
         pass
     next_steps = [render(s, summary) for s in entry.get("next_steps") or []]
+    if kv:
+        next_steps = _kybes_steps(kv, values) + next_steps
     if missing:
         next_steps.insert(0, "Genera prima i pattern richiesti: " + ", ".join(missing))
-    return {"created": sorted(created), "skipped": sorted(skipped), "diffs": dict(sorted(diffs.items())),
-            "missing_requires": missing, "next_steps": next_steps}
+    return {"created": sorted(created), "regenerated": sorted(regenerated), "skipped": sorted(skipped),
+            "diffs": dict(sorted(diffs.items())), "missing_requires": missing, "next_steps": next_steps}
 
 
 # ---------------------------------------------------------------- CLI
@@ -429,7 +593,8 @@ def _print_human(res: dict, upgrade: bool) -> None:
             print(f"--- differenze in {rel}")
             print(diff, end="" if diff.endswith("\n") else "\n")
         print("kynfra: --upgrade non ha scritto nulla; applica le modifiche che vuoi con gli strumenti di modifica")
-    for title, key in (("File creati", "created"), ("File esistenti non sovrascritti (usa --force)", "skipped")):
+    for title, key in (("File creati", "created"), ("File rigenerati dal progetto", "regenerated"),
+                       ("File esistenti non sovrascritti (usa --force)", "skipped")):
         if res[key]:
             print(f"{title} ({len(res[key])}):")
             print("\n".join(f"- {r}" for r in res[key]))

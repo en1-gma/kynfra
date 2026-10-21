@@ -117,6 +117,113 @@
       "Deploy del frontend: carica la build nel bucket bucket_name con Cache-Control \"public, max-age=31536000, immutable\" sugli asset con hash e \"no-cache\" su index.html, poi invalida /index.html sulla distribuzione distribution_id; il ruolo di deploy ha bisogno solo di s3:PutObject/s3:DeleteObject/s3:ListBucket sul bucket e cloudfront:CreateInvalidation sulla distribuzione"
     ]
   },
+  "backend": {
+    "description": "Infrastruttura completa del backend kybes letta dal progetto (schemas/openapi.yaml, services/<contesto>/functions|ms/<nome>, jobs/<nome>, schemas/db): API Gateway REST con body dallo schema OpenAPI (yamldecode(file(...))) arricchito con integrazione e validatore per operazione, authorizer TOKEN su Lambda che valida il JWT OIDC (o Cognito user pool), stage v1 con X-Ray, throttling, metriche, log INFO e access log JSON con correlationId, WAF regionale (obbligatorio in prod); una Lambda per function (timeout 10 s, ruolo dedicato, X-Ray, log group cifrato con retention, alias live, zip dal bucket di artefatti privato e versionato, nessun segreto nelle variabili d'ambiente); VPC link verso un NLB interno con un target group IP per microservizio su EKS; per ogni job coda SQS cifrata con DLQ (maxReceiveCount 5), schedule di EventBridge Scheduler per i job a calendario e ruolo Pod Identity; con schemas/db RDS Proxy con TLS e autenticazione IAM, segreto gestito da RDS e security group dal solo backend. handlers.auto.tfvars e jobs.auto.tfvars si rigenerano a ogni comando (regola api-coverage).",
+    "requires": [
+      "network",
+      "secrets"
+    ],
+    "kybes": {
+      "requires_with_workloads": [
+        "ecr",
+        "eks"
+      ]
+    },
+    "regenerate": [
+      "handlers.auto.tfvars",
+      "jobs.auto.tfvars"
+    ],
+    "inputs": {
+      "authorizer": {
+        "type": "string",
+        "default": "lambda",
+        "help": "Authorizer delle operazioni non pubbliche: lambda (authorizer TOKEN su una Lambda che valida il JWT OIDC; codice nel pacchetto authorizer/authorizer.zip del bucket degli artefatti) oppure cognito (user pool Cognito). API Gateway REST non ha un authorizer JWT nativo"
+      },
+      "cognito_user_pool_arn": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "Con authorizer=cognito: ARN della user pool (arn:aws:cognito-idp:<regione>:<account>:userpool/<id>)"
+      },
+      "oidc_issuer": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "Con authorizer=lambda: issuer OIDC (claim iss); vuoto = dedotto da openIdConnectUrl dello schema OpenAPI"
+      },
+      "oidc_audience": {
+        "type": "string",
+        "required": true,
+        "example": "acme-api",
+        "help": "Audience attesa nei token (claim aud), es. il client id dell'applicazione presso l'identity provider; con authorizer=cognito non si usa (la user pool verifica i propri client)"
+      },
+      "log_retention_days": {
+        "type": "number",
+        "default": 90,
+        "help": "Retention in giorni dei log di Lambda, API Gateway e WAF (almeno 365 in prod)"
+      },
+      "throttling_rate_limit": {
+        "type": "number",
+        "default": 100,
+        "help": "Richieste al secondo ammesse in media sullo stage"
+      },
+      "throttling_burst_limit": {
+        "type": "number",
+        "default": 200,
+        "help": "Picco di richieste ammesso sullo stage"
+      },
+      "waf_enabled": {
+        "type": "bool",
+        "default": false,
+        "help": "WAF regionale con managed rule set e rate limit sullo stage (sempre attivo in prod)"
+      },
+      "deletion_protection": {
+        "type": "bool",
+        "default": false,
+        "help": "Deletion protection dell'NLB interno dei microservizi (sempre attiva in prod)"
+      },
+      "manage_api_gateway_account": {
+        "type": "bool",
+        "default": false,
+        "help": "true: questo stack imposta il ruolo CloudWatch di API Gateway dell'account e della regione (impostazione unica: attivala in un solo stack per account e regione, o impostala una volta a mano); senza il ruolo access log ed execution log non si scrivono"
+      },
+      "kubernetes_namespace": {
+        "type": "string",
+        "default": "default",
+        "help": "Namespace Kubernetes dei service account di microservizi e job (Pod Identity)"
+      },
+      "db_instance_identifier": {
+        "type": "string",
+        "required": false,
+        "default": "",
+        "help": "Con schemas/db: istanza RDS esistente (manage_master_user_password = true) dietro RDS Proxy; il database stesso è fuori dalla v1"
+      },
+      "db_engine_family": {
+        "type": "string",
+        "default": "POSTGRESQL",
+        "help": "Motore del database per RDS Proxy: POSTGRESQL, MYSQL o SQLSERVER"
+      }
+    },
+    "env_defaults": {
+      "prod": {
+        "log_retention_days": 365,
+        "waf_enabled": true,
+        "deletion_protection": true
+      }
+    },
+    "stacks": [
+      "backend"
+    ],
+    "shared": false,
+    "next_steps": [
+      "Prima gli stack network e secrets dello stesso ambiente (chiavi {{ project }}/<env>/network.tfstate e secrets.tfstate) e, con microservizi o job, kubernetes, kubernetes-addons e envs/shared/ecr; poi il DevOps, con le credenziali dell'account {{ account_id }}, per ogni ambiente: cd {{ infra_root }}/envs/<env>/backend && {{ iac_cli }} init && {{ iac_cli }} plan -out=backend.tfplan && {{ iac_cli }} apply backend.tfplan",
+      "La CI carica gli zip delle Lambda nel bucket artifacts_bucket (chiavi <contesto>/<nome>.zip e authorizer/authorizer.zip, o artifact_keys) con kms:GenerateDataKey sulla chiave kms_key_arn e passa a ogni build artifact_sha256s (SHA-256 in base64 di ogni zip) con -var o con un suo file *.auto.tfvars: gli zip devono esistere prima del primo apply",
+      "Ruolo CloudWatch di API Gateway: impostazione unica per account e regione; senza, access log ed execution log non si scrivono. Attiva manage_api_gateway_account = true in un solo stack backend dell'account (es. prod)",
+      "Dopo ogni modifica di services/, jobs/ o di x-kybes-handler nello schema rigenera con /kynfra:create-backend-infra-aws (handlers.auto.tfvars e jobs.auto.tfvars si riscrivono): la regola api-coverage blocca finché schema e infrastruttura divergono",
+      "Microservizi: registra i pod nel target group ms_target_group_arns con un TargetGroupBinding dell'AWS Load Balancer Controller (targetType ip, porta 8080) e usa i service account di service_accounts nel namespace indicato; i job leggono la propria coda (queue_urls) con il ruolo Pod Identity e KEDA scala con il ruolo dell'operatore (identityOwner: operator)",
+      "Con api_origin=backend lo stack spa dello stesso ambiente legge api_domain_name e api_origin_path (chiave {{ project }}/<env>/backend.tfstate)"
+    ]
+  },
   "elb": {
     "description": "Load balancer davanti ai workload: ALB (o NLB su richiesta) nelle subnet dello stack network, listener 443 con policy ELBSecurityPolicy-TLS13-1-2-2021-06 e certificato ACM regionale con validazione DNS, redirect 80 -> 443 (ALB), drop_invalid_header_fields e desync mitigation strictest, record Route53 alias, access log su un bucket dedicato con policy per il servizio ELB della regione, WAF regionale (obbligatorio in prod per l'ALB), deletion protection in prod, target group IP con health check, security group con 443/80 dal mondo o solo 443 dalla prefix list di CloudFront ed egress solo verso la VPC.",
     "requires": [

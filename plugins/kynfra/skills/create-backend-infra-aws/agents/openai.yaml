@@ -1,0 +1,7 @@
+interface:
+  display_name: "kynfra Backend (AWS)"
+  short_description: "Generate the complete AWS backend of a kybes project with kynfra"
+  brand_color: "#F97316"
+  default_prompt: "Use $create-backend-infra-aws to generate the backend stack from the kybes project (API Gateway REST from openapi.yaml, one Lambda per function, VPC link to the microservices on EKS, SQS queues and Pod Identity roles for jobs, RDS Proxy)."
+policy:
+  allow_implicit_invocation: false
