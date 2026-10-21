@@ -99,7 +99,7 @@ Il codice si scrive con gli strumenti di modifica dei file, non da shell, così 
 
 Comportamento:
 
-- **Strumento mancante**: in locale è un **avviso** con il comando per installarlo (`/kynfra:tools`), non un blocco (le regole interne bloccano comunque); in CI (`--strict`) è un errore.
+- **Strumento mancante**: in locale è un **avviso** con il comando per installarlo (`/kynfra:kynfra-tools`), non un blocco (le regole interne bloccano comunque); in CI (`--strict`) è un errore.
 - **Anti-loop**: blocca fino a `max_blocks` volte di fila nella stessa catena di stop, poi lascia chiudere con l'avviso esplicito "NON è conforme". `stop_hook_active` non sblocca il gate: serve solo a capire se la catena è nuova.
 - **`only_if_changes`**: "ci sono modifiche" non è solo `git status`; conta anche `HEAD` diverso da quello di inizio sessione e i commit non ancora pubblicati, quindi **un commit non spegne il gate**.
 - **Monorepo**: se il cwd non è un progetto kynfra, controlla i progetti kynfra sotto il cwd.

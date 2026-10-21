@@ -29,7 +29,7 @@ Genera il modulo `modules/network` e lo stack `envs/<env>/network` per ogni ambi
 
    I default di prod (3 zone, NAT per zona, retention 365) prevalgono sui default generali ma non su `--var`; in prod la retention dei flow log non può scendere sotto 365 giorni (validazione del modulo). Il generatore non sovrascrive file esistenti salvo `--force`, che chiede l'utente. Per vedere le differenze con una versione più recente del kit: `--upgrade`.
 4. **Personalizzazioni** (altri endpoint, CIDR per ambiente diversi nei `tfvars`) solo con gli strumenti di modifica dei file, mai con redirect o `sed -i` da shell: ogni scrittura passa dalle regole. Mantieni letterali gli attributi di sicurezza, `enable_key_rotation = true`, la retention dei log e il security group di default senza regole.
-5. **Controlla**: `python3 -B <kit>/scripts/arch_check.py . --external` e correggi la causa di ogni finding (mai soppressioni inline). Se mancano strumenti esterni proponi `/kynfra:tools`.
+5. **Controlla**: `python3 -B <kit>/scripts/arch_check.py . --external` e correggi la causa di ogni finding (mai soppressioni inline). Se mancano strumenti esterni proponi `/kynfra:kynfra-tools`.
 6. **Riepiloga** in poche righe:
    - file creati (modulo e stack per ambiente) e output di ogni stack: `vpc_id`, `public_subnet_ids`, `private_subnet_ids`, `isolated_subnet_ids`, `vpc_endpoint_sg_id`;
    - costi fissi: NAT gateway (uno per zona in prod) ed endpoint VPC interface (cinque per ogni zona);

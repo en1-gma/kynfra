@@ -137,7 +137,7 @@ Lo stop gate non ti lascia chiudere finché non passano; eseguili tu prima:
 4. `tflint --recursive` con il ruleset AWS;
 5. lo scanner configurato (`checkov` o `trivy config`).
 
-Se uno strumento esterno non è installato, segnalalo all'utente e proponi `/kynfra:tools`: non bloccare su di esso, ma le regole interne bloccano comunque. In CI tutti gli strumenti sono obbligatori.
+Se uno strumento esterno non è installato, segnalalo all'utente e proponi `/kynfra:kynfra-tools`: non bloccare su di esso, ma le regole interne bloccano comunque. In CI tutti gli strumenti sono obbligatori.
 
 ## 9. Checklist di consegna
 

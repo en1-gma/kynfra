@@ -18,7 +18,7 @@ python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py verify
 | `install <tool> --approved-by "<utente>"` | scarica, verifica, installa e registra **un** strumento. `--approved-by` è obbligatorio (utente git che approva) |
 | `verify` | controlla che i binari installati corrispondano al registro (checksum del binario e versione) |
 
-Gli strumenti sono `terraform`, `opentofu` (alias `tofu`), `tflint`, `tflint-ruleset-aws`, `trivy` e `checkov`. `status` considera richiesti lo strumento IaC e lo scanner scelti in config, TFLint e il suo ruleset. Dentro l'agente si usa la skill `kynfra-tools` (`/kynfra:tools`): mostra lo stato, propone **un** strumento, attende il sì dell'utente per quello strumento, lo installa, poi passa al successivo. Non esistono approvazioni cumulative né "sì a tutto": una risposta vale per uno strumento e una versione. `tools.py install` passa dalla richiesta di permesso del comando shell, quindi l'utente lo autorizza ogni volta.
+Gli strumenti sono `terraform`, `opentofu` (alias `tofu`), `tflint`, `tflint-ruleset-aws`, `trivy` e `checkov`. `status` considera richiesti lo strumento IaC e lo scanner scelti in config, TFLint e il suo ruleset. Dentro l'agente si usa la skill `kynfra-tools` (`/kynfra:kynfra-tools`): mostra lo stato, propone **un** strumento, attende il sì dell'utente per quello strumento, lo installa, poi passa al successivo. Non esistono approvazioni cumulative né "sì a tutto": una risposta vale per uno strumento e una versione. `tools.py install` passa dalla richiesta di permesso del comando shell, quindi l'utente lo autorizza ogni volta.
 
 ```mermaid
 sequenceDiagram

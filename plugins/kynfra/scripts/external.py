@@ -137,7 +137,7 @@ def checkov_errors(out: str, rc: int, root: Path, baseline: List[dict]) -> List[
 
 
 def _install_hint(tool: str) -> str:
-    return f"installa con /kynfra:tools (tools.py install {tool})"
+    return f"installa con /kynfra:kynfra-tools (tools.py install {tool})"
 
 
 def run_external(steps: List[Step], strict: bool, proj: Path,

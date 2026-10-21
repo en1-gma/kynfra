@@ -15,7 +15,7 @@ Regole operative:
 4. Differenze tra ambienti solo nei `tfvars`; nomi `<progetto>-<env>`; `account_id` e regione da variabili; moduli solo con risorse native del provider.
 5. Segreti: solo contenitori (`aws_secretsmanager_secret`); mai valori nei file, mai lettura di segreti. Variabili riservate `sensitive = true` senza default.
 6. Se non sei certo di un argomento del provider, consulta Context7 o il registry Terraform per la versione bloccata.
-7. Prima di chiudere esegui `python3 -B tools/kynfra/plugins/kynfra/scripts/arch_check.py . --strict --external`, `fmt -check`, `init -backend=false` + `validate`, `tflint`, lo scanner. Se uno strumento esterno manca, segnalalo all'utente (`/kynfra:tools`): non installarlo tu.
+7. Prima di chiudere esegui `python3 -B tools/kynfra/plugins/kynfra/scripts/arch_check.py . --strict --external`, `fmt -check`, `init -backend=false` + `validate`, `tflint`, lo scanner. Se uno strumento esterno manca, segnalalo all'utente (`/kynfra:kynfra-tools`): non installarlo tu.
 
 Non eseguire mai `apply`, `destroy`, `import`, `taint`, `plan`, `state` mutante, `init` senza `-backend=false`, né CLI cloud mutanti: li fa il DevOps.
 

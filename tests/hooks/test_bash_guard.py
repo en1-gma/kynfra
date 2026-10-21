@@ -350,12 +350,12 @@ class HookOutputTests(unittest.TestCase):
         self.assertTrue(text.startswith("Comando rifiutato"), text)
         self.assertIn("terraform apply", text)
         self.assertIn("kynfra-architecture", text.splitlines()[-1])
-        self.assertNotIn("/kynfra:tools", text)
+        self.assertNotIn("/kynfra:kynfra-tools", text)
         self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
 
     def test_tool_reason_points_to_tools_command(self):
         text = reason(bash(self.proj, "brew install terraform"))
-        self.assertIn("/kynfra:tools", text.splitlines()[-1])
+        self.assertIn("/kynfra:kynfra-tools", text.splitlines()[-1])
         self.assertTrue(any("kynfra-architecture" in ln for ln in text.splitlines()))
 
     def test_allowed_is_silent(self):
@@ -725,7 +725,7 @@ class FixRound3Tests(GuardCase):
         for cmd in ("pnpm dlx x", "yarn dlx x", "gem exec x", "pnpm -s dlx x"):
             with self.subTest(cmd=cmd):
                 reasons = self.check(cmd)
-                self.assertTrue(any("/kynfra:tools" in r for r in reasons), reasons)
+                self.assertTrue(any("/kynfra:kynfra-tools" in r for r in reasons), reasons)
 
 
 if __name__ == "__main__":

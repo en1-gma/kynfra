@@ -18,8 +18,8 @@ jobs:
         # 3.10 è la versione minima supportata dagli script (solo libreria standard), 3.12 quella di riferimento
         python: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Hook, regole, generatore, installer, documentazione (Claude Code e Codex)
@@ -36,12 +36,12 @@ jobs:
     env:
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache dei provider Terraform
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .tf-plugin-cache
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('plugins/kynfra/templates/versions.json') }}-${{ matrix.pattern }}

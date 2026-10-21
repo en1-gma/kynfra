@@ -1,6 +1,6 @@
 ---
 name: kynfra-tools
-description: Check and install the external tools kynfra needs (Terraform or OpenTofu, TFLint, TFLint AWS ruleset, Checkov or Trivy), one tool at a time and only with the user's explicit approval for that tool, recorded in .kynfra/tools.lock.json. Use when a tool is missing, when status reports a wrong version, or when the user runs /kynfra:tools.
+description: Check and install the external tools kynfra needs (Terraform or OpenTofu, TFLint, TFLint AWS ruleset, Checkov or Trivy), one tool at a time and only with the user's explicit approval for that tool, recorded in .kynfra/tools.lock.json. Use when a tool is missing, when status reports a wrong version, or when the user runs /kynfra:kynfra-tools.
 ---
 
 # Strumenti esterni di kynfra

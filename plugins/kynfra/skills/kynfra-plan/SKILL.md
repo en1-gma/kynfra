@@ -18,5 +18,5 @@ Stai agendo da architetto dell'infrastruttura. In questo passo non scrivi codice
    5. comandi che il DevOps dovrà eseguire (`init`, `plan`, `apply`) e passaggi manuali (delega NS, valori dei segreti);
    6. violazioni richieste e alternative conformi;
    7. task piccoli e indipendenti, ciascuno con i file.
-5. Non pianificare mai `apply`, `plan`, `import` o `state`: li esegue il DevOps. Se servono strumenti esterni mancanti, aggiungi un task "installare con `/kynfra:tools`".
+5. Non pianificare mai `apply`, `plan`, `import` o `state`: li esegue il DevOps. Se servono strumenti esterni mancanti, aggiungi un task "installare con `/kynfra:kynfra-tools`".
 6. In Codex esegui ogni task con l'agente `kynfra_implementer` se disponibile, altrimenti implementalo tu seguendo `kynfra-architecture`; chiudi con `$kynfra-review`.

@@ -31,7 +31,7 @@ Finché `.kynfra/config.json` non esiste, ogni hook di kynfra è un no-op in que
    - `.github/workflows/kynfra-check.yml` (senza accesso al cloud);
    - `.gitignore` aggiornato per `.kynfra/bin/`, `.kynfra/venv/`, `.kynfra/tflint.d/`, `**/.terraform/`.
 5. Ricorda le cose da completare a mano: `accounts.main.id` se è rimasto il segnaposto `000000000000`, i tag `Owner` e `CostCenter` in `tags`.
-6. Controlla gli strumenti esterni con `python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py status` e, se ne mancano, proponi la skill `kynfra-tools` (`/kynfra:tools`): si installano uno strumento alla volta, con l'approvazione dell'utente per ciascuno.
+6. Controlla gli strumenti esterni con `python3 -B tools/kynfra/plugins/kynfra/scripts/tools.py status` e, se ne mancano, proponi la skill `kynfra-tools` (`/kynfra:kynfra-tools`): si installano uno strumento alla volta, con l'approvazione dell'utente per ciascuno.
 7. Suggerisci il passo successivo: descrivere cosa ospitare e pianificarlo con l'agente `kynfra:architect` (Claude Code) o `$kynfra-plan` (Codex), poi `/kynfra:create-<pattern>-infra-aws`.
 
 Non modificare `.kynfra/config.json` dopo l'installazione: è protetto e lo cambia solo l'utente. Lo stesso vale per `tools/kynfra/`, `.terraform.lock.hcl`, le impostazioni e gli hook dell'agente, le regole, le skill, gli agenti e il workflow CI di kynfra; gli hook rifiutano anche `install.sh --force` e `--uninstall` dalla shell dell'agente, quindi chiedi all'utente di eseguirli.

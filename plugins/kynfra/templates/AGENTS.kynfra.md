@@ -12,7 +12,7 @@ Questo progetto genera Terraform per AWS con le regole di kynfra (IaC: __IAC__, 
 - **Mai eseguire** `apply`, `destroy`, `import`, `taint`, `plan`, `force-unlock`, `init` senza `-backend=false`, né CLI cloud mutanti: lo fa il DevOps.
 
 Modo di lavorare:
-- Comandi: `/kynfra:create-<pattern>-infra-aws` con pattern `network`, `spa`, `backend`, `elb`, `eks`, `ecr`, `secrets`; `/kynfra:tools` per gli strumenti esterni.
+- Comandi: `/kynfra:create-<pattern>-infra-aws` con pattern `network`, `spa`, `backend`, `elb`, `eks`, `ecr`, `secrets`; `/kynfra:kynfra-tools` per gli strumenti esterni.
 - Pianifica con l'agente **kynfra:architect** (Claude Code) o la skill **$kynfra-plan** (Codex), non con il planner integrato.
 - Implementa un task alla volta con **kynfra:implementer** / l'agente Codex `kynfra_implementer`.
 - Fai verificare con **kynfra:reviewer** / **$kynfra-review**.

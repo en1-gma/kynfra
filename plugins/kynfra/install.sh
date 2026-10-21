@@ -326,4 +326,4 @@ if [ "$CI" = github ]; then
 fi
 
 ok "kynfra installato. Controllo completo: python3 -B $KIT_REL/plugins/kynfra/scripts/arch_check.py ."
-info "Strumenti esterni (non scaricati dall'installer): /kynfra:tools oppure python3 -B $KIT_REL/plugins/kynfra/scripts/tools.py status"
+info "Strumenti esterni (non scaricati dall'installer): /kynfra:kynfra-tools oppure python3 -B $KIT_REL/plugins/kynfra/scripts/tools.py status"

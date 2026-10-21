@@ -96,6 +96,17 @@ class DocsTest(unittest.TestCase):
         for use in re.findall(r"uses:\s*(\S+)", read(WORKFLOW)):
             self.assertRegex(use, r"@v\d+$", f"azione non fissata a una versione: {use}")
 
+    def test_slash_commands_match_skills(self):
+        skills = {d.name for d in (PLUGIN / "skills").iterdir() if d.is_dir()}
+        skills.add("manage-accounts-aws")  # solo roadmap: gestore degli account, non ancora una skill
+        files = [ROOT / "README.md", *DOCS.glob("*.md"), *(DOCS / "pattern").glob("*.md"),
+                 *(p for p in PLUGIN.rglob("*") if p.is_file() and p.suffix in (".md", ".py", ".sh", ".json", ".toml", ".yml"))]
+        for f in files:
+            for name in re.findall(r"/kynfra:([A-Za-z0-9_-]+)(?![A-Za-z0-9_<-])", read(f)):
+                if name.endswith("-"):
+                    continue  # segnaposto /kynfra:create-<pattern>-infra-aws
+                self.assertIn(name, skills, f"{f.relative_to(ROOT)}: /kynfra:{name} non è una skill")
+
     def test_gitignore_has_local_tools_dir(self):
         self.assertIn(".kynfra/", read(ROOT / ".gitignore").splitlines())
 

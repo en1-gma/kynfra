@@ -363,7 +363,7 @@ class Analyzer:
 
     def deny_tool(self, what: str) -> None:
         self.deny(f"download o installazione di strumenti fuori da tools.py ({what}): gli strumenti si installano "
-                  "solo con /kynfra:tools, uno alla volta e con l'approvazione dell'utente", tool=True)
+                  "solo con /kynfra:kynfra-tools, uno alla volta e con l'approvazione dell'utente", tool=True)
 
     def finish(self) -> None:
         if self.writes & self.executed:
@@ -2749,7 +2749,7 @@ def main() -> int:
               + "\nNon aggirare i controlli: segui la skill kynfra-architecture (il codice IaC si scrive con "
                 "Write/Edit; apply, plan e le CLI cloud mutanti li esegue il DevOps).")
     if tool:
-        reason += "\nPer gli strumenti esterni usa /kynfra:tools (un'installazione approvata per strumento)."
+        reason += "\nPer gli strumenti esterni usa /kynfra:kynfra-tools (un'installazione approvata per strumento)."
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": reason}}, ensure_ascii=False))
     return 0
