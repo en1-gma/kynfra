@@ -7,3 +7,4 @@ node_modules/
 .terraform/
 .kynfra/bin/
 .kynfra/venv/
+.kynfra/

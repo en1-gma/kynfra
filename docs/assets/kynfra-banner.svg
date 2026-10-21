@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="t d">
+  <title id="t">kynfra — Know Your Infrastructure</title>
+  <desc id="d">One predictable Terraform layout for AWS, with remote state, pinned versions, mandatory tags and no secrets, enforced by hooks in Claude Code and Codex. The agent generates and validates; the DevOps applies.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c0f05"/>
+      <stop offset="0.55" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#2a1305"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F97316"/>
+      <stop offset="1" stop-color="#FBBF24"/>
+    </linearGradient>
+    <linearGradient id="win" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#0b1120"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="380" rx="24" fill="url(#bg)"/>
+  <g fill="none" stroke="#1e293b" stroke-width="1">
+    <path d="M0 320 H1200"/><path d="M0 56 H1200"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="64" y="138" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="92" font-weight="700" fill="#f8fafc" letter-spacing="-2">ky<tspan fill="url(#accent)">nfra</tspan></text>
+  <text x="68" y="184" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="26" fill="#cbd5e1">Know Your Infrastructure</text>
+  <text x="68" y="226" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#94a3b8">Guarded, predictable Terraform for AWS built by AI agents —</text>
+  <text x="68" y="252" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#94a3b8">remote state, pinned versions, mandatory tags, no secrets,</text>
+  <text x="68" y="278" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#94a3b8">and never an apply from the agent.</text>
+
+  <!-- pattern chips -->
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="600">
+    <g transform="translate(68 296)"><rect width="84" height="28" rx="14" fill="#9a3412" opacity="0.4" stroke="#F97316"/><text x="42" y="19" text-anchor="middle" fill="#fed7aa">network</text></g>
+    <g transform="translate(160 296)"><rect width="56" height="28" rx="14" fill="#334155" opacity="0.6" stroke="#e2e8f0"/><text x="28" y="19" text-anchor="middle" fill="#f1f5f9">spa</text></g>
+    <g transform="translate(224 296)"><rect width="84" height="28" rx="14" fill="#0e7490" opacity="0.35" stroke="#22d3ee"/><text x="42" y="19" text-anchor="middle" fill="#a5f3fc">backend</text></g>
+    <g transform="translate(316 296)"><rect width="56" height="28" rx="14" fill="#065f46" opacity="0.45" stroke="#34d399"/><text x="28" y="19" text-anchor="middle" fill="#a7f3d0">elb</text></g>
+    <g transform="translate(380 296)"><rect width="56" height="28" rx="14" fill="#9f1239" opacity="0.4" stroke="#fb7185"/><text x="28" y="19" text-anchor="middle" fill="#fecdd3">eks</text></g>
+    <g transform="translate(444 296)"><rect width="56" height="28" rx="14" fill="#5b21b6" opacity="0.4" stroke="#a78bfa"/><text x="28" y="19" text-anchor="middle" fill="#ddd6fe">ecr</text></g>
+    <g transform="translate(508 296)"><rect width="84" height="28" rx="14" fill="#854d0e" opacity="0.4" stroke="#fbbf24"/><text x="42" y="19" text-anchor="middle" fill="#fde68a">secrets</text></g>
+  </g>
+
+  <!-- editor window with the infra tree -->
+  <g transform="translate(620 62)">
+    <rect width="320" height="250" rx="14" fill="url(#win)" stroke="#F97316" stroke-width="2"/>
+    <circle cx="20" cy="20" r="5" fill="#f87171"/><circle cx="38" cy="20" r="5" fill="#fbbf24"/><circle cx="56" cy="20" r="5" fill="#34d399"/>
+    <text x="80" y="25" font-family="Consolas, Menlo, monospace" font-size="13" fill="#64748b">infra/</text>
+    <g font-family="Consolas, Menlo, monospace" font-size="14">
+      <text x="20" y="56" fill="#cbd5e1">├─ bootstrap/    <tspan fill="#64748b">state bucket</tspan></text>
+      <text x="20" y="78" fill="#cbd5e1">├─ modules/<tspan fill="#F97316">spa</tspan>/</text>
+      <text x="20" y="100" fill="#cbd5e1">└─ envs/</text>
+      <text x="20" y="122" fill="#94a3b8">   ├─ dev/<tspan fill="#F97316">network</tspan> <tspan fill="#64748b">spa</tspan></text>
+      <text x="20" y="144" fill="#94a3b8">   ├─ prod/<tspan fill="#F97316">network</tspan> <tspan fill="#64748b">spa</tspan></text>
+      <text x="20" y="166" fill="#94a3b8">   └─ shared/<tspan fill="#fbbf24">ecr dns</tspan></text>
+      <text x="20" y="200" fill="#64748b">backend  s3 · encrypt · use_lockfile</text>
+      <text x="20" y="222" fill="#64748b">provider default_tags · allowed_account_ids</text>
+    </g>
+  </g>
+
+  <!-- guard cards -->
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif">
+    <g transform="translate(980 62)">
+      <rect width="176" height="74" rx="12" fill="#0f172a" stroke="#F97316"/>
+      <text x="16" y="30" font-size="15" font-weight="700" fill="#fdba74">no apply, ever</text>
+      <text x="16" y="54" font-size="13" fill="#94a3b8">the DevOps applies</text>
+    </g>
+    <g transform="translate(980 150)">
+      <rect width="176" height="74" rx="12" fill="#0f172a" stroke="#fbbf24"/>
+      <text x="16" y="30" font-size="15" font-weight="700" fill="#fde68a">no secrets</text>
+      <text x="16" y="54" font-size="13" fill="#94a3b8">containers, never values</text>
+    </g>
+    <g transform="translate(980 238)">
+      <rect width="176" height="74" rx="12" fill="#0f172a" stroke="#a78bfa"/>
+      <text x="16" y="30" font-size="15" font-weight="700" fill="#c4b5fd">hooks + stop gate</text>
+      <text x="16" y="54" font-size="13" fill="#94a3b8">Claude Code · Codex</text>
+    </g>
+  </g>
+  <g stroke="#475569" stroke-width="2" stroke-dasharray="4 4" fill="none">
+    <path d="M940 99 H980"/><path d="M940 187 H980"/><path d="M940 275 H980"/>
+  </g>
+  <text x="64" y="356" font-family="Consolas, Menlo, monospace" font-size="13" fill="#64748b">Terraform · OpenTofu · TFLint · Checkov · Trivy · S3 · CloudFront · API Gateway · Lambda · EKS · ECR · Secrets Manager</text>
+</svg>

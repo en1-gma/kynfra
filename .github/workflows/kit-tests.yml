@@ -1,0 +1,64 @@
+name: kit tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: hooks (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 è la versione minima supportata dagli script (solo libreria standard), 3.12 quella di riferimento
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Hook, regole, generatore, installer, documentazione (Claude Code e Codex)
+        run: bash tests/run.sh
+
+  patterns:
+    name: pattern ${{ matrix.pattern }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # esattamente le chiavi di plugins/kynfra/templates/aws/patterns.json (lo verifica tests/hooks/test_docs.py)
+        pattern: [backend, bootstrap, ecr, eks, elb, network, secrets, spa]
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache dei provider Terraform
+        uses: actions/cache@v4
+        with:
+          path: .tf-plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('plugins/kynfra/templates/versions.json') }}-${{ matrix.pattern }}
+          restore-keys: |
+            tf-plugins-${{ runner.os }}-${{ hashFiles('plugins/kynfra/templates/versions.json') }}-
+      - name: Cartella della cache dei provider
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      # Il checkout fa da progetto per gli strumenti: tools.py li installa in .kynfra/ (ignorata da git), verificati
+      # sul checksum ufficiale e registrati in .kynfra/tools.lock.json. Senza .kynfra/config.json il progetto è la
+      # cartella corrente. Una installazione per strumento, versioni di plugins/kynfra/templates/versions.json.
+      - name: Strumento terraform
+        run: python3 -B plugins/kynfra/scripts/tools.py install terraform --approved-by ci
+      - name: Strumento tflint
+        run: python3 -B plugins/kynfra/scripts/tools.py install tflint --approved-by ci
+      - name: Strumento tflint-ruleset-aws
+        run: python3 -B plugins/kynfra/scripts/tools.py install tflint-ruleset-aws --approved-by ci
+      - name: Strumento checkov
+        run: python3 -B plugins/kynfra/scripts/tools.py install checkov --approved-by ci
+      - name: Pattern ${{ matrix.pattern }} (genera, arch_check --strict, fmt, validate, tflint, checkov; nessuna credenziale cloud)
+        run: KYNFRA_TOOLS_PROJECT=$GITHUB_WORKSPACE KYNFRA_REQUIRE_TOOLS=1 bash tests/run.sh --patterns ${{ matrix.pattern }}
